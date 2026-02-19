@@ -13,6 +13,8 @@ public final class AppEnvironment {
     public let watchlist = WatchlistStore()
     public let chat = ChatStore()
     public let webSocket = WebSocketClient()
+    public let search = SearchStore()
+    public let opportunities = OpportunityStore()
 
     public init() {
         portfolio.loadMockData()
@@ -20,5 +22,6 @@ public final class AppEnvironment {
         signalFeed.loadMockData()
         activity.loadMockData()
         performance.loadMockData()
+        opportunities.loadMockData()
     }
 }
