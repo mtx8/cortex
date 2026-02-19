@@ -201,3 +201,14 @@ import Testing
         #expect(env.webSocket.isConnected == false)
     }
 }
+
+@Test func testPortfolioStoreApply() async throws {
+    await MainActor.run {
+        let store = PortfolioStore()
+        store.apply(["nav": 100000.0, "daily_pnl": 500.0, "win_rate": 0.65, "position_count": 5])
+        #expect(store.nav == 100000.0)
+        #expect(store.dailyPnL == 500.0)
+        #expect(store.winRate == 0.65)
+        #expect(store.openPositionCount == 5)
+    }
+}

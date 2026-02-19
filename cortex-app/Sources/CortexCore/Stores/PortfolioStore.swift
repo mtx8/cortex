@@ -20,6 +20,6 @@ public final class PortfolioStore {
         if let wr = update["win_rate"] as? Double { self.winRate = wr }
         if let sr = update["sharpe_ratio"] as? Double { self.sharpeRatio = sr }
         if let bp = update["buying_power"] as? Double { self.buyingPower = bp }
-        if let pos = update["position_count"] as? Int { self.openPositionCount = pos }
+        if let pos = update["position_count"] as? Int ?? update["open_positions"] as? Int { self.openPositionCount = pos }
     }
 }

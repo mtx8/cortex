@@ -12,7 +12,12 @@ public final class KillSwitchStore {
 
     public func engage() {
         isEngaging = true
-        // Backend will confirm via WebSocket, which calls confirmEngaged
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(5))
+            if isEngaging && !isActive {
+                confirmEngaged(reason: "timeout - forced local engage")
+            }
+        }
     }
 
     public func confirmEngaged(reason: String) {

@@ -10,12 +10,14 @@ public final class WebSocketClient {
     public private(set) var messagesReceived: Int = 0
 
     private var webSocketTask: URLSessionWebSocketTask?
+    private var session: URLSession?
     private var reconnectTask: Task<Void, Never>?
     private let logger = Logger(label: "cortex.websocket")
     private var shouldReconnect: Bool = true
     private let maxReconnectDelay: Double = 30.0
+    private var reconnectAttempt: Int = 0
 
-    public var onMessage: (([String: Any]) -> Void)?
+    public var onMessage: (@MainActor @Sendable ([String: Any]) -> Void)?
 
     public init(url: String = "ws://127.0.0.1:8765/ws") {
         self.url = url
@@ -27,10 +29,11 @@ public final class WebSocketClient {
             return
         }
         shouldReconnect = true
-        let session = URLSession(configuration: .default)
-        webSocketTask = session.webSocketTask(with: wsURL)
+        session?.invalidateAndCancel()
+        let newSession = URLSession(configuration: .default)
+        session = newSession
+        webSocketTask = newSession.webSocketTask(with: wsURL)
         webSocketTask?.resume()
-        isConnected = true
         lastError = nil
         receiveMessages()
     }
@@ -41,13 +44,17 @@ public final class WebSocketClient {
         reconnectTask = nil
         webSocketTask?.cancel(with: .goingAway, reason: nil)
         webSocketTask = nil
+        session?.invalidateAndCancel()
+        session = nil
         isConnected = false
     }
 
     public func send(_ data: [String: Any]) async throws {
-        // Simple JSON encoding for commands
+        guard let task = webSocketTask else {
+            throw URLError(.notConnectedToInternet)
+        }
         let jsonData = try JSONSerialization.data(withJSONObject: data)
-        try await webSocketTask?.send(.data(jsonData))
+        try await task.send(.data(jsonData))
     }
 
     private func receiveMessages() {
@@ -56,6 +63,10 @@ public final class WebSocketClient {
                 guard let self = self else { return }
                 switch result {
                 case .success(let message):
+                    if !self.isConnected {
+                        self.isConnected = true
+                        self.reconnectAttempt = 0
+                    }
                     self.messagesReceived += 1
                     self.handleMessage(message)
                     self.receiveMessages() // Continue listening
@@ -89,10 +100,11 @@ public final class WebSocketClient {
 
     private func scheduleReconnect() {
         reconnectTask?.cancel()
+        let delay = min(pow(2.0, Double(reconnectAttempt)), maxReconnectDelay)
+        reconnectAttempt += 1
         reconnectTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+            try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled, self.shouldReconnect else { return }
-            self.logger.info("Attempting WebSocket reconnect...")
             self.connect()
         }
     }

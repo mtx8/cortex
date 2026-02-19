@@ -27,15 +27,16 @@ impl ScanResult {
         format!("ScanResult(symbol={}, score={:.1})", self.symbol, self.composite_score)
     }
 
-    fn to_dict(&self) -> std::collections::HashMap<String, f64> {
-        let mut map = std::collections::HashMap::new();
-        map.insert("composite_score".into(), self.composite_score);
-        map.insert("momentum_score".into(), self.momentum_score);
-        map.insert("volume_score".into(), self.volume_score);
-        map.insert("rsi".into(), self.rsi);
-        map.insert("macd_histogram".into(), self.macd_histogram);
-        map.insert("trend_score".into(), self.trend_score);
-        map
+    fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let dict = pyo3::types::PyDict::new_bound(py);
+        dict.set_item("symbol", &self.symbol)?;
+        dict.set_item("composite_score", self.composite_score)?;
+        dict.set_item("momentum_score", self.momentum_score)?;
+        dict.set_item("volume_score", self.volume_score)?;
+        dict.set_item("rsi", self.rsi)?;
+        dict.set_item("macd_histogram", self.macd_histogram)?;
+        dict.set_item("trend_score", self.trend_score)?;
+        Ok(dict)
     }
 }
 
@@ -108,14 +109,15 @@ pub fn compute_ema(prices: &[f64], period: usize) -> f64 {
 /// MACD using standard 12 / 26 / 9 parameters.
 /// Returns `(macd_line, signal_line, histogram)`.
 pub fn compute_macd_signal(prices: &[f64]) -> (f64, f64, f64) {
-    let ema12 = compute_ema(prices, 12);
-    let ema26 = compute_ema(prices, 26);
-    let macd_line = ema12 - ema26;
-
-    // Build a MACD-line series so we can compute its 9-period EMA (= signal)
+    // Early return when insufficient data for the full MACD calculation
     if prices.len() < 26 {
+        let ema12 = compute_ema(prices, 12);
+        let ema26 = compute_ema(prices, 26);
+        let macd_line = ema12 - ema26;
         return (macd_line, 0.0_f64, macd_line);
     }
+
+    // Build a MACD-line series so we can compute its 9-period EMA (= signal)
 
     let k12 = 2.0_f64 / 13.0_f64;
     let k26 = 2.0_f64 / 27.0_f64;
@@ -170,6 +172,12 @@ pub fn scan_symbols(
     volumes: Vec<f64>,
     avg_volumes: Vec<f64>,
 ) -> PyResult<Vec<ScanResult>> {
+    if symbols.len() != volumes.len() || symbols.len() != avg_volumes.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "symbols, volumes, and avg_volumes must have the same length"
+        ));
+    }
+
     let result = panic::catch_unwind(|| {
         symbols
             .par_iter()
