@@ -21,6 +21,24 @@ pub struct ScanResult {
     pub trend_score: f64,
 }
 
+#[pymethods]
+impl ScanResult {
+    fn __repr__(&self) -> String {
+        format!("ScanResult(symbol={}, score={:.1})", self.symbol, self.composite_score)
+    }
+
+    fn to_dict(&self) -> std::collections::HashMap<String, f64> {
+        let mut map = std::collections::HashMap::new();
+        map.insert("composite_score".into(), self.composite_score);
+        map.insert("momentum_score".into(), self.momentum_score);
+        map.insert("volume_score".into(), self.volume_score);
+        map.insert("rsi".into(), self.rsi);
+        map.insert("macd_histogram".into(), self.macd_histogram);
+        map.insert("trend_score".into(), self.trend_score);
+        map
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure technical-indicator functions
 // ---------------------------------------------------------------------------
@@ -198,6 +216,12 @@ pub fn scan_symbols_with_history(
     volumes: Vec<f64>,
     avg_volumes: Vec<f64>,
 ) -> PyResult<Vec<ScanResult>> {
+    if symbols.len() != price_history.len() || symbols.len() != volumes.len() || symbols.len() != avg_volumes.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "All input vectors must have the same length"
+        ));
+    }
+
     let result = panic::catch_unwind(|| {
         symbols
             .par_iter()
