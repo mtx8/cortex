@@ -133,7 +133,7 @@ def create_app_components() -> dict:
     )
 
     # TradePipeline
-    pipeline = TradePipeline(bus=bus, risk_guardian=guardian)
+    pipeline = TradePipeline(bus=bus, risk_guardian=guardian, autonomy_dial=autonomy)
 
     # System orchestrator
     orchestrator = SystemOrchestrator(bus=bus, autonomy=autonomy)

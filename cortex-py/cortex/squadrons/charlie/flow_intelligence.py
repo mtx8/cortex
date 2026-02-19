@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -258,8 +258,8 @@ class FlowIntelligence(BaseAgent):
     def __init__(self, bus: SignalBus) -> None:
         super().__init__(bus)
         self.detector = FlowDetector()
-        self._recent_flows: list[OptionsFlow] = []
-        self._alerts: list[FlowAlert] = []
+        self._recent_flows: deque[OptionsFlow] = deque(maxlen=1000)
+        self._alerts: deque[FlowAlert] = deque(maxlen=500)
 
     # -- Feed ingestion -----------------------------------------------------
 

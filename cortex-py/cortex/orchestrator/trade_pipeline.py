@@ -62,9 +62,11 @@ class TradePipeline:
         self,
         bus: SignalBus,
         risk_guardian: RiskGuardian,
+        autonomy_dial=None,
     ):
         self._bus = bus
         self._risk_guardian = risk_guardian
+        self._autonomy_dial = autonomy_dial
         self._orders: dict[str, PipelineOrder] = {}
         self._order_seq = 0
         self._orders_submitted = 0
@@ -175,6 +177,19 @@ class TradePipeline:
                 cap=self.HARD_MAX_NOTIONAL,
             )
             order.quantity = capped_qty
+
+        # Stage 2c: Autonomy gate check
+        if self._autonomy_dial:
+            gate = self._autonomy_dial.check(
+                signal_type="bravo.order_submit",
+                notional=order.quantity * entry_price,
+            )
+            if not gate.allowed and not gate.requires_approval:
+                order.stage = PipelineStage.REJECTED
+                order.rejections.append(f"Autonomy gate: {gate.reason}")
+                order.completed_at = time.time()
+                self._orders_rejected += 1
+                return order
 
         # Stage 3: Wash sale check placeholder (FOXTROT will implement)
         order.stage = PipelineStage.WASH_SALE_CHECK

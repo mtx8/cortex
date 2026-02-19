@@ -18,6 +18,7 @@ class SignalTypes:
 
     # DELTA -> ALPHA, CHARLIE
     NEWS_CATALYST = "delta.news_catalyst"
+    CATALYST_DETECTED = "delta.catalyst_detected"
     EARNINGS_ALERT = "delta.earnings_alert"
     INSIDER_SIGNAL = "delta.insider_signal"
     CONGRESS_TRADE = "delta.congress_trade"

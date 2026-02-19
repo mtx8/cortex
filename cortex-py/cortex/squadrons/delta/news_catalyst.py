@@ -224,7 +224,7 @@ class NewsCatalyst(BaseAgent):
                 catalyst=result["catalyst"],
             )
             await self.emit(
-                SignalTypes.NEWS_CATALYST,
+                SignalTypes.CATALYST_DETECTED,
                 payload=result,
                 priority=SignalPriority.NORMAL,
             )

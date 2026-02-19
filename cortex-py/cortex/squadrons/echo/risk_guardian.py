@@ -59,8 +59,15 @@ class RiskGuardian(BaseAgent):
         if signal.signal_type == SignalTypes.ENTRY_SIGNAL:
             await self._handle_entry_signal(signal)
         elif signal.signal_type == SignalTypes.ORDER_FILLED:
-            # Track fills for drawdown calculation
-            pass
+            await self._handle_fill(signal)
+
+    async def _handle_fill(self, signal: Signal) -> None:
+        """Track fills for drawdown calculation (Phase 2 will add P&L tracking)."""
+        log.info(
+            "risk_guardian.fill_received",
+            symbol=signal.payload.get("symbol"),
+            order_id=signal.payload.get("order_id"),
+        )
 
     async def _handle_entry_signal(self, signal: Signal) -> None:
         """Process an entry signal through the full risk pipeline."""
@@ -137,6 +144,7 @@ class RiskGuardian(BaseAgent):
         drawdown_state = self._drawdown.get_state()
         if drawdown_state.should_engage_kill_switch:
             rejections.append(f"Kill switch triggered by drawdown: {drawdown_state.message}")
+            self._decisions_rejected += 1
             return RiskDecision(
                 approved=False,
                 drawdown=drawdown_state,
