@@ -3,7 +3,7 @@ import Foundation
 public struct ChatMessage: Identifiable, Sendable {
     public let id: String
     public let role: Role
-    public let content: String
+    public var content: String
     public let timestamp: Date
     public var symbol: String?
     public var actionType: ActionType?
@@ -45,6 +45,8 @@ public final class ChatStore {
     public var messages: [ChatMessage] = []
     public var inputText: String = ""
     public var isProcessing: Bool = false
+    public var webSocket: WebSocketClient?
+    public var currentStreamingMessageId: String?
 
     public init() {
         // Add welcome message
@@ -54,6 +56,15 @@ public final class ChatStore {
         ))
     }
 
+    /// Quick prompt presets for the chat interface.
+    public static let quickPrompts: [(label: String, prompt: String)] = [
+        ("Biggest risk?", "What is the biggest risk in my portfolio right now?"),
+        ("Top opportunity", "Show me the top trading opportunity right now"),
+        ("Market thesis", "What is your current market thesis?"),
+        ("Watch overnight", "What should I watch overnight?"),
+        ("Sector rotation", "What sector rotation trends are you seeing?"),
+    ]
+
     public func sendMessage() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
@@ -62,10 +73,54 @@ public final class ChatStore {
         inputText = ""
         isProcessing = true
 
-        // Simulate AI response (in production, this goes to the Python backend)
+        // Try to send via WebSocket first
+        if let ws = webSocket, ws.isConnected {
+            let payload: [String: Any] = [
+                "type": "cmd_chat_message",
+                "payload": ["message": text]
+            ]
+            // Create a placeholder streaming message
+            let streamId = UUID().uuidString
+            currentStreamingMessageId = streamId
+            messages.append(ChatMessage(id: streamId, role: .assistant, content: ""))
+
+            Task { @MainActor in
+                do {
+                    try await ws.send(payload)
+                } catch {
+                    // If WebSocket send fails, fall back to mock
+                    currentStreamingMessageId = nil
+                    if let idx = messages.firstIndex(where: { $0.id == streamId }) {
+                        messages.remove(at: idx)
+                    }
+                    fallbackMockResponse(for: text)
+                }
+            }
+        } else {
+            // Fallback: simulate AI response when WebSocket is not connected
+            fallbackMockResponse(for: text)
+        }
+    }
+
+    /// Append a chunk of streamed text to the current streaming message.
+    public func appendChunk(_ chunk: String) {
+        guard let streamId = currentStreamingMessageId,
+              let idx = messages.firstIndex(where: { $0.id == streamId }) else { return }
+        messages[idx].content += chunk
+    }
+
+    /// Finish the streaming response.
+    public func finishStreaming() {
+        currentStreamingMessageId = nil
+        isProcessing = false
+    }
+
+    // MARK: - Mock Response Fallback
+
+    private func fallbackMockResponse(for query: String) {
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(1.5))
-            let response = generateMockResponse(for: text)
+            let response = generateMockResponse(for: query)
             messages.append(response)
             isProcessing = false
         }
@@ -91,7 +146,24 @@ public final class ChatStore {
                 symbol: "AAPL",
                 actionType: .analysis
             )
-        } else if q.contains("opportunit") || q.contains("trade") || q.contains("signal") {
+        } else if q.contains("risk") || q.contains("biggest risk") {
+            return ChatMessage(
+                role: .assistant,
+                content: """
+                **Portfolio Risk Assessment:**
+
+                Top 3 risks right now:
+
+                1. **Concentration Risk** -- 60% exposure to tech sector. NVDA and META are correlated.
+                2. **Earnings Risk** -- AAPL reports in 12 days. Consider hedging or reducing size.
+                3. **Macro Risk** -- Fed speakers this week could move rates. SPY at key resistance.
+
+                **Recommendation:** Consider trimming NVDA by 30% to reduce sector concentration. \
+                Add a SPY put spread as portfolio hedge.
+                """,
+                actionType: .riskWarning
+            )
+        } else if q.contains("opportunit") || q.contains("trade") || q.contains("signal") || q.contains("top") {
             return ChatMessage(
                 role: .assistant,
                 content: """
@@ -100,46 +172,71 @@ public final class ChatStore {
                 **NVDA** -- Breakout above $890 resistance, RSI 62, Volume 1.8x avg
                 - Entry: $892 | Stop: $875 | Target: $920 | R:R 1.6:1
 
-                **MSFT** -- Consolidating at $415 support, MACD turning bullish
-                - Watching for break above $420 with volume confirmation
+                **META** -- RSI bounce from oversold, AD line improving
+                - Entry: $502 | Stop: $490 | Target: $530 | R:R 2.3:1
 
-                **TSLA** -- Below all moving averages, RSI 38, negative flow
-                - Avoid longs. Short setup if breaks $170
+                **AMD** -- Unusual call volume 2.5x, AI chip demand narrative
+                - Watching for break above $180 with volume confirmation
 
                 *Risk note: Daily drawdown at 2.1%, well within 7% limit.*
                 """,
                 actionType: .buySignal
             )
-        } else if q.contains("portfolio") || q.contains("position") || q.contains("risk") {
+        } else if q.contains("thesis") || q.contains("market") {
             return ChatMessage(
                 role: .assistant,
                 content: """
-                **Portfolio Status:**
+                **Current Market Thesis:**
 
-                - NAV: $50,000 | Daily P&L: +$234.50 (+0.47%)
-                - Open Positions: 3 | Win Rate: 67%
-                - Daily Drawdown: 1.2% (limit: 7%)
-                - Notional Exposure: $1,200 (cap: $500/trade)
+                **Bullish bias** with caution near resistance levels.
 
-                **Risk Assessment:** LOW -- All systems nominal. DrawdownShield green across all 3 clocks.
+                - SPY holding above 20-day MA, breadth improving
+                - Tech leading but extended -- selective entries only
+                - AI narrative still driving NVDA/AMD/META momentum
+                - Rates stable; no imminent Fed hawkishness
+                - VIX at 14.2 -- complacency suggests hedges are cheap
 
-                Autonomy Level: SUGGEST_ONLY -- I'll flag opportunities but you approve trades.
+                **Strategy:** Continue buying dips in quality names. \
+                Keep position sizes moderate. Trail stops tighter on extended moves.
                 """,
                 actionType: .analysis
             )
-        } else if q.contains("kill") || q.contains("halt") || q.contains("stop") {
+        } else if q.contains("overnight") || q.contains("watch") {
             return ChatMessage(
                 role: .assistant,
                 content: """
-                **Kill Switch Status:** INACTIVE
+                **Overnight Watch List:**
 
-                All trading systems operational. To engage the kill switch, use the button \
-                in the War Room or say "engage kill switch."
+                - **NVDA** -- After-hours movement on AI conference news. Watch $895 level.
+                - **TSLA** -- Oversold bounce possible. Gap fill target at $178.
+                - **BTC-USD** -- Testing $68K resistance. Breakout could trigger altcoin rally.
+                - **Futures** -- ES at 5,125. Watch Asian session for directional bias.
 
-                Warning: The kill switch is synchronous and in-memory -- zero network dependency. \
-                It will halt ALL trading immediately across all squadrons.
+                **Key Events Tomorrow:**
+                - 8:30 AM -- CPI data release
+                - 10:00 AM -- Consumer sentiment
+                - Multiple Fed speakers throughout the day
                 """,
-                actionType: .riskWarning
+                actionType: .watchAlert
+            )
+        } else if q.contains("sector") || q.contains("rotation") {
+            return ChatMessage(
+                role: .assistant,
+                content: """
+                **Sector Rotation Analysis:**
+
+                **Inflows:** Technology (+2.3%), Communication Services (+1.8%), Consumer Discretionary (+1.1%)
+                **Outflows:** Utilities (-1.5%), Real Estate (-1.2%), Staples (-0.8%)
+
+                **Key Observations:**
+                - Growth > Value rotation accelerating
+                - Small caps (IWM) lagging -- risk-off signal for breadth
+                - Energy flat despite oil recovery -- watch for catch-up trade
+                - Financials strengthening on yield curve steepening
+
+                **Action:** Overweight tech/comms, underweight defensives. Watch for IWM breakout as breadth confirmation.
+                """,
+                actionType: .analysis
             )
         } else {
             return ChatMessage(
@@ -148,12 +245,12 @@ public final class ChatStore {
                 I can help with:
 
                 - **Market Analysis** -- "Analyze AAPL" or "What's the setup on NVDA?"
-                - **Trade Opportunities** -- "Show me trade signals" or "Any opportunities?"
-                - **Portfolio Review** -- "How's my portfolio?" or "Risk status"
-                - **Strategy** -- "Should I be more aggressive?" or "Sector rotation?"
-                - **Risk Management** -- "Kill switch status" or "Drawdown levels"
+                - **Trade Opportunities** -- "Show me trade signals" or "Top opportunity"
+                - **Portfolio Review** -- "Biggest risk?" or "How's my portfolio?"
+                - **Strategy** -- "Market thesis" or "Sector rotation?"
+                - **Overnight Watch** -- "What should I watch overnight?"
 
-                I have full context on all 44 agents across 6 squadrons.
+                I have full context on all 44 agents across 6 squadrons, your positions, and real-time market data.
                 """
             )
         }

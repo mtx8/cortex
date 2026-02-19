@@ -18,6 +18,8 @@ public final class MessageRouter {
             guard let self else { return }
             self.route(message)
         }
+        // Wire WebSocket reference into ChatStore for sending
+        environment.chat.webSocket = environment.webSocket
     }
 
     /// Begin the WebSocket connection.
@@ -77,6 +79,64 @@ public final class MessageRouter {
                 severity: parseSeverity(payload["severity"] as? String)
             )
             environment.activity.append(event)
+
+        // MARK: - Chat Streaming
+
+        case "chat_chunk":
+            let chunk = payload["chunk"] as? String ?? ""
+            let done = payload["done"] as? Bool ?? false
+            if !done {
+                environment.chat.appendChunk(chunk)
+            } else {
+                environment.chat.finishStreaming()
+            }
+
+        // MARK: - Market Data
+
+        case "market_quote":
+            let symbol = payload["symbol"] as? String ?? ""
+            let price = payload["price"] as? Double ?? 0
+            let change = payload["change"] as? Double ?? 0
+            let changePct = payload["change_percent"] as? Double ?? 0
+            environment.watchlist.updatePrice(
+                symbol: symbol,
+                price: price,
+                change: change,
+                changePercent: changePct
+            )
+
+        // MARK: - Opportunities
+
+        case "opportunity":
+            environment.opportunities.apply(payload)
+
+        // MARK: - Ticker Search Results
+
+        case "ticker_search_results":
+            if let results = payload["results"] as? [[String: String]] {
+                let items = results.map { item in
+                    (ticker: item["ticker"] ?? "", name: item["name"] ?? "")
+                }
+                environment.search.applyRemoteResults(items)
+            }
+
+        // MARK: - Scanner Results
+
+        case "scanner_result":
+            // Scanner results can update both signal feed and opportunity store
+            if let ticker = payload["ticker"] as? String,
+               let score = payload["composite_score"] as? Double {
+                let opp = Opportunity(
+                    id: payload["id"] as? String ?? UUID().uuidString,
+                    ticker: ticker,
+                    compositeScore: score,
+                    type: Opportunity.OpportunityType(rawValue: payload["type"] as? String ?? "Momentum") ?? .momentum,
+                    thesis: payload["thesis"] as? String ?? "",
+                    riskReward: payload["risk_reward"] as? Double ?? 0,
+                    timestamp: Date()
+                )
+                environment.opportunities.append(opp)
+            }
 
         default:
             break

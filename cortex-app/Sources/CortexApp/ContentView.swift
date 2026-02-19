@@ -42,7 +42,7 @@ struct ContentView: View {
         case .watchlist:
             WatchlistView(store: environment.watchlist)
         case .chat:
-            ChatView(store: environment.chat)
+            ChatView(store: environment.chat, opportunities: environment.opportunities)
         case .performance:
             PerformanceDashboardView(store: environment.performance)
         case .settings:
