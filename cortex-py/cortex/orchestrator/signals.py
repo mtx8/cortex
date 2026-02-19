@@ -30,6 +30,7 @@ class SignalTypes:
     POSITION_SIZE = "echo.position_size"
 
     # BRAVO -> ECHO, FOXTROT
+    ORDER_SUBMITTED = "bravo.order_submitted"
     ORDER_FILLED = "bravo.order_filled"
     ORDER_REJECTED = "bravo.order_rejected"
     SLIPPAGE_REPORT = "bravo.slippage_report"
