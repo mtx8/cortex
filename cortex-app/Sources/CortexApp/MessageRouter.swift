@@ -69,7 +69,7 @@ public final class MessageRouter {
                 environment.killSwitch.disengage()
             }
 
-        case "activity":
+        case "activity", "activity_event":
             let event = ActivityEvent(
                 id: payload["id"] as? String ?? UUID().uuidString,
                 eventType: payload["event_type"] as? String ?? "unknown",

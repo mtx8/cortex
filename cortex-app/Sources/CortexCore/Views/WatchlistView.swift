@@ -155,6 +155,7 @@ struct WatchlistRow: View {
     }
 
     func formatPrice(_ price: Double) -> String {
+        if price == 0 { return "--" }
         if price >= 1000 { return String(format: "$%.0f", price) }
         return String(format: "$%.2f", price)
     }
