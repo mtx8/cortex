@@ -54,6 +54,10 @@ class TradePipeline:
     The pipeline is synchronous in decision-making (fast path),
     async only for I/O operations (order submission)."""
 
+    # Hard safety cap — non-negotiable for initial live testing.
+    # This is the absolute maximum notional value per trade.
+    HARD_MAX_NOTIONAL: float = 500.0
+
     def __init__(
         self,
         bus: SignalBus,
@@ -143,6 +147,34 @@ class TradePipeline:
         if decision.sizing:
             order.quantity = decision.sizing.recommended_quantity
             order.sizing_method = decision.sizing.method_used
+
+        # Stage 2b: Hard notional cap — $500 max per trade (non-negotiable)
+        notional = order.quantity * entry_price
+        if notional > self.HARD_MAX_NOTIONAL:
+            # Reduce quantity to fit within cap
+            capped_qty = int(self.HARD_MAX_NOTIONAL / entry_price)
+            if capped_qty < 1:
+                order.stage = PipelineStage.REJECTED
+                order.rejections.append(
+                    f"Single share ${entry_price:.2f} exceeds "
+                    f"hard cap ${self.HARD_MAX_NOTIONAL:.2f}"
+                )
+                order.completed_at = time.time()
+                self._orders_rejected += 1
+                log.warning(
+                    "pipeline.notional_cap_reject",
+                    order_id=order_id, symbol=symbol,
+                    notional=notional, cap=self.HARD_MAX_NOTIONAL,
+                )
+                return order
+            log.info(
+                "pipeline.notional_cap_reduced",
+                order_id=order_id, symbol=symbol,
+                original_qty=order.quantity, capped_qty=capped_qty,
+                notional=capped_qty * entry_price,
+                cap=self.HARD_MAX_NOTIONAL,
+            )
+            order.quantity = capped_qty
 
         # Stage 3: Wash sale check placeholder (FOXTROT will implement)
         order.stage = PipelineStage.WASH_SALE_CHECK

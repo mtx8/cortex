@@ -180,6 +180,36 @@ async def test_pipeline_emits_submit_signal():
 
 
 @pytest.mark.asyncio
+async def test_pipeline_notional_cap_reduces_quantity():
+    """Pipeline should reduce quantity so notional stays under $500."""
+    pipeline = make_pipeline()
+    order = await pipeline.process_entry_signal(
+        symbol="AAPL", asset_class="equity", side="buy",
+        entry_price=150.0, stop_loss=145.0,
+        source_signal_id="sig_cap", source_agent="test",
+        nav=50000.0,
+    )
+    # At $150/share, max 3 shares ($450) fits under $500
+    assert order.stage == PipelineStage.SUBMITTED
+    assert order.quantity <= 3
+    assert order.quantity * 150.0 <= 500.0
+
+
+@pytest.mark.asyncio
+async def test_pipeline_notional_cap_rejects_expensive():
+    """Pipeline should reject when a single share exceeds $500."""
+    pipeline = make_pipeline()
+    order = await pipeline.process_entry_signal(
+        symbol="BRK.A", asset_class="equity", side="buy",
+        entry_price=600.0, stop_loss=590.0,
+        source_signal_id="sig_exp", source_agent="test",
+        nav=50000.0,
+    )
+    assert order.stage == PipelineStage.REJECTED
+    assert any("hard cap" in r for r in order.rejections)
+
+
+@pytest.mark.asyncio
 async def test_pipeline_to_dict():
     pipeline = make_pipeline()
     await pipeline.process_entry_signal(
