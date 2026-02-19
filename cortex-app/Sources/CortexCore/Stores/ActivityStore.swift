@@ -39,6 +39,31 @@ public final class ActivityStore {
 
     public init() {}
 
+    public func loadMockData() {
+        let mockEvents: [(String, String, String, ActivityEvent.Severity)] = [
+            ("order_filled", "AAPL BUY 3 @ $185.02 — filled", "AAPL", .info),
+            ("signal_detected", "NVDA breakout signal detected by signal_hunter", "NVDA", .info),
+            ("risk_check", "Pre-trade check passed for NVDA", "NVDA", .info),
+            ("drawdown_update", "Daily drawdown: 2.1% (limit: 7%)", "", .info),
+            ("order_filled", "NVDA BUY 1 @ $880.05 — filled", "NVDA", .info),
+            ("volume_alert", "TSLA volume surge: 2.3x average", "TSLA", .warning),
+            ("system_start", "CORTEX system initialized — 14 agents online", "", .info),
+            ("order_filled", "SPY BUY 1 @ $510.00 — filled", "SPY", .info),
+            ("wash_sale_check", "Wash sale check passed for AAPL", "AAPL", .info),
+            ("risk_update", "Risk Guardian: All positions within limits", "", .info),
+        ]
+        for (i, (type, msg, sym, sev)) in mockEvents.enumerated() {
+            append(ActivityEvent(
+                id: "mock_evt_\(i)",
+                eventType: type,
+                message: msg,
+                symbol: sym,
+                timestamp: Date().addingTimeInterval(Double(-i * 180)),
+                severity: sev
+            ))
+        }
+    }
+
     public func append(_ event: ActivityEvent) {
         events.insert(event, at: 0)
         if events.count > maxEvents {

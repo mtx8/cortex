@@ -36,6 +36,24 @@ public final class PerformanceStore {
 
     public init() {}
 
+    public func loadMockData() {
+        totalTrades = 47
+        winningTrades = 31
+        losingTrades = 16
+        maxDrawdownPct = 4.2
+        currentStreak = 3
+
+        // Generate 30 days of equity curve
+        var equity = 46_500.0
+        for i in 0..<30 {
+            let date = Calendar.current.date(byAdding: .day, value: i - 29, to: Date())!
+            let dailyChange = Double.random(in: -400...500)
+            equity += dailyChange
+            addEquityPoint(value: equity, date: date)
+            addDailyPnL(pnl: dailyChange, date: date)
+        }
+    }
+
     public var winRate: Double {
         guard totalTrades > 0 else { return 0 }
         return Double(winningTrades) / Double(totalTrades)

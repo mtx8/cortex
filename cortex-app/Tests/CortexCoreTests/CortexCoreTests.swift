@@ -106,11 +106,12 @@ import Testing
 @Test func testAppEnvironmentStores() async throws {
     await MainActor.run {
         let env = AppEnvironment()
-        #expect(env.portfolio.nav == 0.0)
-        #expect(env.squadrons.agents.isEmpty)
+        // Mock data is loaded on init — verify it populated
+        #expect(env.portfolio.nav == 50_000.0)
+        #expect(!env.squadrons.agents.isEmpty)
         #expect(env.killSwitch.isActive == false)
-        #expect(env.signalFeed.signals.isEmpty)
-        #expect(env.activity.events.isEmpty)
+        #expect(!env.signalFeed.signals.isEmpty)
+        #expect(!env.activity.events.isEmpty)
     }
 }
 
@@ -197,7 +198,8 @@ import Testing
     await MainActor.run {
         let env = AppEnvironment()
         #expect(env.settings.maxNotional == 500.0)
-        #expect(env.performance.totalTrades == 0)
+        // Mock data loads 47 trades on init
+        #expect(env.performance.totalTrades == 47)
         #expect(env.webSocket.isConnected == false)
     }
 }

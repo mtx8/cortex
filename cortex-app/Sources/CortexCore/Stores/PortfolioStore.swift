@@ -13,6 +13,16 @@ public final class PortfolioStore {
 
     public init() {}
 
+    public func loadMockData() {
+        nav = 50_000.0
+        dailyPnL = 234.50
+        totalPnL = 3_456.78
+        winRate = 0.67
+        openPositionCount = 3
+        buyingPower = 48_800.0
+        sharpeRatio = 1.85
+    }
+
     public func apply(_ update: [String: Any]) {
         if let nav = update["nav"] as? Double { self.nav = nav }
         if let pnl = update["total_pnl"] as? Double { self.totalPnL = pnl }

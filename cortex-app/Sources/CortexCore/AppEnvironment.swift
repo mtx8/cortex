@@ -14,5 +14,11 @@ public final class AppEnvironment {
     public let chat = ChatStore()
     public let webSocket = WebSocketClient()
 
-    public init() {}
+    public init() {
+        portfolio.loadMockData()
+        squadrons.loadMockData()
+        signalFeed.loadMockData()
+        activity.loadMockData()
+        performance.loadMockData()
+    }
 }
