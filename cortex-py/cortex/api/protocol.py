@@ -1,30 +1,41 @@
-"""MessagePack-based WebSocket protocol for Swift <-> Python communication."""
+"""JSON-based WebSocket protocol for Swift <-> Python communication.
+
+Uses orjson for fast JSON serialization. The Swift client sends and receives
+plain JSON messages with keys: type, payload, ts.
+"""
 
 from dataclasses import dataclass
-from enum import IntEnum
-import msgpack
+from enum import Enum
 import time
 
+import orjson
 
-class MessageType(IntEnum):
+
+class MessageType(str, Enum):
     # Server -> Client (streaming)
-    PORTFOLIO_UPDATE = 1
-    AGENT_UPDATE = 2
-    SIGNAL_FIRED = 3
-    SCANNER_RESULT = 4
-    ACTIVITY_EVENT = 5
-    OPPORTUNITY = 6
-    CHAT_TOKEN = 7
-    KILL_SWITCH_STATUS = 8
+    PORTFOLIO_UPDATE = "portfolio_update"
+    AGENT_UPDATE = "agent_update"
+    SIGNAL_FIRED = "signal_fired"
+    SCANNER_RESULT = "scanner_result"
+    ACTIVITY_EVENT = "activity_event"
+    OPPORTUNITY = "opportunity"
+    CHAT_TOKEN = "chat_token"
+    KILL_SWITCH_STATUS = "kill_switch_status"
+    CHAT_RESPONSE = "chat_response"
+    CHAT_CHUNK = "chat_chunk"
+    TICKER_SEARCH_RESULTS = "ticker_search_results"
+    MARKET_QUOTE = "market_quote"
 
     # Client -> Server (commands)
-    CMD_KILL_SWITCH = 100
-    CMD_DISENGAGE_KILL = 101
-    CMD_SET_AUTONOMY = 102
-    CMD_TOGGLE_AGENT = 103
-    CMD_QUICK_TRADE = 104
-    CMD_CHAT_MESSAGE = 105
-    CMD_SUBSCRIBE_SCANNER = 106
+    CMD_KILL_SWITCH = "cmd_kill_switch"
+    CMD_DISENGAGE_KILL = "cmd_disengage_kill"
+    CMD_SET_AUTONOMY = "cmd_set_autonomy"
+    CMD_TOGGLE_AGENT = "cmd_toggle_agent"
+    CMD_QUICK_TRADE = "cmd_quick_trade"
+    CMD_CHAT_MESSAGE = "cmd_chat_message"
+    CMD_SUBSCRIBE_SCANNER = "cmd_subscribe_scanner"
+    CMD_SEARCH_TICKER = "cmd_search_ticker"
+    CMD_REQUEST_QUOTES = "cmd_request_quotes"
 
 
 @dataclass
@@ -38,18 +49,22 @@ class CortexMessage:
             self.timestamp = time.time()
 
 
-def encode_message(msg: CortexMessage) -> bytes:
-    return msgpack.packb({
-        "t": int(msg.type),
-        "p": msg.payload,
+def encode_message(msg: CortexMessage) -> str:
+    """Encode a CortexMessage to a JSON string using orjson."""
+    return orjson.dumps({
+        "type": msg.type.value,
+        "payload": msg.payload,
         "ts": msg.timestamp,
-    }, use_bin_type=True)
+    }).decode("utf-8")
 
 
-def decode_message(data: bytes) -> CortexMessage:
-    raw = msgpack.unpackb(data, raw=False)
+def decode_message(data: dict) -> CortexMessage:
+    """Decode a dict (already parsed by FastAPI/orjson) into a CortexMessage.
+
+    Accepts dicts with keys: type, payload, ts.
+    """
     return CortexMessage(
-        type=MessageType(raw["t"]),
-        payload=raw["p"],
-        timestamp=raw["ts"],
+        type=MessageType(data["type"]),
+        payload=data.get("payload", {}),
+        timestamp=data.get("ts"),
     )

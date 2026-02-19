@@ -34,7 +34,7 @@ class WSBroadcaster:
         disconnected = []
         for client in self._clients:
             try:
-                await client.send_bytes(data)
+                await client.send_text(data)
             except Exception:
                 disconnected.append(client)
         for client in disconnected:

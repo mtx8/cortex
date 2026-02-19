@@ -1,4 +1,5 @@
 import pytest
+import orjson
 from cortex.api.ws_broadcaster import WSBroadcaster
 from cortex.api.protocol import MessageType, CortexMessage, encode_message, decode_message
 from cortex.orchestrator.bus import SignalBus
@@ -60,6 +61,35 @@ def test_encode_decode_roundtrip():
         win_rate=0.55, open_positions=2,
     )
     encoded = encode_message(msg)
-    decoded = decode_message(encoded)
+    assert isinstance(encoded, str)
+    parsed = orjson.loads(encoded)
+    decoded = decode_message(parsed)
     assert decoded.type == MessageType.PORTFOLIO_UPDATE
     assert decoded.payload["nav"] == 50000
+
+
+@pytest.mark.asyncio
+async def test_broadcast_sends_text():
+    """Verify broadcast sends text (JSON) not bytes."""
+    bus = SignalBus()
+    bc = WSBroadcaster(bus=bus)
+
+    sent_data = []
+
+    class MockWS:
+        async def send_text(self, data):
+            sent_data.append(data)
+
+    mock_ws = MockWS()
+    bc.add_client(mock_ws)
+
+    msg = bc.build_portfolio_message(
+        nav=100000, daily_pnl=500, total_pnl=5000,
+        win_rate=0.6, open_positions=3,
+    )
+    await bc.broadcast(msg)
+
+    assert len(sent_data) == 1
+    parsed = orjson.loads(sent_data[0])
+    assert parsed["type"] == "portfolio_update"
+    assert parsed["payload"]["nav"] == 100000
