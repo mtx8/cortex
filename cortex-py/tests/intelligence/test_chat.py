@@ -1,0 +1,288 @@
+"""Tests for CortexChat streaming Claude integration."""
+
+import pytest
+from unittest.mock import AsyncMock, patch, MagicMock
+from collections import deque
+
+from cortex.intelligence.chat import CortexChat, ChatMessage, _MAX_HISTORY
+from cortex.orchestrator.bus import SignalBus
+
+
+# ─── ChatMessage Tests ────────────────────────────────────────────────
+
+def test_chat_message_defaults():
+    msg = ChatMessage(role="user", content="Hello")
+    assert msg.role == "user"
+    assert msg.content == "Hello"
+    assert msg.timestamp > 0
+
+
+# ─── CortexChat Construction ─────────────────────────────────────────
+
+def test_chat_creation():
+    chat = CortexChat(api_key="test-key")
+    assert chat._model == "claude-opus-4-6"
+    assert chat.request_count == 0
+    assert chat.error_count == 0
+
+
+def test_chat_to_dict():
+    chat = CortexChat(api_key="test-key", model="claude-opus-4-6")
+    d = chat.to_dict()
+    assert d["model"] == "claude-opus-4-6"
+    assert d["has_api_key"] is True
+    assert d["request_count"] == 0
+    assert d["active_conversations"] == 0
+
+
+def test_chat_no_api_key():
+    chat = CortexChat(api_key="")
+    assert chat.to_dict()["has_api_key"] is False
+
+
+# ─── System Prompt ────────────────────────────────────────────────────
+
+def test_build_system_prompt_empty_context():
+    chat = CortexChat(api_key="test-key")
+    prompt = chat.build_system_prompt()
+    assert "CORTEX AI" in prompt
+    assert "NAV: $0.00" in prompt
+    assert "no open positions" in prompt
+    assert "no recent signals" in prompt
+
+
+def test_build_system_prompt_with_context():
+    chat = CortexChat(api_key="test-key")
+    chat.set_portfolio_context(
+        nav=100000.0,
+        daily_pnl=1500.0,
+        positions=[
+            {"symbol": "AAPL", "qty": 50, "avg_price": 180.0, "pnl": 250.0},
+            {"symbol": "MSFT", "qty": 30, "avg_price": 370.0, "pnl": -100.0},
+        ],
+        top_signals=["alpha.entry_signal: NVDA", "alpha.volume_surge: TSLA"],
+        risk_metrics={
+            "drawdown_pct": 2.5,
+            "win_rate": 0.65,
+            "sharpe": 1.8,
+            "open_positions": 5,
+        },
+    )
+    prompt = chat.build_system_prompt()
+    assert "$100,000.00" in prompt
+    assert "$+1,500.00" in prompt
+    assert "AAPL" in prompt
+    assert "MSFT" in prompt
+    assert "alpha.entry_signal: NVDA" in prompt
+    assert "2.5%" in prompt
+    assert "65.0%" in prompt
+
+
+def test_build_system_prompt_negative_pnl():
+    chat = CortexChat(api_key="test-key")
+    chat.set_portfolio_context(nav=50000.0, daily_pnl=-500.0)
+    prompt = chat.build_system_prompt()
+    assert "$-500.00" in prompt
+
+
+# ─── Conversation History ────────────────────────────────────────────
+
+def test_conversation_history_management():
+    chat = CortexChat(api_key="test-key")
+    assert chat.get_conversation_length("test") == 0
+
+    # Manually add messages to history
+    history = chat._get_history("test")
+    history.append(ChatMessage(role="user", content="Hello"))
+    history.append(ChatMessage(role="assistant", content="Hi there"))
+
+    assert chat.get_conversation_length("test") == 2
+
+
+def test_conversation_max_history():
+    chat = CortexChat(api_key="test-key")
+    history = chat._get_history("test")
+
+    # Fill beyond max
+    for i in range(_MAX_HISTORY + 5):
+        history.append(ChatMessage(role="user", content=f"msg {i}"))
+
+    assert len(history) == _MAX_HISTORY
+
+
+def test_clear_conversation():
+    chat = CortexChat(api_key="test-key")
+    history = chat._get_history("test")
+    history.append(ChatMessage(role="user", content="Hello"))
+    assert chat.get_conversation_length("test") == 1
+
+    chat.clear_conversation("test")
+    assert chat.get_conversation_length("test") == 0
+
+
+def test_clear_nonexistent_conversation():
+    chat = CortexChat(api_key="test-key")
+    # Should not raise
+    chat.clear_conversation("nonexistent")
+
+
+def test_history_to_messages():
+    chat = CortexChat(api_key="test-key")
+    history = chat._get_history("test")
+    history.append(ChatMessage(role="user", content="Hello"))
+    history.append(ChatMessage(role="assistant", content="Hi!"))
+    history.append(ChatMessage(role="user", content="How are you?"))
+
+    messages = chat._history_to_messages("test")
+    assert len(messages) == 3
+    assert messages[0] == {"role": "user", "content": "Hello"}
+    assert messages[1] == {"role": "assistant", "content": "Hi!"}
+    assert messages[2] == {"role": "user", "content": "How are you?"}
+
+
+# ─── Streaming (mocked SDK) ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_stream_response_no_sdk():
+    """When anthropic SDK is unavailable, yields fallback message."""
+    chat = CortexChat(api_key="test-key")
+
+    # Force client to be None (simulating missing SDK)
+    with patch.object(chat, "_get_client", new_callable=AsyncMock, return_value=None):
+        chunks = []
+        async for chunk in chat.stream_response("Hello"):
+            chunks.append(chunk)
+
+    assert len(chunks) == 1
+    assert "unavailable" in chunks[0].lower()
+    assert chat.get_conversation_length("default") == 2  # user + assistant fallback
+
+
+@pytest.mark.asyncio
+async def test_stream_response_with_mock_client():
+    """Verify streaming works with a mocked Anthropic client."""
+    chat = CortexChat(api_key="test-key")
+
+    # Create mock streaming context
+    mock_text_chunks = ["Hello", " there", "! How", " can I help?"]
+
+    class MockTextStream:
+        def __init__(self):
+            self.chunks = list(mock_text_chunks)
+            self.idx = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self.idx >= len(self.chunks):
+                raise StopAsyncIteration
+            chunk = self.chunks[self.idx]
+            self.idx += 1
+            return chunk
+
+    class MockStreamContext:
+        def __init__(self):
+            self.text_stream = MockTextStream()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.messages.stream.return_value = MockStreamContext()
+
+    with patch.object(chat, "_get_client", new_callable=AsyncMock, return_value=mock_client):
+        chunks = []
+        async for chunk in chat.stream_response("What is my P&L?"):
+            chunks.append(chunk)
+
+    assert chunks == mock_text_chunks
+    assert chat.request_count == 1
+    assert chat.get_conversation_length("default") == 2  # user + assistant
+
+    # Verify the full response was stored in history
+    history = list(chat._get_history("default"))
+    assert history[0].role == "user"
+    assert history[0].content == "What is my P&L?"
+    assert history[1].role == "assistant"
+    assert history[1].content == "Hello there! How can I help?"
+
+
+@pytest.mark.asyncio
+async def test_stream_response_error_handling():
+    """Verify errors are caught and yielded as error messages."""
+    chat = CortexChat(api_key="test-key")
+
+    mock_client = MagicMock()
+    mock_client.messages.stream.side_effect = Exception("API rate limit exceeded")
+
+    with patch.object(chat, "_get_client", new_callable=AsyncMock, return_value=mock_client):
+        chunks = []
+        async for chunk in chat.stream_response("Hello"):
+            chunks.append(chunk)
+
+    assert len(chunks) == 1
+    assert "Error generating response" in chunks[0]
+    assert "rate limit" in chunks[0]
+    assert chat.error_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_response_separate_conversations():
+    """Verify separate conversation IDs maintain separate histories."""
+    chat = CortexChat(api_key="test-key")
+
+    with patch.object(chat, "_get_client", new_callable=AsyncMock, return_value=None):
+        async for _ in chat.stream_response("Hello from A", conversation_id="conv_a"):
+            pass
+        async for _ in chat.stream_response("Hello from B", conversation_id="conv_b"):
+            pass
+
+    assert chat.get_conversation_length("conv_a") == 2
+    assert chat.get_conversation_length("conv_b") == 2
+
+    history_a = list(chat._get_history("conv_a"))
+    history_b = list(chat._get_history("conv_b"))
+    assert history_a[0].content == "Hello from A"
+    assert history_b[0].content == "Hello from B"
+
+
+@pytest.mark.asyncio
+async def test_stream_passes_system_prompt():
+    """Verify the system prompt with portfolio context is passed to Claude."""
+    chat = CortexChat(api_key="test-key")
+    chat.set_portfolio_context(nav=75000.0, daily_pnl=300.0)
+
+    class MockTextStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    class MockStreamContext:
+        def __init__(self):
+            self.text_stream = MockTextStream()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.messages.stream.return_value = MockStreamContext()
+
+    with patch.object(chat, "_get_client", new_callable=AsyncMock, return_value=mock_client):
+        async for _ in chat.stream_response("Test"):
+            pass
+
+    # Verify the stream was called with correct parameters
+    call_kwargs = mock_client.messages.stream.call_args.kwargs
+    assert call_kwargs["model"] == "claude-opus-4-6"
+    assert "$75,000.00" in call_kwargs["system"]
+    assert "$+300.00" in call_kwargs["system"]
+    assert call_kwargs["messages"][0]["content"] == "Test"
