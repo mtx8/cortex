@@ -40,3 +40,76 @@ import Testing
         #expect(store.activeCount == 1)
     }
 }
+
+@Test func testSignalFeedAppend() async throws {
+    await MainActor.run {
+        let store = SignalFeedStore()
+        store.append(SignalEvent(
+            id: "sig_001",
+            signalType: "alpha.entry_signal",
+            sourceAgent: "signal_hunter",
+            sourceSquadron: "alpha",
+            symbol: "AAPL"
+        ))
+        #expect(store.signals.count == 1)
+        #expect(store.recentSignals.first?.symbol == "AAPL")
+    }
+}
+
+@Test func testSignalFeedMaxLimit() async throws {
+    await MainActor.run {
+        let store = SignalFeedStore()
+        store.maxSignals = 5
+        for i in 0..<10 {
+            store.append(SignalEvent(
+                id: "sig_\(i)",
+                signalType: "test",
+                sourceAgent: "test",
+                sourceSquadron: "test"
+            ))
+        }
+        #expect(store.signals.count == 5)
+    }
+}
+
+@Test func testActivityStoreAppend() async throws {
+    await MainActor.run {
+        let store = ActivityStore()
+        store.append(ActivityEvent(
+            id: "evt_001",
+            eventType: "order_filled",
+            message: "AAPL buy 10 @ 150.00",
+            symbol: "AAPL",
+            severity: .info
+        ))
+        #expect(store.events.count == 1)
+        #expect(store.criticalEvents.count == 0)
+    }
+}
+
+@Test func testActivityCriticalFilter() async throws {
+    await MainActor.run {
+        let store = ActivityStore()
+        store.append(ActivityEvent(
+            id: "evt_001", eventType: "kill_switch",
+            message: "Kill switch engaged", severity: .critical
+        ))
+        store.append(ActivityEvent(
+            id: "evt_002", eventType: "order_filled",
+            message: "Normal fill", severity: .info
+        ))
+        #expect(store.criticalEvents.count == 1)
+        #expect(store.events.count == 2)
+    }
+}
+
+@Test func testAppEnvironmentStores() async throws {
+    await MainActor.run {
+        let env = AppEnvironment()
+        #expect(env.portfolio.nav == 0.0)
+        #expect(env.squadrons.agents.isEmpty)
+        #expect(env.killSwitch.isActive == false)
+        #expect(env.signalFeed.signals.isEmpty)
+        #expect(env.activity.events.isEmpty)
+    }
+}

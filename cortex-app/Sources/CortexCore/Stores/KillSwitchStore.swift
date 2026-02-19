@@ -10,6 +10,11 @@ public final class KillSwitchStore {
 
     public init() {}
 
+    public func engage() {
+        isEngaging = true
+        // Backend will confirm via WebSocket, which calls confirmEngaged
+    }
+
     public func confirmEngaged(reason: String) {
         isEngaging = false
         isActive = true
