@@ -12,6 +12,11 @@ struct ContentView: View {
                     Label("War Room", systemImage: "shield.fill")
                 }
 
+            ChartView(symbol: "AAPL")
+                .tabItem {
+                    Label("Charts", systemImage: "chart.xyaxis.line")
+                }
+
             PerformanceDashboardView(store: environment.performance)
                 .tabItem {
                     Label("Performance", systemImage: "chart.line.uptrend.xyaxis")
