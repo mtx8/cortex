@@ -113,3 +113,91 @@ import Testing
         #expect(env.activity.events.isEmpty)
     }
 }
+
+@Test func testMessageDecoderPortfolio() async throws {
+    let decoder = MessageDecoder()
+    let payload: [String: Any] = ["nav": 100000.0, "daily_pnl": 500.0]
+    let decoded = decoder.decodePortfolioUpdate(payload)
+    #expect(decoded.nav == 100000.0)
+    #expect(decoded.dailyPnL == 500.0)
+}
+
+@Test func testMessageDecoderAgentUpdate() async throws {
+    let decoder = MessageDecoder()
+    let payload: [String: Any] = [
+        "agent_id": "signal_hunter",
+        "squadron": "alpha",
+        "status": "active",
+        "signal_count": 42,
+        "error_count": 0,
+    ]
+    let decoded = decoder.decodeAgentUpdate(payload)
+    #expect(decoded["agent_id"] as? String == "signal_hunter")
+}
+
+@Test func testWebSocketClientDefaults() async throws {
+    await MainActor.run {
+        let client = WebSocketClient()
+        #expect(client.isConnected == false)
+        #expect(client.url == "ws://127.0.0.1:8765/ws")
+    }
+}
+
+@Test func testWebSocketClientCustomURL() async throws {
+    await MainActor.run {
+        let client = WebSocketClient(url: "ws://localhost:9999/ws")
+        #expect(client.url == "ws://localhost:9999/ws")
+    }
+}
+
+@Test func testSettingsStoreDefaults() async throws {
+    await MainActor.run {
+        let store = SettingsStore()
+        #expect(store.autonomyLevel == .suggestOnly)
+        #expect(store.maxNotional == 500.0)
+        #expect(store.serverURL == "ws://127.0.0.1:8765/ws")
+    }
+}
+
+@Test func testAutonomyLevelLabels() async throws {
+    #expect(AutonomyLevel.fullManual.label == "Full Manual")
+    #expect(AutonomyLevel.fullAuto.label == "Full Auto")
+}
+
+@Test func testPerformanceStoreDefaults() async throws {
+    await MainActor.run {
+        let store = PerformanceStore()
+        #expect(store.totalTrades == 0)
+        #expect(store.winRate == 0)
+        #expect(store.equityCurve.isEmpty)
+    }
+}
+
+@Test func testPerformanceStoreAddEquity() async throws {
+    await MainActor.run {
+        let store = PerformanceStore()
+        store.addEquityPoint(value: 50000)
+        store.addEquityPoint(value: 51000)
+        #expect(store.equityCurve.count == 2)
+    }
+}
+
+@Test func testPerformanceStorePnL() async throws {
+    await MainActor.run {
+        let store = PerformanceStore()
+        store.addDailyPnL(pnl: 500)
+        store.addDailyPnL(pnl: -200)
+        #expect(store.bestDay == 500)
+        #expect(store.worstDay == -200)
+        #expect(store.averageDailyPnL == 150)
+    }
+}
+
+@Test func testAppEnvironmentHasNewStores() async throws {
+    await MainActor.run {
+        let env = AppEnvironment()
+        #expect(env.settings.maxNotional == 500.0)
+        #expect(env.performance.totalTrades == 0)
+        #expect(env.webSocket.isConnected == false)
+    }
+}

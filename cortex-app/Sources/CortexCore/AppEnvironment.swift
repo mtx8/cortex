@@ -8,6 +8,9 @@ public final class AppEnvironment {
     public let killSwitch = KillSwitchStore()
     public let signalFeed = SignalFeedStore()
     public let activity = ActivityStore()
+    public let settings = SettingsStore()
+    public let performance = PerformanceStore()
+    public let webSocket = WebSocketClient()
 
     public init() {}
 }
