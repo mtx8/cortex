@@ -1,0 +1,39 @@
+# Worktrees
+.worktrees/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+.venv/
+venv/
+
+# Rust
+cortex-rs/target/
+
+# Swift
+cortex-app/.build/
+cortex-app/DerivedData/
+*.xcuserstate
+
+# Environment
+.env
+*.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+*.db
+*.sqlite
