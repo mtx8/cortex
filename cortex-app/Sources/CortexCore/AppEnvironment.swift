@@ -10,6 +10,8 @@ public final class AppEnvironment {
     public let activity = ActivityStore()
     public let settings = SettingsStore()
     public let performance = PerformanceStore()
+    public let watchlist = WatchlistStore()
+    public let chat = ChatStore()
     public let webSocket = WebSocketClient()
 
     public init() {}
