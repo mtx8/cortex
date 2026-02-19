@@ -47,6 +47,11 @@ class SystemOrchestrator:
         log.info("orchestrator.agent_registered", agent_id=agent.agent_id, squadron=agent.squadron)
 
     @property
+    def agents(self) -> list[BaseAgent]:
+        """Return all registered agents (used by StatusBroadcaster)."""
+        return list(self._agents.values())
+
+    @property
     def agent_count(self) -> int:
         return len(self._agents)
 

@@ -23,9 +23,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .background(Color(nsColor: NSColor(red: 0.1, green: 0.1, blue: 0.14, alpha: 1.0)))
-        .keyboardShortcut(for: .toggleSidebar) {
-            isSidebarExpanded.toggle()
-        }
+        .background { keyboardShortcuts }
     }
 
     @ViewBuilder
@@ -36,9 +34,9 @@ struct ContentView: View {
         case .charts:
             ChartView()
         case .scanner:
-            ScannerView()
+            ScannerView(opportunities: environment.opportunities)
         case .squadrons:
-            SquadronsDetailView()
+            SquadronsDetailView(squadrons: environment.squadrons)
         case .watchlist:
             WatchlistView(store: environment.watchlist)
         case .chat:
@@ -49,23 +47,40 @@ struct ContentView: View {
             SettingsView(settings: environment.settings)
         }
     }
-}
 
-// MARK: - Keyboard Shortcut Helpers
+    // MARK: - Keyboard Shortcuts
 
-private enum CortexShortcut {
-    case toggleSidebar
-}
+    /// All keyboard shortcuts as hidden buttons rendered in the background.
+    @ViewBuilder
+    private var keyboardShortcuts: some View {
+        // Cmd+B: Toggle sidebar
+        Button("") { isSidebarExpanded.toggle() }
+            .keyboardShortcut("b", modifiers: .command)
+            .hidden()
 
-private extension View {
-    func keyboardShortcut(for shortcut: CortexShortcut, action: @escaping () -> Void) -> some View {
-        switch shortcut {
-        case .toggleSidebar:
-            return self.background(
-                Button("") { action() }
-                    .keyboardShortcut("b", modifiers: .command)
+        // Cmd+K: Toggle kill switch
+        Button("") {
+            if environment.killSwitch.isActive {
+                environment.killSwitch.disengage()
+            } else {
+                environment.killSwitch.engage()
+            }
+        }
+        .keyboardShortcut("k", modifiers: .command)
+        .hidden()
+
+        // Cmd+/: Switch to chat tab
+        Button("") { selectedTab = .chat }
+            .keyboardShortcut("/", modifiers: .command)
+            .hidden()
+
+        // Cmd+1 through Cmd+8: Switch tabs
+        ForEach(AppTab.allCases) { tab in
+            if let shortcut = tab.shortcut {
+                Button("") { selectedTab = tab }
+                    .keyboardShortcut(shortcut, modifiers: .command)
                     .hidden()
-            )
+            }
         }
     }
 }

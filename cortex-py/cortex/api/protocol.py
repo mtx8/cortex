@@ -18,6 +18,7 @@ class MessageType(str, Enum):
     SIGNAL_FIRED = "signal_fired"
     SCANNER_RESULT = "scanner_result"
     ACTIVITY_EVENT = "activity_event"
+    ACTIVITY = "activity"
     OPPORTUNITY = "opportunity"
     CHAT_TOKEN = "chat_token"
     KILL_SWITCH_STATUS = "kill_switch_status"

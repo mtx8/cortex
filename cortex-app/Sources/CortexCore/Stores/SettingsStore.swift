@@ -38,7 +38,9 @@ public final class SettingsStore {
     public var autoThreshold: Double = 250.0
     public var isDarkMode: Bool = true
 
+    public var webSocket: WebSocketClient?
+
     public init() {}
 
-    public var isConnected: Bool { false } // Will be wired to WebSocketClient
+    public var isConnected: Bool { webSocket?.isConnected ?? false }
 }

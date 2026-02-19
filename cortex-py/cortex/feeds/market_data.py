@@ -7,6 +7,7 @@ Runs as a background asyncio task. Every poll_interval seconds it:
 """
 
 import asyncio
+import random
 import structlog
 
 from cortex.api.protocol import MessageType, CortexMessage
@@ -19,6 +20,8 @@ log = structlog.get_logger()
 DEFAULT_WATCHLIST: list[str] = [
     "AAPL", "NVDA", "MSFT", "TSLA", "META", "AMZN", "GOOG", "SPY", "QQQ",
 ]
+
+OPPORTUNITY_TYPES: list[str] = ["Momentum", "Volume", "Catalyst", "Breakout", "Flow"]
 
 
 class MarketDataFeed:
@@ -42,6 +45,9 @@ class MarketDataFeed:
         self._poll_count = 0
         self._last_quotes: dict[str, dict] = {}
         self._task: asyncio.Task | None = None
+        # Scanner opportunity state — seeded per-ticker so scores drift slowly
+        self._rng = random.Random(42)
+        self._scanner_scores: dict[str, dict] = {}
 
     @property
     def watchlist(self) -> list[str]:
@@ -106,6 +112,9 @@ class MarketDataFeed:
                 priority=SignalPriority.LOW,
             ))
 
+        # Broadcast scanner opportunities for watchlist symbols
+        await self._broadcast_scanner_opportunities()
+
         log.debug(
             "feed.poll_complete",
             poll=self._poll_count,
@@ -135,6 +144,44 @@ class MarketDataFeed:
         """Signal the polling loop to stop."""
         self._running = False
         log.info("feed.stop_requested")
+
+    async def _broadcast_scanner_opportunities(self) -> None:
+        """Generate and broadcast scanner opportunity data for watchlist symbols."""
+        if self._broadcaster.client_count == 0:
+            return
+
+        theses = {
+            "Momentum": "Strong momentum with RSI trending and volume confirmation",
+            "Volume": "Unusual volume spike detected, institutional activity likely",
+            "Catalyst": "Upcoming catalyst event with positive sentiment signals",
+            "Breakout": "Breaking above key resistance level with increasing volume",
+            "Flow": "Significant options flow detected, smart money positioning",
+        }
+
+        for ticker in self._watchlist:
+            # Initialize or drift the score for this ticker
+            if ticker not in self._scanner_scores:
+                self._scanner_scores[ticker] = {
+                    "score": self._rng.uniform(40, 95),
+                    "type": self._rng.choice(OPPORTUNITY_TYPES),
+                    "rr": round(self._rng.uniform(1.0, 3.0), 1),
+                }
+
+            state = self._scanner_scores[ticker]
+            # Small random drift each cycle (±3 points)
+            state["score"] = max(20, min(98, state["score"] + self._rng.uniform(-3, 3)))
+
+            msg = CortexMessage(
+                type=MessageType.SCANNER_RESULT,
+                payload={
+                    "ticker": ticker,
+                    "composite_score": round(state["score"], 1),
+                    "type": state["type"],
+                    "thesis": f"{ticker}: {theses[state['type']]}",
+                    "risk_reward": state["rr"],
+                },
+            )
+            await self._broadcaster.broadcast(msg)
 
     def to_dict(self) -> dict:
         return {

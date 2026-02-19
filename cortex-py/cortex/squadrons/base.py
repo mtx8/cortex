@@ -25,6 +25,14 @@ class BaseAgent(ABC):
     def status(self) -> str:
         return self._status
 
+    @property
+    def signal_count(self) -> int:
+        return self._signal_count
+
+    @property
+    def error_count(self) -> int:
+        return self._error_count
+
     def register(self) -> None:
         for signal_type in self.subscriptions:
             self._bus.subscribe(signal_type, self._on_signal)

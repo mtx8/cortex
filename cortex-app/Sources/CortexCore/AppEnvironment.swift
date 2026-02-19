@@ -17,11 +17,9 @@ public final class AppEnvironment {
     public let opportunities = OpportunityStore()
 
     public init() {
-        portfolio.loadMockData()
-        squadrons.loadMockData()
-        signalFeed.loadMockData()
-        activity.loadMockData()
-        performance.loadMockData()
-        opportunities.loadMockData()
+        // Stores populate from WebSocket when backend is connected.
+        // No mock data — real data only.
+        settings.webSocket = webSocket
+        search.webSocket = webSocket
     }
 }

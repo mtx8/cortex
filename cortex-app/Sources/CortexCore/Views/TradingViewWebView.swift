@@ -4,6 +4,10 @@ import WebKit
 /// NSViewRepresentable wrapper that loads TradingView's Advanced Chart widget
 /// inside a WKWebView. The widget is configured for dark theme, the requested
 /// symbol / timeframe, and includes RSI, MACD, and Volume studies.
+///
+/// The Coordinator tracks the previous symbol and timeframe so the full HTML
+/// is only reloaded when a value actually changes (avoiding expensive reloads
+/// on every SwiftUI state update).
 public struct TradingViewWebView: NSViewRepresentable {
     let symbol: String
     let timeframe: String
@@ -20,11 +24,31 @@ public struct TradingViewWebView: NSViewRepresentable {
         config.preferences.setValue(true, forKey: "javaScriptEnabled")
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
+
+        // Store initial values in coordinator
+        context.coordinator.previousSymbol = symbol
+        context.coordinator.previousTimeframe = timeframe
+
         loadChart(webView: webView)
         return webView
     }
 
     public func updateNSView(_ webView: WKWebView, context: Context) {
+        let coordinator = context.coordinator
+
+        // Only reload if symbol or timeframe actually changed
+        guard symbol != coordinator.previousSymbol || timeframe != coordinator.previousTimeframe else {
+            return
+        }
+
+        // Update tracked values
+        coordinator.previousSymbol = symbol
+        coordinator.previousTimeframe = timeframe
+
+        // Reload with new parameters.
+        // TradingView's embedded widget does not expose a reliable setSymbol()
+        // API on the object created by `new TradingView.widget(...)`, so the
+        // most robust approach is a full HTML reload when the values change.
         loadChart(webView: webView)
     }
 
@@ -99,6 +123,9 @@ public struct TradingViewWebView: NSViewRepresentable {
     // MARK: - Coordinator
 
     public class Coordinator: NSObject, WKNavigationDelegate {
+        var previousSymbol: String = ""
+        var previousTimeframe: String = ""
+
         public func webView(
             _ webView: WKWebView,
             decidePolicyFor navigationAction: WKNavigationAction,

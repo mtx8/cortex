@@ -38,9 +38,24 @@ async def lifespan(app: FastAPI):
     if market_feed is not None:
         feed_task = asyncio.create_task(market_feed.start())
 
+    # Start status broadcaster if available
+    status_task = None
+    status_broadcaster = components.get("status_broadcaster")
+    if status_broadcaster is not None:
+        status_task = asyncio.create_task(status_broadcaster.start())
+
     yield
 
     # Graceful shutdown
+    if status_broadcaster is not None:
+        await status_broadcaster.stop()
+    if status_task is not None:
+        status_task.cancel()
+        try:
+            await status_task
+        except asyncio.CancelledError:
+            pass
+
     if market_feed is not None:
         await market_feed.stop()
     if feed_task is not None:
@@ -208,6 +223,7 @@ def create_app_components() -> dict:
     from cortex.connectors.polygon.rest_client import PolygonRESTClient
     from cortex.feeds.market_data import MarketDataFeed
     from cortex.intelligence.chat import CortexChat
+    from cortex.feeds.status_broadcaster import StatusBroadcaster
 
     bus = SignalBus()
     autonomy = AutonomyDial()
@@ -289,6 +305,13 @@ def create_app_components() -> dict:
         bus=bus,
     )
 
+    # Periodic status broadcaster
+    status_broadcaster = StatusBroadcaster(
+        broadcaster=broadcaster,
+        orchestrator=orchestrator,
+        interval=5.0,
+    )
+
     return {
         "bus": bus,
         "autonomy": autonomy,
@@ -300,6 +323,7 @@ def create_app_components() -> dict:
         "polygon_client": polygon_client,
         "market_feed": market_feed,
         "chat": chat,
+        "status_broadcaster": status_broadcaster,
     }
 
 

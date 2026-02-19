@@ -6,12 +6,18 @@ import Foundation
 public final class SearchStore {
     public var results: [(ticker: String, name: String)] = []
     public var isSearching: Bool = false
+    public var webSocket: WebSocketClient?
 
     public init() {}
 
     /// Quick local filter against a hardcoded list of common tickers.
-    /// This will be replaced with real Polygon.io search via WebSocket later.
+    /// When connected, also sends a search request via WebSocket.
     public func localSearch(_ query: String) {
+        // Send WebSocket search request if connected
+        if let ws = webSocket, ws.isConnected {
+            let msg: [String: Any] = ["type": "cmd_search_ticker", "payload": ["query": query]]
+            Task { try? await ws.send(msg) }
+        }
         let allTickers: [(String, String)] = [
             ("AAPL", "Apple Inc"),
             ("MSFT", "Microsoft Corp"),
