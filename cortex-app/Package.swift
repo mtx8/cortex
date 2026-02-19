@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "CortexCore", targets: ["CortexCore"]),
+        .executable(name: "CortexApp", targets: ["CortexApp"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
@@ -16,6 +17,10 @@ let package = Package(
             dependencies: [
                 .product(name: "Logging", package: "swift-log"),
             ]
+        ),
+        .executableTarget(
+            name: "CortexApp",
+            dependencies: ["CortexCore"]
         ),
         .testTarget(
             name: "CortexCoreTests",
