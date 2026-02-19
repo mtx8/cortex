@@ -199,7 +199,7 @@ class TradePipeline:
             signal_id=f"pipeline_{order_id}",
             source_agent="trade_pipeline",
             source_squadron="orchestrator",
-            signal_type="bravo.order_submit",
+            signal_type=SignalTypes.ORDER_SUBMITTED,
             payload={
                 "order_id": order_id,
                 "symbol": symbol,

@@ -1,6 +1,7 @@
 import asyncio
 import pytest
 from cortex.orchestrator.bus import SignalBus
+from cortex.orchestrator.signals import SignalTypes
 from cortex.orchestrator.trade_pipeline import (
     TradePipeline,
     PipelineOrder,
@@ -160,7 +161,7 @@ async def test_pipeline_emits_submit_signal():
     pipeline = TradePipeline(bus=bus, risk_guardian=guardian)
 
     submitted = []
-    bus.subscribe("bravo.order_submit", lambda s: submitted.append(s))
+    bus.subscribe(SignalTypes.ORDER_SUBMITTED, lambda s: submitted.append(s))
 
     task = asyncio.create_task(bus.run())
 
