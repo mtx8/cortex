@@ -389,7 +389,7 @@ def create_app_components() -> dict:
         port=config.ibkr_port,
         client_id=config.ibkr_client_id,
     )
-    ibkr_manager = IBKRConnectionManager(config=ibkr_config)
+    ibkr_manager = IBKRConnectionManager(config=ibkr_config, rate_limiter=ibkr_rate_limiter)
 
     return {
         "bus": bus,

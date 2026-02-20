@@ -194,14 +194,25 @@ class MarketDataFeed:
             # Small random drift each cycle (±3 points)
             state["score"] = max(20, min(98, state["score"] + self._rng.uniform(-3, 3)))
 
+            opp_type = state["type"]
+            score = round(state["score"], 1)
+            direction = "short" if opp_type == "Flow" else "long"
+
             msg = CortexMessage(
                 type=MessageType.SCANNER_RESULT,
                 payload={
+                    "id": ticker,
                     "ticker": ticker,
-                    "composite_score": round(state["score"], 1),
-                    "type": state["type"],
-                    "thesis": f"{ticker}: {theses[state['type']]}",
+                    "composite_score": score,
+                    "type": opp_type,
+                    "thesis": f"{ticker}: {theses[opp_type]}",
                     "risk_reward": state["rr"],
+                    "direction": direction,
+                    "sector": "Unknown",
+                    "market": "stocks",
+                    "market_cap": 0,
+                    "short_interest": 0.0,
+                    "ai_insight": f"High momentum score ({score}) with {opp_type.lower()} pattern",
                 },
             )
             await self._broadcaster.broadcast(msg)

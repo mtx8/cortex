@@ -201,13 +201,15 @@ public final class FinancialsStore {
     public var sentiment: SentimentData?
     public var aiAnalysis: AIStockAnalysis?
     public var isLoading: Bool = false
+    public var errorMessage: String?
     public var recentSearches: [String] = []
 
     public var webSocket: WebSocketClient?
 
+    private var searchTimeoutTask: Task<Void, Never>?
+
     public init() {
-        // Load AAPL mock data by default so the view is not empty on launch
-        loadMockData(for: "AAPL")
+        // Empty state on launch -- real data only, no mock data
     }
 
     // MARK: - Search
@@ -226,6 +228,10 @@ public final class FinancialsStore {
         recentSearches.insert(ticker, at: 0)
         if recentSearches.count > 10 { recentSearches.removeLast() }
 
+        // Cancel any previous timeout
+        searchTimeoutTask?.cancel()
+        errorMessage = nil
+
         // Send request to backend if connected
         if let ws = webSocket, ws.isConnected {
             let msg: [String: Any] = [
@@ -240,6 +246,16 @@ public final class FinancialsStore {
                     loadMockData(for: ticker)
                 }
             }
+
+            // Start a 10-second timeout in case the backend never responds
+            searchTimeoutTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard !Task.isCancelled else { return }
+                if isLoading {
+                    isLoading = false
+                    errorMessage = "Request timed out. Please try again."
+                }
+            }
         } else {
             // No WebSocket -- use mock data
             loadMockData(for: ticker)
@@ -250,6 +266,8 @@ public final class FinancialsStore {
 
     /// Apply profile data from backend
     public func applyProfile(_ data: [String: Any]) {
+        searchTimeoutTask?.cancel()
+        errorMessage = nil
         let symbol = data["symbol"] as? String ?? selectedSymbol ?? ""
         let name = data["name"] as? String ?? symbol
         let sector = data["sector"] as? String ?? "Unknown"
@@ -299,6 +317,8 @@ public final class FinancialsStore {
 
     /// Apply news data from backend
     public func applyNews(_ items: [[String: Any]]) {
+        searchTimeoutTask?.cancel()
+        errorMessage = nil
         news = items.map { item in
             let sentimentRaw = item["sentiment"] as? String ?? "neutral"
             let sentiment: NewsItem.Sentiment = NewsItem.Sentiment(rawValue: sentimentRaw) ?? .neutral
@@ -320,6 +340,8 @@ public final class FinancialsStore {
 
     /// Apply SEC filings from backend
     public func applyFilings(_ items: [[String: Any]]) {
+        searchTimeoutTask?.cancel()
+        errorMessage = nil
         filings = items.map { item in
             let filedStr = item["filed_date"] as? String ?? ""
             let filedDate = ISO8601DateFormatter().date(from: filedStr) ?? Date()
@@ -336,6 +358,8 @@ public final class FinancialsStore {
 
     /// Apply sentiment data from backend
     public func applySentiment(_ data: [String: Any]) {
+        searchTimeoutTask?.cancel()
+        errorMessage = nil
         let trendRaw = data["trend"] as? String ?? "stable"
         let trend = SentimentData.Trend(rawValue: trendRaw) ?? .stable
         let keywords = data["top_keywords"] as? [String] ?? []
@@ -350,6 +374,8 @@ public final class FinancialsStore {
 
     /// Apply AI analysis from backend
     public func applyAIAnalysis(_ data: [String: Any]) {
+        searchTimeoutTask?.cancel()
+        errorMessage = nil
         let recRaw = data["recommendation"] as? String ?? "Hold"
         let recommendation = AIStockAnalysis.Recommendation(rawValue: recRaw) ?? .hold
         let risks = data["key_risks"] as? [String] ?? []

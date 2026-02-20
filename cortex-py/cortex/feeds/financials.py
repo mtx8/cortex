@@ -60,6 +60,17 @@ class FinancialsAggregator:
             await ws.send_text(encode_message(msg))
         results["news"] = news
 
+        # Derive sentiment from news headlines and send to client
+        if news:
+            sentiment = self._derive_sentiment(news)
+            if ws:
+                msg = CortexMessage(
+                    type=MessageType.FINANCIALS_SENTIMENT,
+                    payload=sentiment,
+                )
+                await ws.send_text(encode_message(msg))
+            results["sentiment"] = sentiment
+
         # Generate AI analysis if chat is available
         if self._chat:
             ai_analysis = await self._generate_ai_analysis(symbol, polygon_data, edgar_data, news)
@@ -232,6 +243,45 @@ class FinancialsAggregator:
         except Exception as e:
             log.error("financials.ai_analysis_error", symbol=symbol, error=str(e))
             return None
+
+    def _derive_sentiment(self, news: list[dict]) -> dict:
+        """Simple keyword-based sentiment analysis on news headlines."""
+        positive_words = {"surge", "rally", "beat", "upgrade", "growth", "record"}
+        negative_words = {"crash", "plunge", "miss", "downgrade", "loss", "decline", "warning"}
+
+        positive_count = 0
+        negative_count = 0
+
+        for item in news:
+            headline = item.get("title", "").lower()
+            words = set(headline.split())
+            if words & positive_words:
+                positive_count += 1
+            if words & negative_words:
+                negative_count += 1
+
+        total = len(news)
+        if positive_count > negative_count:
+            overall = "bullish"
+        elif negative_count > positive_count:
+            overall = "bearish"
+        else:
+            overall = "neutral"
+
+        # Score 0-100: 50 is neutral, >50 bullish, <50 bearish
+        if total > 0:
+            score = int(50 + ((positive_count - negative_count) / total) * 50)
+            score = max(0, min(100, score))
+        else:
+            score = 50
+
+        return {
+            "overall_sentiment": overall,
+            "score": score,
+            "positive_count": positive_count,
+            "negative_count": negative_count,
+            "total_analyzed": total,
+        }
 
     def _parse_recommendation(self, text: str) -> str:
         """Extract recommendation from AI response text."""
