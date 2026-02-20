@@ -57,11 +57,37 @@ public final class WatchlistStore {
 
     /// Default watchlist symbols — prices populate from the backend via WebSocket.
     private static let defaultSymbols = ["AAPL", "NVDA", "MSFT", "TSLA", "META", "AMZN", "GOOG", "SPY", "QQQ"]
+    private static let persistenceKey = "cortex_watchlist_symbols"
 
     public init() {
-        // Pre-populate with default symbols (prices = 0 until backend connects)
-        items = Self.defaultSymbols.map { WatchlistItem(symbol: $0, price: 0) }
+        // Load persisted symbols, falling back to defaults on first launch
+        let symbols: [String]
+        if let saved = UserDefaults.standard.stringArray(forKey: Self.persistenceKey), !saved.isEmpty {
+            symbols = saved
+        } else {
+            symbols = Self.defaultSymbols
+        }
+        items = symbols.map { WatchlistItem(symbol: $0, price: 0) }
         // Positions populate from broker connection — empty until then
+    }
+
+    // MARK: - Add / Remove / Persist
+
+    public func addSymbol(_ symbol: String) {
+        let upper = symbol.uppercased().trimmingCharacters(in: .whitespaces)
+        guard !upper.isEmpty, !items.contains(where: { $0.symbol == upper }) else { return }
+        items.append(WatchlistItem(symbol: upper, price: 0))
+        persist()
+    }
+
+    public func removeSymbol(_ symbol: String) {
+        items.removeAll { $0.symbol == symbol }
+        persist()
+    }
+
+    private func persist() {
+        let symbols = items.map(\.symbol)
+        UserDefaults.standard.set(symbols, forKey: Self.persistenceKey)
     }
 
     public func updatePrice(symbol: String, price: Double, change: Double, changePercent: Double) {
@@ -71,8 +97,9 @@ public final class WatchlistStore {
             items[idx].changePercent = changePercent
             items[idx].lastUpdate = Date()
         } else {
-            // New symbol from backend — add it to the watchlist
+            // New symbol from backend — add it to the watchlist and persist
             items.append(WatchlistItem(symbol: symbol, price: price, change: change, changePercent: changePercent))
+            persist()
         }
     }
 

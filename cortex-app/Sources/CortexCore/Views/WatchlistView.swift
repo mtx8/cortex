@@ -2,82 +2,266 @@ import SwiftUI
 
 public struct WatchlistView: View {
     let store: WatchlistStore
+    @Environment(\.cortexSelectedSection) private var selectedSection
+    @State private var newSymbolText: String = ""
 
     public init(store: WatchlistStore) {
         self.store = store
     }
 
     public var body: some View {
+        switch selectedSection {
+        case "Active Positions":
+            positionsFullView
+        case "All Symbols":
+            watchlistFullView
+        case "Alerts":
+            alertsPlaceholder
+        case "Order History":
+            orderHistoryPlaceholder
+        default:
+            defaultSplitView
+        }
+    }
+
+    // MARK: - Default Split View
+
+    @ViewBuilder
+    private var defaultSplitView: some View {
         HSplitView {
-            // Left: Watchlist
-            VStack(spacing: 0) {
-                HStack {
-                    Image(systemName: "eye.fill")
-                        .foregroundStyle(.blue)
-                    Text("Watchlist")
-                        .font(.headline)
-                    Spacer()
-                    Text("\(store.items.count) symbols")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            watchlistPanel
+                .frame(minWidth: 500)
+
+            positionsPanel
+                .frame(minWidth: 350)
+        }
+    }
+
+    // MARK: - Watchlist Panel (reusable)
+
+    @ViewBuilder
+    private var watchlistPanel: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Image(systemName: "eye.fill")
+                    .foregroundStyle(CortexDesign.accentPrimary)
+                Text("Watchlist")
+                    .font(.headline)
+                Spacer()
+                Text("\(store.items.count) symbols")
+                    .font(CortexDesign.labelFont)
+                    .foregroundStyle(.secondary)
+            }
+            .padding()
+
+            // Add-symbol bar
+            HStack(spacing: 8) {
+                TextField("Add symbol...", text: $newSymbolText)
+                    .textFieldStyle(.plain)
+                    .font(CortexDesign.dataFont)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: CortexDesign.badgeRadius)
+                            .fill(CortexDesign.bgElevated)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: CortexDesign.badgeRadius)
+                            .strokeBorder(CortexDesign.border, lineWidth: 1)
+                    )
+                    .onSubmit { addSymbolFromField() }
+
+                Button(action: addSymbolFromField) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.system(size: 12))
+                        Text("Add")
+                            .font(.system(size: 12, weight: .semibold))
+                    }
+                    .foregroundStyle(CortexDesign.accentPrimary)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: CortexDesign.badgeRadius)
+                            .fill(CortexDesign.accentPrimary.opacity(0.08))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: CortexDesign.badgeRadius)
+                            .strokeBorder(CortexDesign.accentPrimary.opacity(0.3), lineWidth: 1)
+                    )
                 }
-                .padding()
+                .buttonStyle(.plain)
+                .disabled(newSymbolText.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 8)
 
-                Divider()
+            Divider()
 
-                // Column headers
-                HStack {
-                    Text("Symbol").frame(width: 80, alignment: .leading)
-                    Text("Price").frame(width: 80, alignment: .trailing)
-                    Text("Change").frame(width: 90, alignment: .trailing)
-                    Text("Volume").frame(width: 80, alignment: .trailing)
-                    Text("RSI").frame(width: 50, alignment: .trailing)
-                    Text("Signal").frame(width: 70, alignment: .center)
-                }
-                .font(.caption.bold())
-                .foregroundStyle(.secondary)
-                .padding(.horizontal)
-                .padding(.vertical, 6)
-                .background(Color(.controlBackgroundColor))
+            // Column headers
+            HStack {
+                Text("Symbol").frame(width: 80, alignment: .leading)
+                Text("Price").frame(width: 80, alignment: .trailing)
+                Text("Change").frame(width: 90, alignment: .trailing)
+                Text("Volume").frame(width: 80, alignment: .trailing)
+                Text("RSI").frame(width: 50, alignment: .trailing)
+                Text("Signal").frame(width: 70, alignment: .center)
+            }
+            .font(.caption.bold())
+            .foregroundStyle(.secondary)
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(CortexDesign.bgCard)
 
-                List(store.items) { item in
+            List {
+                ForEach(store.items) { item in
                     WatchlistRow(item: item, isSelected: store.selectedSymbol == item.symbol)
                         .contentShape(Rectangle())
                         .onTapGesture { store.selectedSymbol = item.symbol }
+                        .contextMenu {
+                            Button(role: .destructive) {
+                                store.removeSymbol(item.symbol)
+                            } label: {
+                                Label("Remove \(item.symbol)", systemImage: "trash")
+                            }
+                        }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button(role: .destructive) {
+                                store.removeSymbol(item.symbol)
+                            } label: {
+                                Label("Remove", systemImage: "trash")
+                            }
+                        }
+                }
+            }
+            .listStyle(.plain)
+        }
+    }
+
+    private func addSymbolFromField() {
+        let trimmed = newSymbolText.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        store.addSymbol(trimmed)
+        newSymbolText = ""
+    }
+
+    // MARK: - Positions Panel (reusable)
+
+    @ViewBuilder
+    private var positionsPanel: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Image(systemName: "briefcase.fill")
+                    .foregroundStyle(.green)
+                Text("Open Positions")
+                    .font(.headline)
+                Spacer()
+                let pnl = store.totalUnrealizedPnL
+                Text(String(format: "%@$%.2f", pnl >= 0 ? "+" : "", pnl))
+                    .font(.headline)
+                    .foregroundStyle(pnl >= 0 ? .green : .red)
+            }
+            .padding()
+
+            Divider()
+
+            if store.positions.isEmpty {
+                ContentUnavailableView("No Open Positions", systemImage: "tray",
+                    description: Text("Positions will appear here when trades are executed."))
+            } else {
+                List(store.positions) { position in
+                    PositionRow(position: position)
                 }
                 .listStyle(.plain)
             }
-            .frame(minWidth: 500)
-
-            // Right: Positions
-            VStack(spacing: 0) {
-                HStack {
-                    Image(systemName: "briefcase.fill")
-                        .foregroundStyle(.green)
-                    Text("Open Positions")
-                        .font(.headline)
-                    Spacer()
-                    let pnl = store.totalUnrealizedPnL
-                    Text(String(format: "%@$%.2f", pnl >= 0 ? "+" : "", pnl))
-                        .font(.headline)
-                        .foregroundStyle(pnl >= 0 ? .green : .red)
-                }
-                .padding()
-
-                Divider()
-
-                if store.positions.isEmpty {
-                    ContentUnavailableView("No Open Positions", systemImage: "tray",
-                        description: Text("Positions will appear here when trades are executed."))
-                } else {
-                    List(store.positions) { position in
-                        PositionRow(position: position)
-                    }
-                    .listStyle(.plain)
-                }
-            }
-            .frame(minWidth: 350)
         }
+    }
+
+    // MARK: - Full Width Views
+
+    @ViewBuilder
+    private var watchlistFullView: some View {
+        watchlistPanel
+    }
+
+    @ViewBuilder
+    private var positionsFullView: some View {
+        positionsPanel
+    }
+
+    // MARK: - Alerts Placeholder
+
+    @ViewBuilder
+    private var alertsPlaceholder: some View {
+        VStack(spacing: 16) {
+            Spacer()
+
+            Image(systemName: "bell.badge")
+                .font(.system(size: 40))
+                .foregroundStyle(Color(white: 0.2))
+
+            Text("Price Alerts")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(Color(white: 0.6))
+
+            Text("Configure price alerts for your watchlist symbols.\nGet notified when prices hit your target levels.")
+                .font(.system(size: 12))
+                .foregroundStyle(Color(white: 0.4))
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 350)
+
+            Button(action: {}) {
+                HStack(spacing: 6) {
+                    Image(systemName: "plus.circle.fill")
+                        .font(.system(size: 12))
+                    Text("Create Alert")
+                        .font(.system(size: 12, weight: .semibold))
+                }
+                .foregroundStyle(.cyan)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.cyan.opacity(0.08))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(Color.cyan.opacity(0.3), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(white: 0.05))
+    }
+
+    // MARK: - Order History Placeholder
+
+    @ViewBuilder
+    private var orderHistoryPlaceholder: some View {
+        VStack(spacing: 16) {
+            Spacer()
+
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: 40))
+                .foregroundStyle(Color(white: 0.2))
+
+            Text("Order History")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(Color(white: 0.6))
+
+            Text("Recent order executions will appear here.\nAll filled, cancelled, and pending orders are logged.")
+                .font(.system(size: 12))
+                .foregroundStyle(Color(white: 0.4))
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 350)
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(white: 0.05))
     }
 }
 
