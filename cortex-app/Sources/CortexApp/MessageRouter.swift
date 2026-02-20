@@ -22,6 +22,10 @@ public final class MessageRouter {
         environment.chat.webSocket = environment.webSocket
         // Wire WebSocket reference into FinancialsStore for sending
         environment.financials.webSocket = environment.webSocket
+        // Wire WebSocket references into new stores
+        environment.trade.webSocket = environment.webSocket
+        environment.options.webSocket = environment.webSocket
+        environment.simulation.webSocket = environment.webSocket
     }
 
     /// Begin the WebSocket connection.
@@ -93,13 +97,20 @@ public final class MessageRouter {
                 environment.chat.finishStreaming()
             }
 
+        // Handle error responses from chat (prevents stuck UI)
+        case "chat_response":
+            if let error = payload["error"] as? String {
+                environment.chat.appendChunk(error)
+                environment.chat.finishStreaming()
+            }
+
         // MARK: - Market Data
 
         case "market_quote":
-            let symbol = payload["symbol"] as? String ?? ""
+            let symbol = payload["ticker"] as? String ?? payload["symbol"] as? String ?? ""
             let price = payload["price"] as? Double ?? 0
             let change = payload["change"] as? Double ?? 0
-            let changePct = payload["change_percent"] as? Double ?? 0
+            let changePct = payload["change_pct"] as? Double ?? 0
             environment.watchlist.updatePrice(
                 symbol: symbol,
                 price: price,
@@ -142,6 +153,42 @@ public final class MessageRouter {
 
         case "financials_ai_analysis":
             environment.financials.applyAIAnalysis(payload)
+
+        case "financials_error":
+            let error = payload["error"] as? String ?? "Unknown error"
+            environment.financials.applyError(error)
+
+        // MARK: - Level 2 / Time & Sales
+
+        case "l2_update":
+            environment.level2.applyL2Update(payload)
+
+        case "time_sales":
+            environment.level2.applyTimeSales(payload)
+
+        // MARK: - Trade / Positions / Orders
+
+        case "position_update":
+            environment.trade.applyPositionUpdate(payload)
+
+        case "order_status":
+            environment.trade.applyOrderStatus(payload)
+
+        // MARK: - Options
+
+        case "option_chain_data":
+            environment.options.applyOptionChain(payload)
+
+        case "profit_calculation":
+            environment.options.applyProfitCalculation(payload)
+
+        // MARK: - Simulation
+
+        case "simulation_update":
+            environment.simulation.applySimulationUpdate(payload)
+
+        case "learning_insight":
+            environment.simulation.applyLearningInsight(payload)
 
         // MARK: - Scanner Results
 
