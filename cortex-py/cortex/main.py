@@ -608,6 +608,20 @@ def create_app_components() -> dict:
     from cortex.squadrons.foxtrot.wash_sale_guard import WashSaleGuard
     from cortex.squadrons.foxtrot.harvest_bot import HarvestBot
     from cortex.squadrons.delta.news_catalyst import NewsCatalyst
+    from cortex.squadrons.golf.trade_historian import TradeHistorian
+    from cortex.squadrons.golf.pattern_learner import PatternLearner
+    from cortex.squadrons.golf.strategy_optimizer import StrategyOptimizer
+    from cortex.squadrons.golf.regime_detector import RegimeDetector
+    from cortex.squadrons.golf.performance_tracker import PerformanceTracker
+    from cortex.squadrons.golf.drawdown_analyzer import DrawdownAnalyzer
+    from cortex.squadrons.golf.sector_momentum import SectorMomentum
+    from cortex.squadrons.golf.correlation_tracker import CorrelationTracker
+    from cortex.squadrons.hotel.spread_analyzer import SpreadAnalyzer
+    from cortex.squadrons.hotel.depth_reader import DepthReader
+    from cortex.squadrons.hotel.tick_analyzer import TickAnalyzer
+    from cortex.squadrons.hotel.price_level_mapper import PriceLevelMapper
+    from cortex.squadrons.hotel.execution_optimizer import ExecutionOptimizer
+    from cortex.squadrons.hotel.latency_monitor import LatencyMonitor
     from cortex.api.ws_broadcaster import WSBroadcaster
     from cortex.connectors.polygon.rest_client import PolygonRESTClient
     from cortex.feeds.market_data import MarketDataFeed
@@ -689,6 +703,50 @@ def create_app_components() -> dict:
     # DELTA squadron
     news_catalyst = NewsCatalyst(bus=bus)
     orchestrator.register_agent(news_catalyst)
+
+    # GOLF squadron — Adaptive Learning
+    trade_historian = TradeHistorian(bus=bus)
+    orchestrator.register_agent(trade_historian)
+
+    pattern_learner = PatternLearner(bus=bus, trade_historian=trade_historian)
+    orchestrator.register_agent(pattern_learner)
+
+    strategy_optimizer = StrategyOptimizer(bus=bus)
+    orchestrator.register_agent(strategy_optimizer)
+
+    regime_detector = RegimeDetector(bus=bus)
+    orchestrator.register_agent(regime_detector)
+
+    performance_tracker = PerformanceTracker(bus=bus)
+    orchestrator.register_agent(performance_tracker)
+
+    golf_drawdown_analyzer = DrawdownAnalyzer(bus=bus)
+    orchestrator.register_agent(golf_drawdown_analyzer)
+
+    sector_momentum = SectorMomentum(bus=bus)
+    orchestrator.register_agent(sector_momentum)
+
+    correlation_tracker = CorrelationTracker(bus=bus)
+    orchestrator.register_agent(correlation_tracker)
+
+    # HOTEL squadron — Market Microstructure
+    spread_analyzer = SpreadAnalyzer(bus=bus)
+    orchestrator.register_agent(spread_analyzer)
+
+    depth_reader = DepthReader(bus=bus)
+    orchestrator.register_agent(depth_reader)
+
+    tick_analyzer = TickAnalyzer(bus=bus)
+    orchestrator.register_agent(tick_analyzer)
+
+    price_level_mapper = PriceLevelMapper(bus=bus)
+    orchestrator.register_agent(price_level_mapper)
+
+    execution_optimizer = ExecutionOptimizer(bus=bus)
+    orchestrator.register_agent(execution_optimizer)
+
+    latency_monitor = LatencyMonitor(bus=bus)
+    orchestrator.register_agent(latency_monitor)
 
     # WebSocket broadcaster
     broadcaster = WSBroadcaster(bus=bus)
