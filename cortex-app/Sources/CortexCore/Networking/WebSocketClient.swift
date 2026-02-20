@@ -54,7 +54,10 @@ public final class WebSocketClient {
             throw URLError(.notConnectedToInternet)
         }
         let jsonData = try JSONSerialization.data(withJSONObject: data)
-        try await task.send(.data(jsonData))
+        guard let text = String(data: jsonData, encoding: .utf8) else {
+            throw URLError(.cannotParseResponse)
+        }
+        try await task.send(.string(text))
     }
 
     private func receiveMessages() {

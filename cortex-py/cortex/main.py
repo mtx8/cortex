@@ -108,12 +108,22 @@ async def websocket_endpoint(ws: WebSocket):
     log.info("ws.connected", clients=broadcaster.client_count)
 
     try:
-        while True:
-            data = await ws.receive_json()
+        from cortex.api.protocol import (
+            MessageType, CortexMessage, decode_message, encode_message,
+        )
+        import orjson
 
-            from cortex.api.protocol import (
-                MessageType, CortexMessage, decode_message, encode_message,
-            )
+        while True:
+            # Handle both text and binary WebSocket frames
+            raw = await ws.receive()
+            if raw.get("type") == "websocket.disconnect":
+                break
+            if raw.get("text"):
+                data = orjson.loads(raw["text"])
+            elif raw.get("bytes"):
+                data = orjson.loads(raw["bytes"])
+            else:
+                continue
 
             msg = decode_message(data)
 
