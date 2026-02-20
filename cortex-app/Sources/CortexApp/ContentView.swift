@@ -126,7 +126,7 @@ struct ContentView: View {
         case .trade:
             TradeView(environment: environment)
         case .financials:
-            FinancialsView(store: environment.financials, chatStore: environment.chat)
+            FinancialsView(store: environment.financials, chatStore: environment.chat, optionsStore: environment.options)
         case .watchlist:
             WatchlistView(store: environment.watchlist)
         case .squadrons:

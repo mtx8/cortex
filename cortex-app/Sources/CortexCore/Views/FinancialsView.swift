@@ -2,6 +2,7 @@ import SwiftUI
 
 public struct FinancialsView: View {
     @Bindable var store: FinancialsStore
+    @Environment(\.cortexSelectedSection) private var envSelectedSection
 
     public enum Section: String, CaseIterable {
         case fundamentals = "Fundamentals"
@@ -9,12 +10,17 @@ public struct FinancialsView: View {
         case filings = "SEC Filings"
         case sentiment = "Sentiment"
         case aiAnalysis = "AI Analysis"
+        case optionsAnalysis = "Options"
     }
 
-    @State private var selectedSection: Section = .fundamentals
+    @State private var activeSection: Section = .fundamentals
+    private var chatStore: ChatStore?
+    private var optionsStore: OptionsStore?
 
-    public init(store: FinancialsStore) {
+    public init(store: FinancialsStore, chatStore: ChatStore? = nil, optionsStore: OptionsStore? = nil) {
         self.store = store
+        self.chatStore = chatStore
+        self.optionsStore = optionsStore
     }
 
     public var body: some View {
@@ -29,6 +35,24 @@ public struct FinancialsView: View {
                 ProgressView("Loading financial data...")
                     .foregroundStyle(.secondary)
                 Spacer()
+            } else if let error = store.errorMessage {
+                Spacer()
+                VStack(spacing: 12) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 36))
+                        .foregroundStyle(.orange)
+                    Text(error)
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                    Button("Try Again") {
+                        if let symbol = store.selectedSymbol {
+                            store.search(symbol)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
+                Spacer()
             } else if let profile = store.profile {
                 ScrollView {
                     VStack(spacing: 16) {
@@ -36,7 +60,7 @@ public struct FinancialsView: View {
                         keyStatsGrid(profile)
                         sectionPicker
 
-                        switch selectedSection {
+                        switch activeSection {
                         case .fundamentals:
                             fundamentalsPanel(profile)
                         case .news:
@@ -47,6 +71,8 @@ public struct FinancialsView: View {
                             sentimentPanel
                         case .aiAnalysis:
                             aiAnalysisPanel
+                        case .optionsAnalysis:
+                            optionsAnalysisPanel
                         }
                     }
                     .padding(20)
@@ -56,6 +82,29 @@ public struct FinancialsView: View {
             }
         }
         .background(Color(nsColor: NSColor(red: 0.06, green: 0.06, blue: 0.09, alpha: 1.0)))
+        .onChange(of: store.selectedSymbol) { _, newSymbol in
+            if let sym = newSymbol {
+                chatStore?.selectedSymbol = sym
+            }
+        }
+        .onChange(of: envSelectedSection) { _, newValue in
+            switch newValue {
+            case "Fundamentals", "Overview":
+                activeSection = .fundamentals
+            case "SEC Filings":
+                activeSection = .filings
+            case "News & Catalysts":
+                activeSection = .news
+            case "Social Sentiment":
+                activeSection = .sentiment
+            case "AI Analysis":
+                activeSection = .aiAnalysis
+            case "Options":
+                activeSection = .optionsAnalysis
+            default:
+                break
+            }
+        }
     }
 
     // MARK: - Search Bar
@@ -250,14 +299,14 @@ public struct FinancialsView: View {
     private var sectionPicker: some View {
         HStack(spacing: 0) {
             ForEach(Section.allCases, id: \.self) { section in
-                Button(action: { selectedSection = section }) {
+                Button(action: { activeSection = section }) {
                     Text(section.rawValue)
-                        .font(.system(size: 12, weight: selectedSection == section ? .bold : .medium))
+                        .font(.system(size: 12, weight: activeSection == section ? .bold : .medium))
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
-                        .foregroundStyle(selectedSection == section ? .white : .secondary)
+                        .foregroundStyle(activeSection == section ? .white : .secondary)
                         .background(
-                            selectedSection == section
+                            activeSection == section
                                 ? Color(nsColor: NSColor(red: 0.14, green: 0.14, blue: 0.20, alpha: 1.0))
                                 : Color.clear
                         )
@@ -906,6 +955,51 @@ public struct FinancialsView: View {
             } else {
                 emptySection("No AI analysis available", icon: "brain")
             }
+        }
+    }
+
+    // MARK: - Options Analysis Panel
+
+    @ViewBuilder
+    private var optionsAnalysisPanel: some View {
+        if let optStore = optionsStore {
+            VStack(spacing: 16) {
+                // Load chain button if not loaded
+                if optStore.strikes.isEmpty && !optStore.isLoading {
+                    Button(action: {
+                        if let sym = store.selectedSymbol {
+                            optStore.requestChain(symbol: sym)
+                        }
+                    }) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.down.circle")
+                                .font(.system(size: 12))
+                            Text("Load Option Chain for \(store.selectedSymbol ?? "--")")
+                                .font(.system(size: 12, weight: .semibold))
+                        }
+                        .foregroundStyle(CortexDesign.accentPrimary)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(CortexDesign.accentPrimary.opacity(0.08))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(CortexDesign.accentPrimary.opacity(0.3), lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                OptionChainView(store: optStore)
+                    .frame(minHeight: 300)
+
+                ProfitCalculatorView(store: optStore)
+                    .frame(minHeight: 200)
+            }
+        } else {
+            emptySection("Options store not available", icon: "tablecells")
         }
     }
 
