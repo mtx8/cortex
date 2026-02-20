@@ -8,6 +8,7 @@ Claude is invoked on-demand by the user (not in the execution hot path).
 Responses are streamed as text chunks back to the Swift client.
 """
 
+import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -219,38 +220,56 @@ You help the operator understand their portfolio, market conditions, and trading
         system_prompt = self.build_system_prompt(context)
         messages = self._history_to_messages(conversation_id)
 
-        try:
-            full_response = ""
-            async with client.messages.stream(
-                model=self._model,
-                max_tokens=self._max_tokens,
-                system=system_prompt,
-                messages=messages,
-            ) as stream:
-                async for text in stream.text_stream:
-                    full_response += text
-                    yield text
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                full_response = ""
+                async with client.messages.stream(
+                    model=self._model,
+                    max_tokens=self._max_tokens,
+                    system=system_prompt,
+                    messages=messages,
+                ) as stream:
+                    async for text in stream.text_stream:
+                        full_response += text
+                        yield text
 
-            # Add assistant response to history
-            history.append(ChatMessage(role="assistant", content=full_response))
+                # Add assistant response to history
+                history.append(ChatMessage(role="assistant", content=full_response))
 
-            log.info(
-                "chat.response_complete",
-                conversation_id=conversation_id,
-                response_length=len(full_response),
-                request_count=self._request_count,
-            )
+                log.info(
+                    "chat.response_complete",
+                    conversation_id=conversation_id,
+                    response_length=len(full_response),
+                    request_count=self._request_count,
+                )
+                return  # Success — exit retry loop
 
-        except Exception as e:
-            self._error_count += 1
-            log.error(
-                "chat.stream_error",
-                error=str(e),
-                conversation_id=conversation_id,
-            )
-            error_msg = f"Error generating response: {e}"
-            history.append(ChatMessage(role="assistant", content=error_msg))
-            yield error_msg
+            except Exception as e:
+                error_str = str(e)
+                is_retryable = "overloaded" in error_str.lower() or "529" in error_str
+                if is_retryable and attempt < max_retries - 1:
+                    delay = 2 ** (attempt + 1)  # 2s, 4s
+                    log.warning(
+                        "chat.retrying",
+                        attempt=attempt + 1,
+                        delay=delay,
+                        error=error_str,
+                    )
+                    yield f"[Server busy, retrying in {delay}s...]\n"
+                    await asyncio.sleep(delay)
+                    continue
+
+                self._error_count += 1
+                log.error(
+                    "chat.stream_error",
+                    error=error_str,
+                    conversation_id=conversation_id,
+                )
+                error_msg = f"Error generating response: {e}"
+                history.append(ChatMessage(role="assistant", content=error_msg))
+                yield error_msg
+                return  # Non-retryable or final attempt — stop
 
     def clear_conversation(self, conversation_id: str = "default") -> None:
         """Clear conversation history for a given conversation."""
