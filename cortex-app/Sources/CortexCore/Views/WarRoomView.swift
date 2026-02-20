@@ -34,33 +34,43 @@ public struct WarRoomView: View {
         .background(Color(white: 0.05))
     }
 
-    // MARK: - Overview (default layout)
+    // MARK: - Overview (3-column layout)
 
     @ViewBuilder
     private var overviewLayout: some View {
-        HSplitView {
-            // Left column: Squadron Command + Top Opportunities
-            ScrollView {
-                VStack(spacing: 12) {
-                    SquadronStatusGrid(squadrons: environment.squadrons)
+        VStack(spacing: 0) {
+            // 3-Column main content area
+            HSplitView {
+                // Left column: Squadron Status + Top Opportunities
+                ScrollView {
+                    VStack(spacing: 12) {
+                        SquadronStatusGrid(squadrons: environment.squadrons)
 
-                    ScannerPreview(opportunities: environment.opportunities)
+                        ScannerPreview(opportunities: environment.opportunities)
+                    }
+                    .padding(.bottom, 12)
                 }
-                .padding(.bottom, 12)
-            }
-            .frame(minWidth: 450)
+                .frame(minWidth: 280, idealWidth: 380)
 
-            // Right column: Live Signal Feed + Activity Feed
-            VStack(spacing: 0) {
+                // Center column: Live Signal Feed
                 LiveSignalFeed(signalFeed: environment.signalFeed)
+                    .frame(minWidth: 260, idealWidth: 340)
 
-                Divider()
-                    .overlay(Color(white: 0.10))
-
-                WarRoomActivityFeedView(activity: environment.activity)
-                    .frame(maxHeight: 200)
+                // Right column: Risk Dashboard
+                ScrollView {
+                    RiskDashboardView(
+                        portfolio: environment.portfolio,
+                        killSwitch: environment.killSwitch,
+                        settings: environment.settings
+                    )
+                    .padding(8)
+                }
+                .frame(minWidth: 220, idealWidth: 260)
             }
-            .frame(minWidth: 300)
+
+            // Activity Feed (compact, bottom strip, max 200px)
+            WarRoomActivityFeedView(activity: environment.activity)
+                .frame(maxHeight: 200)
         }
     }
 
