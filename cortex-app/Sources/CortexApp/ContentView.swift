@@ -128,7 +128,7 @@ struct ContentView: View {
         case .financials:
             FinancialsView(store: environment.financials, chatStore: environment.chat, optionsStore: environment.options)
         case .watchlist:
-            WatchlistView(store: environment.watchlist)
+            WatchlistView(store: environment.watchlist, alertStore: environment.alerts)
         case .squadrons:
             SquadronsDetailView(squadrons: environment.squadrons, webSocket: environment.webSocket)
         case .performance:

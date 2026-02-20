@@ -26,6 +26,7 @@ public final class MessageRouter {
         environment.trade.webSocket = environment.webSocket
         environment.options.webSocket = environment.webSocket
         environment.simulation.webSocket = environment.webSocket
+        environment.alerts.webSocket = environment.webSocket
     }
 
     /// Begin the WebSocket connection.
@@ -189,6 +190,11 @@ public final class MessageRouter {
 
         case "learning_insight":
             environment.simulation.applyLearningInsight(payload)
+
+        // MARK: - Alerts
+
+        case "alert_triggered":
+            environment.alerts.applyTriggered(payload)
 
         // MARK: - Scanner Results
 

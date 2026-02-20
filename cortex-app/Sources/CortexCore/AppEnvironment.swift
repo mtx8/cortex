@@ -22,6 +22,7 @@ public final class AppEnvironment {
     public let level2 = Level2Store()
     public let options = OptionsStore()
     public let simulation = SimulationStore()
+    public let alerts = AlertStore()
 
     public init() {
         // Stores populate from WebSocket when backend is connected.
