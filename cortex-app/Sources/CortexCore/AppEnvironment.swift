@@ -15,11 +15,14 @@ public final class AppEnvironment {
     public let webSocket = WebSocketClient()
     public let search = SearchStore()
     public let opportunities = OpportunityStore()
+    public let scannerFilter = ScannerFilterStore()
+    public let financials = FinancialsStore()
 
     public init() {
         // Stores populate from WebSocket when backend is connected.
         // No mock data — real data only.
         settings.webSocket = webSocket
         search.webSocket = webSocket
+        financials.webSocket = webSocket
     }
 }

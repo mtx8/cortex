@@ -20,6 +20,8 @@ public final class MessageRouter {
         }
         // Wire WebSocket reference into ChatStore for sending
         environment.chat.webSocket = environment.webSocket
+        // Wire WebSocket reference into FinancialsStore for sending
+        environment.financials.webSocket = environment.webSocket
     }
 
     /// Begin the WebSocket connection.
@@ -120,12 +122,35 @@ public final class MessageRouter {
                 environment.search.applyRemoteResults(items)
             }
 
+        // MARK: - Financials
+
+        case "financials_profile":
+            environment.financials.applyProfile(payload)
+
+        case "financials_news":
+            if let items = payload["items"] as? [[String: Any]] {
+                environment.financials.applyNews(items)
+            }
+
+        case "financials_filings":
+            if let items = payload["items"] as? [[String: Any]] {
+                environment.financials.applyFilings(items)
+            }
+
+        case "financials_sentiment":
+            environment.financials.applySentiment(payload)
+
+        case "financials_ai_analysis":
+            environment.financials.applyAIAnalysis(payload)
+
         // MARK: - Scanner Results
 
         case "scanner_result":
             // Scanner results can update both signal feed and opportunity store
             if let ticker = payload["ticker"] as? String,
                let score = payload["composite_score"] as? Double {
+                let dirStr = payload["direction"] as? String ?? "LONG"
+                let dir: OpportunityDirection = dirStr.uppercased() == "SHORT" ? .short : .long
                 let opp = Opportunity(
                     id: payload["id"] as? String ?? UUID().uuidString,
                     ticker: ticker,
@@ -133,7 +158,13 @@ public final class MessageRouter {
                     type: Opportunity.OpportunityType(rawValue: payload["type"] as? String ?? "Momentum") ?? .momentum,
                     thesis: payload["thesis"] as? String ?? "",
                     riskReward: payload["risk_reward"] as? Double ?? 0,
-                    timestamp: Date()
+                    timestamp: Date(),
+                    direction: dir,
+                    sector: payload["sector"] as? String,
+                    market: payload["market"] as? String,
+                    marketCap: payload["market_cap"] as? String,
+                    shortInterest: payload["short_interest"] as? Double,
+                    aiInsight: payload["ai_insight"] as? String
                 )
                 environment.opportunities.append(opp)
             }
