@@ -43,10 +43,11 @@ class CortexChat:
         api_key: str,
         model: str = "claude-opus-4-6",
         bus: SignalBus | None = None,
-        max_tokens: int = 2048,
+        max_tokens: int = 4096,
     ):
         self._api_key = api_key
         self._model = model
+        self._fallback_model = "claude-sonnet-4-6"
         self._bus = bus
         self._max_tokens = max_tokens
         self._client = None  # Lazy init
@@ -75,30 +76,43 @@ class CortexChat:
         }
 
     def build_system_prompt(self, context: dict | None = None) -> str:
-        """Build the system prompt with current portfolio context.
+        """Build the system prompt with live platform data.
 
         Args:
-            context: Optional UI context dict with keys like current_tab,
-                     current_section, selected_symbol.
+            context: Enriched context dict with portfolio, scanner_opportunities,
+                     agents, market_quotes, kill_switch, current_tab, current_section,
+                     selected_symbol. Populated by _build_enriched_context() in main.py.
         """
-        ctx = self._portfolio_context
+        ctx = context or {}
 
-        nav = ctx.get("nav", 0.0)
-        daily_pnl = ctx.get("daily_pnl", 0.0)
-        positions = ctx.get("positions", [])
-        top_signals = ctx.get("top_signals", [])
-        risk_metrics = ctx.get("risk_metrics", {})
+        # ── Portfolio KPIs: enriched context > set_portfolio_context > defaults ──
+        portfolio = ctx.get("portfolio") or {}
+        pc = self._portfolio_context or {}
 
+        nav = portfolio.get("nav", pc.get("nav", 0.0))
+        daily_pnl = portfolio.get("daily_pnl", pc.get("daily_pnl", 0.0))
+        total_pnl = portfolio.get("total_pnl", 0.0)
+        win_rate_val = portfolio.get("win_rate", 0.0)
+        sharpe_val = portfolio.get("sharpe_ratio", 0.0)
+        buying_power = portfolio.get("buying_power", 0.0)
+        open_pos = portfolio.get("open_positions", 0)
+
+        # ── Positions (from set_portfolio_context — backward compat) ──
+        positions = pc.get("positions", [])
         positions_text = "\n".join(
             f"  - {p.get('symbol', '?')}: {p.get('qty', 0)} shares @ ${p.get('avg_price', 0):.2f}"
             f" | P&L: ${p.get('pnl', 0):.2f}"
             for p in positions
         ) or "  (no open positions)"
 
+        # ── Top Signals (from set_portfolio_context — backward compat) ──
+        top_signals = pc.get("top_signals", [])
         signals_text = "\n".join(
             f"  - {s}" for s in top_signals[:10]
         ) or "  (no recent signals)"
 
+        # ── Risk Metrics (from set_portfolio_context — backward compat) ──
+        risk_metrics = pc.get("risk_metrics", {})
         risk_text = ""
         if risk_metrics:
             risk_text = (
@@ -110,12 +124,97 @@ class CortexChat:
         else:
             risk_text = "  (no risk data available)"
 
-        prompt = f"""You are CORTEX AI, the intelligent assistant for an autonomous trading platform.
-You help the operator understand their portfolio, market conditions, and trading strategy.
+        # ── Extra portfolio lines (from enriched context) ──
+        portfolio_extra = ""
+        extra_parts = []
+        if total_pnl:
+            extra_parts.append(f"Total P&L: ${total_pnl:+,.2f}")
+        if win_rate_val:
+            extra_parts.append(f"Win Rate: {win_rate_val:.1%}")
+        if sharpe_val:
+            extra_parts.append(f"Sharpe: {sharpe_val:.2f}")
+        if buying_power:
+            extra_parts.append(f"Buying Power: ${buying_power:,.2f}")
+        if open_pos:
+            extra_parts.append(f"Open Positions: {open_pos}")
+        if extra_parts:
+            portfolio_extra = "\n- " + "\n- ".join(extra_parts)
+
+        # ── Kill Switch (from enriched context) ──
+        ks = ctx.get("kill_switch") or {}
+        ks_section = ""
+        if ks.get("active"):
+            ks_section = (
+                f"\n\n## KILL SWITCH ACTIVE\n"
+                f"All trading is HALTED. Reason: {ks.get('reason', 'unknown')}\n"
+                f"No new orders can be placed until the kill switch is disengaged."
+            )
+
+        # ── Scanner Opportunities (from enriched context) ──
+        scanner_opps = ctx.get("scanner_opportunities", [])
+        scanner_section = ""
+        if scanner_opps:
+            lines = []
+            for opp in scanner_opps[:15]:
+                t = opp.get("ticker", "?")
+                s = opp.get("score", 0)
+                ot = opp.get("type", "?")
+                d = opp.get("direction", "long").upper()
+                rr = opp.get("risk_reward", 0)
+                thesis = opp.get("thesis", "")
+                lines.append(
+                    f"  - {t}: Score {s:.1f} | {ot} | {d} | R:R {rr:.1f} | {thesis}"
+                )
+            scanner_section = (
+                f"\n\n## Active Scanner Results ({len(scanner_opps)} opportunities)\n"
+                + "\n".join(lines)
+            )
+
+        # ── Agent/Squadron Health (from enriched context) ──
+        agents = ctx.get("agents", [])
+        agents_section = ""
+        if agents:
+            by_sq: dict[str, list[dict]] = {}
+            for a in agents:
+                sq = a.get("squadron", "unknown")
+                by_sq.setdefault(sq, []).append(a)
+            lines = []
+            for sq, ags in sorted(by_sq.items()):
+                active = sum(1 for a in ags if a.get("status") == "active")
+                sigs = sum(a.get("signal_count", 0) for a in ags)
+                errs = sum(a.get("error_count", 0) for a in ags)
+                names = ", ".join(a.get("id", "?") for a in ags)
+                lines.append(
+                    f"  - {sq.upper()}: {active}/{len(ags)} active | "
+                    f"{sigs} signals | {errs} errors | Agents: {names}"
+                )
+            agents_section = (
+                f"\n\n## Squadron Health ({len(agents)} agents)\n"
+                + "\n".join(lines)
+            )
+
+        # ── Market Quotes (from enriched context) ──
+        quotes = ctx.get("market_quotes") or {}
+        quotes_section = ""
+        if quotes:
+            lines = []
+            for ticker, q in sorted(quotes.items()):
+                price = q.get("price", 0)
+                change = q.get("change", 0)
+                cpct = q.get("change_pct", 0)
+                sign = "+" if change >= 0 else ""
+                lines.append(
+                    f"  - {ticker}: ${price:,.2f} ({sign}{change:.2f}, {sign}{cpct:.2f}%)"
+                )
+            quotes_section = f"\n\n## Live Market Quotes\n" + "\n".join(lines)
+
+        # ── Assemble prompt ──
+        prompt = f"""You are CORTEX AI, the intelligent command assistant for an autonomous trading platform.
+You have LIVE access to real-time platform data. Use the data below for specific, data-driven analysis.
 
 ## Current Portfolio State
 - NAV: ${nav:,.2f}
-- Daily P&L: ${daily_pnl:+,.2f}
+- Daily P&L: ${daily_pnl:+,.2f}{portfolio_extra}
 
 ## Open Positions
 {positions_text}
@@ -124,22 +223,25 @@ You help the operator understand their portfolio, market conditions, and trading
 {signals_text}
 
 ## Risk Metrics
-{risk_text}
+{risk_text}{ks_section}{scanner_section}{agents_section}{quotes_section}
 
 ## Your Role
 - Answer questions about the portfolio, positions, and market conditions.
-- Explain trading signals and why the system generated them.
-- Provide market analysis and insights when asked.
+- When discussing scanner results, reference specific scores, types, and theses from the data above.
+- When discussing risk or strategy, reference portfolio NAV, P&L, and squadron health.
+- Provide specific, actionable analysis. Use ONLY the data shown above — never invent numbers.
 - Be concise but thorough. Use data from the context above.
 - If you don't have specific data, say so rather than guessing.
 - Format currency values with $ and commas. Format percentages with %.
+- When on Trade view, focus on execution quality, slippage, order types, and Level 2 depth analysis.
+- When in Simulation mode, discuss pattern learning, strategy backtesting, and performance optimization.
 - You are NOT executing trades. You are providing analysis and answering questions."""
 
-        # Add UI context if provided
-        if context:
-            current_tab = context.get("current_tab", "unknown")
-            current_section = context.get("current_section", "unknown")
-            selected_symbol = context.get("selected_symbol")
+        # ── UI context hints ──
+        if ctx and (ctx.get("current_tab") or ctx.get("selected_symbol")):
+            current_tab = ctx.get("current_tab", "unknown")
+            current_section = ctx.get("current_section", "unknown")
+            selected_symbol = ctx.get("selected_symbol")
 
             prompt += f"\n\n## Current User Context\n"
             prompt += f"The user is currently on the '{current_tab}' tab"
@@ -150,17 +252,47 @@ You help the operator understand their portfolio, market conditions, and trading
             if selected_symbol:
                 prompt += f"They are looking at the symbol: {selected_symbol}\n"
 
-            # Tab-specific context hints
-            if current_tab == "scanner":
-                prompt += "Focus on trading opportunities, signals, and entry/exit analysis.\n"
-            elif current_tab == "financials":
+            # Normalize tab name for matching (handles "War Room", "war_room", etc.)
+            tab = current_tab.lower().replace(" ", "_")
+
+            if tab == "scanner":
+                prompt += (
+                    "Focus on trading opportunities, signals, and entry/exit analysis. "
+                    "Reference the scanner results above with specific scores, theses, and R:R ratios.\n"
+                )
+            elif tab == "financials":
                 prompt += "Focus on fundamental analysis, financial metrics, news impact, and SEC filings.\n"
-            elif current_tab == "war_room":
-                prompt += "Focus on portfolio risk, squadron health, and overall strategy.\n"
-            elif current_tab == "markets":
-                prompt += "Focus on technical analysis, chart patterns, and price action.\n"
-            elif current_tab == "watchlist":
+            elif tab in ("war_room", "warroom"):
+                prompt += (
+                    "Focus on portfolio risk, squadron health, and overall strategy. "
+                    "Reference the portfolio metrics and agent health data above.\n"
+                )
+            elif tab == "markets":
+                prompt += (
+                    "Focus on technical analysis, chart patterns, and price action. "
+                    "Reference the live market quotes above.\n"
+                )
+            elif tab == "watchlist":
                 prompt += "Focus on position management, P&L, and trade monitoring.\n"
+            elif tab == "squadrons":
+                prompt += (
+                    "Focus on agent performance, squadron health, signal throughput, and operations. "
+                    "Reference the squadron health data above.\n"
+                )
+            elif tab == "performance":
+                prompt += "Focus on performance analytics, risk-adjusted returns, and trade statistics.\n"
+            elif tab == "trade":
+                prompt += (
+                    "Focus on order execution, Level 2 depth analysis, position management, "
+                    "and risk per trade. Discuss slippage, order types (limit, market, stop), "
+                    "and execution quality metrics.\n"
+                )
+            elif tab == "simulation":
+                prompt += (
+                    "Focus on learning insights, pattern recognition, strategy optimization, "
+                    "and backtesting results. Discuss strategy performance across different market "
+                    "regimes and suggest parameter tuning.\n"
+                )
 
         return prompt
 
@@ -220,12 +352,18 @@ You help the operator understand their portfolio, market conditions, and trading
         system_prompt = self.build_system_prompt(context)
         messages = self._history_to_messages(conversation_id)
 
-        max_retries = 3
+        max_retries = 4  # 3 attempts with primary model, 1 with fallback
         for attempt in range(max_retries):
+            # On the last attempt, fall back to a smaller model if the error was retryable
+            model_to_use = self._model
+            if attempt == max_retries - 1:
+                model_to_use = self._fallback_model
+                log.info("chat.fallback_model", model=model_to_use)
+
             try:
                 full_response = ""
                 async with client.messages.stream(
-                    model=self._model,
+                    model=model_to_use,
                     max_tokens=self._max_tokens,
                     system=system_prompt,
                     messages=messages,
@@ -242,21 +380,27 @@ You help the operator understand their portfolio, market conditions, and trading
                     conversation_id=conversation_id,
                     response_length=len(full_response),
                     request_count=self._request_count,
+                    model=model_to_use,
                 )
                 return  # Success — exit retry loop
 
             except Exception as e:
                 error_str = str(e)
-                is_retryable = "overloaded" in error_str.lower() or "529" in error_str
+                is_overloaded = "overloaded" in error_str.lower() or "529" in error_str
+                is_rate_limited = "rate_limit" in error_str.lower() or "429" in error_str
+                is_auth_error = "auth" in error_str.lower() or "401" in error_str or "invalid.*key" in error_str.lower()
+                is_retryable = is_overloaded or is_rate_limited
+
                 if is_retryable and attempt < max_retries - 1:
-                    delay = 2 ** (attempt + 1)  # 2s, 4s
+                    delay = 2 ** (attempt + 1)  # 2s, 4s, 8s
                     log.warning(
                         "chat.retrying",
                         attempt=attempt + 1,
                         delay=delay,
                         error=error_str,
                     )
-                    yield f"[Server busy, retrying in {delay}s...]\n"
+                    # Silent retry — user sees the typing indicator, no need
+                    # to inject retry text into the chat bubble
                     await asyncio.sleep(delay)
                     continue
 
@@ -266,9 +410,19 @@ You help the operator understand their portfolio, market conditions, and trading
                     error=error_str,
                     conversation_id=conversation_id,
                 )
-                error_msg = f"Error generating response: {e}"
-                history.append(ChatMessage(role="assistant", content=error_msg))
-                yield error_msg
+
+                # Provide a context-specific, helpful error message
+                if is_overloaded:
+                    user_error = "Claude is currently at capacity. Your message has been saved — please try again in a moment."
+                elif is_rate_limited:
+                    user_error = "Rate limit reached. Please wait a moment before sending another message."
+                elif is_auth_error:
+                    user_error = "API authentication failed. Please check your API key in Settings."
+                else:
+                    user_error = "An unexpected error occurred. Please try again."
+
+                history.append(ChatMessage(role="assistant", content=user_error))
+                yield user_error
                 return  # Non-retryable or final attempt — stop
 
     def clear_conversation(self, conversation_id: str = "default") -> None:
