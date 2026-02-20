@@ -40,6 +40,24 @@ class SignalTypes:
     TAX_HARVEST_SIGNAL = "foxtrot.tax_harvest"
     WASH_SALE_BLOCK = "foxtrot.wash_sale_block"
 
+    # GOLF -> everyone (adaptive learning)
+    TRADE_RECORDED = "golf.trade_recorded"
+    PATTERN_LEARNED = "golf.pattern_learned"
+    STRATEGY_OPTIMIZED = "golf.strategy_optimized"
+    REGIME_CHANGE = "golf.regime_change"
+    PERFORMANCE_UPDATE = "golf.performance_update"
+    DRAWDOWN_ANALYSIS = "golf.drawdown_analysis"
+    SECTOR_MOMENTUM = "golf.sector_momentum"
+    CORRELATION_SHIFT = "golf.correlation_shift"
+
+    # HOTEL -> BRAVO, ALPHA (market microstructure)
+    SPREAD_ALERT = "hotel.spread_alert"
+    DEPTH_IMBALANCE = "hotel.depth_imbalance"
+    TICK_PATTERN = "hotel.tick_pattern"
+    PRICE_LEVEL_MAP = "hotel.price_level_map"
+    EXECUTION_RECOMMENDATION = "hotel.execution_recommendation"
+    LATENCY_ALERT = "hotel.latency_alert"
+
     # System
     AGENT_HEALTH = "system.agent_health"
     STRATEGY_UPDATE = "intelligence.strategy_update"
