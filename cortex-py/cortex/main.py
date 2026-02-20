@@ -65,6 +65,11 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    # Stop simulation engine if running
+    simulation_engine = components.get("simulation_engine")
+    if simulation_engine is not None and simulation_engine.running:
+        await simulation_engine.stop()
+
     await orchestrator.stop()
     orch_task.cancel()
     try:
@@ -103,6 +108,8 @@ async def websocket_endpoint(ws: WebSocket):
     chat = components.get("chat")
     polygon_client = components.get("polygon_client")
     financials = components.get("financials")
+    simulation_engine = components.get("simulation_engine")
+    learning_tracker = components.get("learning_tracker")
 
     broadcaster.add_client(ws)
     log.info("ws.connected", clients=broadcaster.client_count)
@@ -112,6 +119,64 @@ async def websocket_endpoint(ws: WebSocket):
             MessageType, CortexMessage, decode_message, encode_message,
         )
         import orjson
+
+        # ── Send immediate state snapshot on connect ──────────────────
+        try:
+            orchestrator = components["orchestrator"]
+            status_broadcaster = components.get("status_broadcaster")
+
+            # 1. Portfolio snapshot
+            if status_broadcaster is not None:
+                portfolio_msg = CortexMessage(
+                    type=MessageType.PORTFOLIO_UPDATE,
+                    payload=status_broadcaster.portfolio_state,
+                )
+                await ws.send_text(encode_message(portfolio_msg))
+
+            # 2. Agent snapshots (so squadron view populates immediately)
+            for agent in orchestrator.agents:
+                agent_msg = CortexMessage(
+                    type=MessageType.AGENT_UPDATE,
+                    payload={
+                        "agent_id": agent.agent_id,
+                        "squadron": getattr(agent, "squadron", "unknown"),
+                        "status": getattr(agent, "status", "active"),
+                        "signal_count": getattr(agent, "signal_count", 0),
+                        "error_count": getattr(agent, "error_count", 0),
+                    },
+                )
+                await ws.send_text(encode_message(agent_msg))
+
+            # 3. Scanner snapshot (so scanner view populates immediately)
+            market_feed = components.get("market_feed")
+            if market_feed is not None:
+                for opp in market_feed.scanner_opportunities:
+                    scanner_msg = CortexMessage(
+                        type=MessageType.SCANNER_RESULT,
+                        payload={
+                            "id": opp["ticker"],
+                            "ticker": opp["ticker"],
+                            "composite_score": opp["score"],
+                            "type": opp["type"],
+                            "thesis": opp["thesis"],
+                            "risk_reward": opp["risk_reward"],
+                            "direction": opp["direction"],
+                            "sector": opp.get("sector", "Unknown"),
+                            "market": "US Stocks",
+                            "market_cap": opp.get("market_cap", "Unknown"),
+                            "short_interest": 0.0,
+                            "ai_insight": f"High momentum score ({opp['score']}) with {opp['type'].lower()} pattern",
+                        },
+                    )
+                    await ws.send_text(encode_message(scanner_msg))
+
+            log.info("ws.initial_snapshot_sent", agents=len(orchestrator.agents))
+        except WebSocketDisconnect:
+            broadcaster.remove_client(ws)
+            log.info("ws.disconnected_during_snapshot")
+            return
+        except Exception as e:
+            log.error("ws.snapshot_error", error=str(e))
 
         while True:
             # Handle both text and binary WebSocket frames
@@ -147,18 +212,21 @@ async def websocket_endpoint(ws: WebSocket):
                 if chat is not None:
                     user_text = msg.payload.get("message", "")
                     conversation_id = msg.payload.get("conversation_id", "default")
-                    context = msg.payload.get("context")  # Tab/section context
+                    client_context = msg.payload.get("context") or {}
+                    # Enrich with live platform data
+                    enriched_ctx = _build_enriched_context(client_context, components)
                     log.info(
                         "ws.chat_message",
                         length=len(user_text),
                         conversation_id=conversation_id,
+                        tab=enriched_ctx.get("current_tab", "?"),
                     )
                     # Stream Claude response chunks back to the client
                     try:
                         async for chunk in chat.stream_response(
                             user_message=user_text,
                             conversation_id=conversation_id,
-                            context=context,
+                            context=enriched_ctx,
                         ):
                             chunk_msg = CortexMessage(
                                 type=MessageType.CHAT_CHUNK,
@@ -211,13 +279,30 @@ async def websocket_endpoint(ws: WebSocket):
                         await ws.send_text(encode_message(err_msg))
 
             elif msg.type == MessageType.CMD_FINANCIALS_LOOKUP:
-                if financials is not None:
-                    symbol = msg.payload.get("symbol", "")
-                    if symbol:
-                        log.info("ws.financials_lookup", symbol=symbol)
-                        asyncio.create_task(
-                            financials.lookup(symbol, ws=ws)
-                        )
+                symbol = msg.payload.get("symbol", "")
+                if financials is not None and symbol:
+                    log.info("ws.financials_lookup", symbol=symbol)
+
+                    async def _safe_financials_lookup(sym: str, websocket):
+                        try:
+                            await financials.lookup(sym, ws=websocket)
+                        except Exception as e:
+                            log.error("ws.financials_lookup_error", symbol=sym, error=str(e))
+                            err_msg = CortexMessage(
+                                type=MessageType.FINANCIALS_ERROR,
+                                payload={"symbol": sym, "error": str(e)},
+                            )
+                            await websocket.send_text(encode_message(err_msg))
+
+                    asyncio.create_task(_safe_financials_lookup(symbol, ws))
+                elif symbol:
+                    # No financials aggregator available — send error
+                    log.warning("ws.financials_unavailable", symbol=symbol)
+                    err_msg = CortexMessage(
+                        type=MessageType.FINANCIALS_ERROR,
+                        payload={"symbol": symbol, "error": "Financials service unavailable"},
+                    )
+                    await ws.send_text(encode_message(err_msg))
 
             elif msg.type == MessageType.CMD_CONNECT_IBKR:
                 ibkr_manager = components.get("ibkr_manager")
@@ -246,6 +331,50 @@ async def websocket_endpoint(ws: WebSocket):
                             },
                         )))
 
+            elif msg.type == MessageType.CMD_START_SIMULATION:
+                if simulation_engine is not None:
+                    capital = msg.payload.get("starting_capital", 100_000.0)
+                    log.info("ws.start_simulation", capital=capital)
+                    try:
+                        await simulation_engine.start(starting_capital=capital)
+                        await ws.send_text(encode_message(CortexMessage(
+                            type=MessageType.SIMULATION_UPDATE,
+                            payload=simulation_engine.stats,
+                        )))
+                    except Exception as e:
+                        log.error("ws.simulation_start_error", error=str(e))
+                        await ws.send_text(encode_message(CortexMessage(
+                            type=MessageType.ACTIVITY_EVENT,
+                            payload={
+                                "event_type": "simulation_error",
+                                "message": f"Simulation start failed: {e}",
+                                "severity": "error",
+                            },
+                        )))
+
+            elif msg.type == MessageType.CMD_STOP_SIMULATION:
+                if simulation_engine is not None:
+                    log.info("ws.stop_simulation")
+                    try:
+                        stats = await simulation_engine.stop()
+                        # Broadcast learning insights on stop
+                        if learning_tracker is not None:
+                            await learning_tracker.broadcast_insights()
+                        await ws.send_text(encode_message(CortexMessage(
+                            type=MessageType.SIMULATION_UPDATE,
+                            payload=stats,
+                        )))
+                    except Exception as e:
+                        log.error("ws.simulation_stop_error", error=str(e))
+                        await ws.send_text(encode_message(CortexMessage(
+                            type=MessageType.ACTIVITY_EVENT,
+                            payload={
+                                "event_type": "simulation_error",
+                                "message": f"Simulation stop failed: {e}",
+                                "severity": "error",
+                            },
+                        )))
+
             else:
                 log.debug("ws.unhandled_command", msg_type=msg.type)
 
@@ -255,6 +384,64 @@ async def websocket_endpoint(ws: WebSocket):
     except Exception:
         broadcaster.remove_client(ws)
         raise
+
+
+def _build_enriched_context(client_context: dict, components: dict) -> dict:
+    """Merge client-side UI context with live backend data for Claude's system prompt."""
+    ctx = dict(client_context)
+
+    # ── Portfolio state ──
+    sb = components.get("status_broadcaster")
+    if sb is not None:
+        ctx["portfolio"] = sb.portfolio_state  # returns a copy
+
+    # ── Scanner opportunities + market quotes ──
+    mf = components.get("market_feed")
+    if mf is not None:
+        ctx["scanner_opportunities"] = mf.scanner_opportunities  # public property
+
+        # Snapshot market quotes (returns a copy via last_quotes property)
+        ctx["market_quotes"] = {
+            t: {
+                "price": q.get("price", 0),
+                "change": q.get("change", 0),
+                "change_pct": q.get("change_pct", 0),
+            }
+            for t, q in mf.last_quotes.items()
+        }
+
+    # ── Agent health ──
+    orch = components.get("orchestrator")
+    if orch is not None:
+        agents = []
+        for agent in list(orch.agents):  # snapshot list for iteration safety
+            agents.append({
+                "id": agent.agent_id,
+                "squadron": getattr(agent, "squadron", "unknown"),
+                "status": getattr(agent, "status", "active"),
+                "signal_count": getattr(agent, "signal_count", 0),
+                "error_count": getattr(agent, "error_count", 0),
+            })
+        ctx["agents"] = agents
+
+    # ── Kill switch ──
+    ks = components.get("kill_switch")
+    if ks is not None:
+        ctx["kill_switch"] = {
+            "active": getattr(ks, "is_halted", False),
+            "reason": getattr(ks, "_engaged_reason", None),
+        }
+
+    # ── Simulation state ──
+    sim = components.get("simulation_engine")
+    if sim is not None:
+        ctx["simulation"] = sim.to_dict()
+
+    lt = components.get("learning_tracker")
+    if lt is not None:
+        ctx["learning_tracker"] = lt.to_dict()
+
+    return ctx
 
 
 def create_app_components() -> dict:
@@ -287,6 +474,8 @@ def create_app_components() -> dict:
     from cortex.connectors.ibkr.rate_limiter import IBKRRateLimiter
     from cortex.connectors.sec.edgar_client import EDGARClient
     from cortex.feeds.financials import FinancialsAggregator
+    from cortex.simulation.engine import SimulationEngine
+    from cortex.simulation.learning_tracker import LearningTracker
 
     bus = SignalBus()
     autonomy = AutonomyDial()
@@ -401,6 +590,10 @@ def create_app_components() -> dict:
     )
     ibkr_manager = IBKRConnectionManager(config=ibkr_config, rate_limiter=ibkr_rate_limiter)
 
+    # Simulation engine (paper trading)
+    simulation_engine = SimulationEngine(bus=bus, broadcaster=broadcaster)
+    learning_tracker = LearningTracker(analysis_interval=50, broadcaster=broadcaster)
+
     return {
         "bus": bus,
         "autonomy": autonomy,
@@ -418,6 +611,8 @@ def create_app_components() -> dict:
         "drawdown_shield": drawdown_shield,
         "edgar_client": edgar_client,
         "financials": financials,
+        "simulation_engine": simulation_engine,
+        "learning_tracker": learning_tracker,
     }
 
 
