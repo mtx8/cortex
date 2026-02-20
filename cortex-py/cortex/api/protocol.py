@@ -75,6 +75,7 @@ class MessageType(str, Enum):
     # Watchlist & Alert commands
     CMD_ADD_WATCHLIST = "cmd_add_watchlist"
     CMD_CREATE_ALERT = "cmd_create_alert"
+    CMD_DELETE_ALERT = "cmd_delete_alert"
 
     # Simulation commands
     CMD_START_SIMULATION = "cmd_start_simulation"
