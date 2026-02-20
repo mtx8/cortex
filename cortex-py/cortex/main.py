@@ -65,6 +65,11 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    # Unsubscribe Level 2 feed if active
+    level2_feed = components.get("level2_feed")
+    if level2_feed is not None and level2_feed.active_symbol:
+        await level2_feed.unsubscribe()
+
     # Stop simulation engine if running
     simulation_engine = components.get("simulation_engine")
     if simulation_engine is not None and simulation_engine.running:
@@ -110,6 +115,8 @@ async def websocket_endpoint(ws: WebSocket):
     financials = components.get("financials")
     simulation_engine = components.get("simulation_engine")
     learning_tracker = components.get("learning_tracker")
+    level2_feed = components.get("level2_feed")
+    options_feed = components.get("options_feed")
 
     broadcaster.add_client(ws)
     log.info("ws.connected", clients=broadcaster.client_count)
@@ -331,6 +338,132 @@ async def websocket_endpoint(ws: WebSocket):
                             },
                         )))
 
+            # ── Trade View commands ──────────────────────────────────
+            elif msg.type == MessageType.CMD_SUBMIT_ORDER:
+                # Order submission goes through TradePipeline per CLAUDE.md
+                pipeline = components.get("pipeline")
+                if pipeline is not None:
+                    order_data = msg.payload
+                    log.info("ws.submit_order", symbol=order_data.get("symbol"))
+                    try:
+                        result = await pipeline.submit_order(order_data)
+                        await ws.send_text(encode_message(CortexMessage(
+                            type=MessageType.ORDER_STATUS,
+                            payload=result,
+                        )))
+                    except Exception as e:
+                        log.error("ws.order_error", error=str(e))
+                        await ws.send_text(encode_message(CortexMessage(
+                            type=MessageType.ORDER_STATUS,
+                            payload={"status": "rejected", "error": str(e)},
+                        )))
+
+            elif msg.type == MessageType.CMD_CANCEL_ORDER:
+                pipeline = components.get("pipeline")
+                if pipeline is not None:
+                    order_id = msg.payload.get("order_id")
+                    log.info("ws.cancel_order", order_id=order_id)
+                    try:
+                        result = await pipeline.cancel_order(order_id)
+                        await ws.send_text(encode_message(CortexMessage(
+                            type=MessageType.ORDER_STATUS,
+                            payload=result,
+                        )))
+                    except Exception as e:
+                        log.error("ws.cancel_error", error=str(e))
+
+            elif msg.type == MessageType.CMD_SET_TRADING_MODE:
+                mode = msg.payload.get("mode", "paper")
+                log.info("ws.set_trading_mode", mode=mode)
+                # Store trading mode in components for pipeline to reference
+                components["trading_mode"] = mode
+                await ws.send_text(encode_message(CortexMessage(
+                    type=MessageType.ACTIVITY_EVENT,
+                    payload={
+                        "event_type": "trading_mode_changed",
+                        "message": f"Trading mode set to {mode}",
+                        "severity": "info",
+                    },
+                )))
+
+            # ── Options commands ─────────────────────────────────────
+            elif msg.type == MessageType.CMD_GET_OPTION_CHAIN:
+                if options_feed is not None:
+                    symbol = msg.payload.get("symbol", "")
+                    expiration = msg.payload.get("expiration")
+                    log.info("ws.get_option_chain", symbol=symbol, expiration=expiration)
+                    try:
+                        chain = await options_feed.get_chain(symbol, expiration=expiration)
+                        await ws.send_text(encode_message(CortexMessage(
+                            type=MessageType.OPTION_CHAIN_DATA,
+                            payload=chain,
+                        )))
+                    except Exception as e:
+                        log.error("ws.option_chain_error", error=str(e))
+
+            elif msg.type == MessageType.CMD_CALCULATE_PROFIT:
+                from cortex.calculators.options_pricing import (
+                    profit_matrix as calc_profit_matrix,
+                    OptionLeg,
+                )
+                log.info("ws.calculate_profit")
+                try:
+                    raw_legs = msg.payload.get("legs", [])
+                    price_range = msg.payload.get("price_range", [80, 120])
+                    sigma = msg.payload.get("volatility", 0.25)
+                    r = msg.payload.get("risk_free_rate", 0.05)
+
+                    legs = [
+                        OptionLeg(
+                            strike=leg["strike"],
+                            option_type=leg["option_type"],
+                            quantity=leg["quantity"],
+                            premium=leg["premium"],
+                            expiry_years=leg.get("expiry_years", 0.25),
+                        )
+                        for leg in raw_legs
+                    ]
+
+                    result = calc_profit_matrix(
+                        legs=legs,
+                        price_range=tuple(price_range),
+                        sigma=sigma,
+                        r=r,
+                    )
+                    await ws.send_text(encode_message(CortexMessage(
+                        type=MessageType.PROFIT_CALCULATION,
+                        payload=result,
+                    )))
+                except Exception as e:
+                    log.error("ws.profit_calc_error", error=str(e))
+
+            # ── Watchlist & Alert commands ────────────────────────────
+            elif msg.type == MessageType.CMD_ADD_WATCHLIST:
+                market_feed = components.get("market_feed")
+                if market_feed is not None:
+                    symbol = msg.payload.get("symbol", "").upper()
+                    if symbol:
+                        market_feed.add_ticker(symbol)
+                        log.info("ws.watchlist_added", symbol=symbol)
+
+            elif msg.type == MessageType.CMD_CREATE_ALERT:
+                # Store alert in memory for now (future: persistent storage)
+                alert = msg.payload
+                log.info(
+                    "ws.alert_created",
+                    symbol=alert.get("symbol"),
+                    condition=alert.get("condition"),
+                )
+                await ws.send_text(encode_message(CortexMessage(
+                    type=MessageType.ACTIVITY_EVENT,
+                    payload={
+                        "event_type": "alert_created",
+                        "message": f"Alert created for {alert.get('symbol', '?')}",
+                        "severity": "info",
+                    },
+                )))
+
+            # ── Simulation commands ──────────────────────────────────
             elif msg.type == MessageType.CMD_START_SIMULATION:
                 if simulation_engine is not None:
                     capital = msg.payload.get("starting_capital", 100_000.0)
@@ -432,6 +565,16 @@ def _build_enriched_context(client_context: dict, components: dict) -> dict:
             "reason": getattr(ks, "_engaged_reason", None),
         }
 
+    # ── Level 2 state ──
+    l2 = components.get("level2_feed")
+    if l2 is not None and l2.active_symbol:
+        ctx["level2"] = l2.to_dict()
+
+    # ── Options feed state ──
+    of = components.get("options_feed")
+    if of is not None:
+        ctx["options_feed"] = of.to_dict()
+
     # ── Simulation state ──
     sim = components.get("simulation_engine")
     if sim is not None:
@@ -476,6 +619,15 @@ def create_app_components() -> dict:
     from cortex.feeds.financials import FinancialsAggregator
     from cortex.simulation.engine import SimulationEngine
     from cortex.simulation.learning_tracker import LearningTracker
+    from cortex.feeds.level2 import Level2Feed
+    from cortex.feeds.options import OptionsFeed
+    from cortex.calculators.options_pricing import (
+        black_scholes,
+        greeks as compute_greeks,
+        implied_volatility,
+        profit_matrix,
+        OptionLeg,
+    )
 
     bus = SignalBus()
     autonomy = AutonomyDial()
@@ -590,6 +742,21 @@ def create_app_components() -> dict:
     )
     ibkr_manager = IBKRConnectionManager(config=ibkr_config, rate_limiter=ibkr_rate_limiter)
 
+    # Level 2 data feed (order book depth from IBKR)
+    level2_feed = Level2Feed(
+        ibkr_manager=ibkr_manager,
+        broadcaster=broadcaster,
+        rate_limiter=ibkr_rate_limiter,
+    )
+
+    # Options data feed (chain data from Polygon / IBKR)
+    options_feed = OptionsFeed(
+        polygon_client=polygon_client,
+        ibkr_manager=ibkr_manager,
+        broadcaster=broadcaster,
+        rate_limiter=ibkr_rate_limiter,
+    )
+
     # Simulation engine (paper trading)
     simulation_engine = SimulationEngine(bus=bus, broadcaster=broadcaster)
     learning_tracker = LearningTracker(analysis_interval=50, broadcaster=broadcaster)
@@ -613,6 +780,8 @@ def create_app_components() -> dict:
         "financials": financials,
         "simulation_engine": simulation_engine,
         "learning_tracker": learning_tracker,
+        "level2_feed": level2_feed,
+        "options_feed": options_feed,
     }
 
 
