@@ -1,10 +1,36 @@
 import SwiftUI
 
+/// Collapse state for the left context pane.
+public enum ContextPaneMode: String, CaseIterable {
+    case full     // 220px — icon + label
+    case iconOnly // 52px  — icon only with tooltip
+    case hidden   // 0px   — completely gone
+
+    /// Cycle to the next mode: full -> iconOnly -> hidden -> full.
+    public var next: ContextPaneMode {
+        switch self {
+        case .full:     return .iconOnly
+        case .iconOnly: return .hidden
+        case .hidden:   return .full
+        }
+    }
+
+    /// Width of the context pane in this mode.
+    public var width: CGFloat {
+        switch self {
+        case .full:     return 220
+        case .iconOnly: return 52
+        case .hidden:   return 0
+        }
+    }
+}
+
 /// Navigation tabs for the CORTEX trading platform.
 public enum AppTab: String, CaseIterable, Identifiable {
     case warRoom = "War Room"
     case markets = "Markets"
     case scanner = "Scanner"
+    case trade = "Trade"
     case financials = "Financials"
     case watchlist = "Watchlist"
     case squadrons = "Squadrons"
@@ -18,6 +44,7 @@ public enum AppTab: String, CaseIterable, Identifiable {
         case .warRoom: return "shield.checkered"
         case .markets: return "chart.line.uptrend.xyaxis"
         case .scanner: return "antenna.radiowaves.left.and.right"
+        case .trade: return "chart.bar.doc.horizontal"
         case .financials: return "building.columns.fill"
         case .watchlist: return "eye.circle.fill"
         case .squadrons: return "person.3.sequence.fill"
@@ -31,11 +58,12 @@ public enum AppTab: String, CaseIterable, Identifiable {
         case .warRoom: return "1"
         case .markets: return "2"
         case .scanner: return "3"
-        case .financials: return "4"
-        case .watchlist: return "5"
-        case .squadrons: return "6"
-        case .performance: return "7"
-        case .settings: return "8"
+        case .trade: return "4"
+        case .financials: return "5"
+        case .watchlist: return "6"
+        case .squadrons: return "7"
+        case .performance: return "8"
+        case .settings: return "9"
         }
     }
 
@@ -66,6 +94,13 @@ public enum AppTab: String, CaseIterable, Identifiable {
                 ("arrow.down.right.circle", "Short Candidates"),
                 ("calendar.badge.exclamationmark", "Catalyst Events"),
                 ("arrow.left.arrow.right.circle", "Options Flow"),
+            ]
+        case .trade:
+            return [
+                ("chart.line.uptrend.xyaxis", "Chart & L2"),
+                ("list.bullet.rectangle", "Positions"),
+                ("clock.arrow.circlepath", "Orders"),
+                ("play.circle", "Simulation"),
             ]
         case .financials:
             return [

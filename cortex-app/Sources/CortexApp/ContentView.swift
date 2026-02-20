@@ -123,6 +123,8 @@ struct ContentView: View {
                 environment.chat.sendMessage()
                 withAnimation(.easeInOut(duration: 0.25)) { isAIPaneVisible = true }
             })
+        case .trade:
+            TradeView(environment: environment)
         case .financials:
             FinancialsView(store: environment.financials, chatStore: environment.chat)
         case .watchlist:
@@ -183,7 +185,7 @@ struct ContentView: View {
         .keyboardShortcut("/", modifiers: .command)
         .hidden()
 
-        // Cmd+1 through Cmd+8: Switch tabs
+        // Cmd+1 through Cmd+9: Switch tabs
         ForEach(AppTab.allCases) { tab in
             if let shortcut = tab.shortcut {
                 Button("") { selectedTab = tab }
