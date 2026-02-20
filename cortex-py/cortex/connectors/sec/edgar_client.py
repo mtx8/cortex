@@ -4,10 +4,8 @@ EDGAR is free — no API key required. Rate limit: 10 req/s (be respectful).
 User-Agent header required by SEC: include company name and email.
 """
 
-import asyncio
 import structlog
 import httpx
-from datetime import datetime
 
 log = structlog.get_logger()
 

@@ -21,8 +21,9 @@ public final class AppEnvironment {
     public init() {
         // Stores populate from WebSocket when backend is connected.
         // No mock data — real data only.
+        // WebSocket wiring is done in MessageRouter.setupRouting()
+        // to keep all wiring in one place.
         settings.webSocket = webSocket
         search.webSocket = webSocket
-        financials.webSocket = webSocket
     }
 }

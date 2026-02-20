@@ -2,7 +2,6 @@
 
 import asyncio
 import structlog
-from datetime import datetime, timedelta
 
 from cortex.api.protocol import MessageType, CortexMessage, encode_message
 from cortex.connectors.polygon.rest_client import PolygonRESTClient
@@ -100,8 +99,8 @@ class FinancialsAggregator:
                 "short_interest": snapshot.get("short_interest", 0),
                 "short_ratio": snapshot.get("short_ratio", 0),
                 "avg_volume": snapshot.get("avg_volume", 0),
-                "week52_high": snapshot.get("week52_high", 0),
-                "week52_low": snapshot.get("week52_low", 0),
+                "week_52_high": snapshot.get("week52_high", 0),
+                "week_52_low": snapshot.get("week52_low", 0),
                 "pe_ratio": snapshot.get("pe_ratio"),
                 "forward_pe": snapshot.get("forward_pe"),
                 "dividend_yield": snapshot.get("dividend_yield"),
@@ -236,14 +235,17 @@ class FinancialsAggregator:
 
     def _parse_recommendation(self, text: str) -> str:
         """Extract recommendation from AI response text."""
+        import re
         text_lower = text.lower()
         if "strong buy" in text_lower:
             return "Strong Buy"
         elif "strong sell" in text_lower:
             return "Strong Sell"
-        elif "buy" in text_lower and "sell" not in text_lower[: text_lower.index("buy") + 50]:
+        elif re.search(r"\bbuy\b", text_lower) and not re.search(
+            r"\bsell\b", text_lower[: text_lower.index("buy") + 50]
+        ):
             return "Buy"
-        elif "sell" in text_lower:
+        elif re.search(r"\bsell\b", text_lower):
             return "Sell"
         return "Hold"
 

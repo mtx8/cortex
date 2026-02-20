@@ -9,10 +9,7 @@ Interactive Brokers has these rate limits:
 Per CLAUDE.md: ALL IBKR API calls go through rate_limiter.py wrappers.
 """
 
-import asyncio
-import time
 import structlog
-from functools import wraps
 from aiolimiter import AsyncLimiter
 
 log = structlog.get_logger()

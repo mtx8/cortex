@@ -291,10 +291,10 @@ def test_parse_recommendation_buy_without_sell(aggregator):
 
 
 def test_parse_recommendation_sell_in_context(aggregator):
-    """'Sell' is detected when it appears in text even as part of 'selloff'."""
+    """'selloff' should not trigger a Sell recommendation — word boundaries matter."""
     text = "Recommendation: Buy. Note: there was a selloff recently but that creates opportunity."
-    # The parser sees 'sell' in 'selloff' near 'buy', so it falls through to Sell
-    assert aggregator._parse_recommendation(text) == "Sell"
+    # The parser uses word boundaries, so 'selloff' does not match 'sell'
+    assert aggregator._parse_recommendation(text) == "Buy"
 
 
 # ─── Section Extraction Tests ────────────────────────────────────────
