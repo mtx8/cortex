@@ -31,6 +31,24 @@ class MessageType(str, Enum):
     FINANCIALS_FILINGS = "financials_filings"
     FINANCIALS_SENTIMENT = "financials_sentiment"
     FINANCIALS_AI_ANALYSIS = "financials_ai_analysis"
+    FINANCIALS_ERROR = "financials_error"
+
+    # Trade View
+    L2_UPDATE = "l2_update"
+    TIME_SALES = "time_sales"
+    POSITION_UPDATE = "position_update"
+    ORDER_STATUS = "order_status"
+
+    # Options
+    OPTION_CHAIN_DATA = "option_chain_data"
+    PROFIT_CALCULATION = "profit_calculation"
+
+    # Watchlist & Alerts
+    ALERT_TRIGGERED = "alert_triggered"
+
+    # Simulation
+    SIMULATION_UPDATE = "simulation_update"
+    LEARNING_INSIGHT = "learning_insight"
 
     # Client -> Server (commands)
     CMD_KILL_SWITCH = "cmd_kill_switch"
@@ -44,6 +62,23 @@ class MessageType(str, Enum):
     CMD_REQUEST_QUOTES = "cmd_request_quotes"
     CMD_FINANCIALS_LOOKUP = "cmd_financials_lookup"
     CMD_CONNECT_IBKR = "cmd_connect_ibkr"
+
+    # Trade View commands
+    CMD_SUBMIT_ORDER = "cmd_submit_order"
+    CMD_CANCEL_ORDER = "cmd_cancel_order"
+    CMD_SET_TRADING_MODE = "cmd_set_trading_mode"
+
+    # Options commands
+    CMD_GET_OPTION_CHAIN = "cmd_get_option_chain"
+    CMD_CALCULATE_PROFIT = "cmd_calculate_profit"
+
+    # Watchlist & Alert commands
+    CMD_ADD_WATCHLIST = "cmd_add_watchlist"
+    CMD_CREATE_ALERT = "cmd_create_alert"
+
+    # Simulation commands
+    CMD_START_SIMULATION = "cmd_start_simulation"
+    CMD_STOP_SIMULATION = "cmd_stop_simulation"
 
 
 @dataclass
