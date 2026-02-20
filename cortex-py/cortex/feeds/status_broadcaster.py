@@ -1,9 +1,10 @@
-"""Periodic status broadcaster — pushes portfolio, agent, and opportunity status to Swift clients."""
+"""Periodic status broadcaster -- pushes portfolio, agent, and opportunity status to Swift clients."""
 
 import asyncio
 import structlog
 from cortex.api.protocol import MessageType, CortexMessage
 from cortex.api.ws_broadcaster import WSBroadcaster
+from cortex.orchestrator.bus import SignalBus, Signal
 from cortex.orchestrator.system import SystemOrchestrator
 
 log = structlog.get_logger()
@@ -16,10 +17,14 @@ class StatusBroadcaster:
         self,
         broadcaster: WSBroadcaster,
         orchestrator: SystemOrchestrator,
+        bus: SignalBus | None = None,
+        drawdown_shield=None,
         interval: float = 5.0,
     ):
         self._broadcaster = broadcaster
         self._orchestrator = orchestrator
+        self._bus = bus
+        self._drawdown_shield = drawdown_shield
         self._interval = interval
         self._running = False
         self._portfolio_state = {
@@ -31,6 +36,11 @@ class StatusBroadcaster:
             "open_positions": 0,
             "sharpe_ratio": 0.0,
         }
+
+        # Subscribe to portfolio-related signals on the bus
+        if self._bus is not None:
+            self._bus.subscribe("bravo.order_filled", self.handle_portfolio_signal)
+            self._bus.subscribe("bravo.order_submitted", self.handle_portfolio_signal)
 
     @property
     def is_running(self) -> bool:
@@ -47,6 +57,16 @@ class StatusBroadcaster:
     def update_portfolio(self, **kwargs) -> None:
         """Update portfolio state (called by connectors when real data arrives)."""
         self._portfolio_state.update(kwargs)
+
+    async def handle_portfolio_signal(self, signal: Signal) -> None:
+        """Update portfolio state from bus signals."""
+        payload = signal.payload
+        if signal.signal_type == "bravo.order_filled":
+            # Update position count on order fill
+            self._portfolio_state["open_positions"] = self._portfolio_state.get("open_positions", 0) + 1
+        elif signal.signal_type == "bravo.order_submitted":
+            # Track submitted orders for activity
+            pass
 
     async def start(self) -> None:
         """Start periodic broadcasting loop."""
@@ -65,6 +85,10 @@ class StatusBroadcaster:
     async def _broadcast_all(self) -> None:
         if self._broadcaster.client_count == 0:
             return
+
+        # Update DrawdownShield with current NAV if available
+        if self._drawdown_shield and self._portfolio_state.get("nav", 0) > 0:
+            self._drawdown_shield.update(self._portfolio_state["nav"])
 
         # 1. Portfolio update
         await self._broadcaster.broadcast(CortexMessage(
@@ -85,13 +109,13 @@ class StatusBroadcaster:
                 },
             ))
 
-        # 3. Activity event — heartbeat so the Swift activity feed stays alive
+        # 3. Activity event -- heartbeat so the Swift activity feed stays alive
         # Use ACTIVITY ("activity") to match the Swift MessageRouter's routing key
         await self._broadcaster.broadcast(CortexMessage(
             type=MessageType.ACTIVITY,
             payload={
                 "event_type": "heartbeat",
-                "message": "System nominal \u2014 all agents active",
+                "message": "System nominal -- all agents active",
                 "severity": "info",
                 "symbol": "",
             },

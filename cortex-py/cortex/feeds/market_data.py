@@ -35,6 +35,7 @@ class MarketDataFeed:
         bus: SignalBus,
         watchlist: list[str] | None = None,
         poll_interval: float = 15.0,
+        status_broadcaster=None,
     ):
         self._polygon = polygon_client
         self._broadcaster = broadcaster
@@ -45,6 +46,7 @@ class MarketDataFeed:
         self._poll_count = 0
         self._last_quotes: dict[str, dict] = {}
         self._task: asyncio.Task | None = None
+        self._status_broadcaster = status_broadcaster
         # Scanner opportunity state — seeded per-ticker so scores drift slowly
         self._rng = random.Random(42)
         self._scanner_scores: dict[str, dict] = {}
@@ -112,8 +114,29 @@ class MarketDataFeed:
                 priority=SignalPriority.LOW,
             ))
 
+            # Bridge to ALPHA squadron agents — they subscribe to alpha.market_signal
+            await self._bus.publish(Signal(
+                signal_id=f"alpha_market_{ticker}_{self._poll_count}",
+                source_agent="market_data_feed",
+                source_squadron="feeds",
+                signal_type="alpha.market_signal",
+                payload=quote,
+                priority=SignalPriority.LOW,
+            ))
+
         # Broadcast scanner opportunities for watchlist symbols
         await self._broadcast_scanner_opportunities()
+
+        # Compute simulated portfolio NAV from watchlist prices for demo until IBKR is connected
+        if self._status_broadcaster and self._last_quotes:
+            total_value = sum(q.get("price", 0) for q in self._last_quotes.values())
+            # Simulated NAV: base capital + watchlist value as a proxy
+            simulated_nav = 100_000.0 + total_value
+            daily_pnl = sum(q.get("change", 0) for q in self._last_quotes.values())
+            self._status_broadcaster.update_portfolio(
+                nav=simulated_nav,
+                daily_pnl=daily_pnl,
+            )
 
         log.debug(
             "feed.poll_complete",

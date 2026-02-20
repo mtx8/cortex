@@ -73,8 +73,13 @@ class CortexChat:
             "risk_metrics": risk_metrics or {},
         }
 
-    def build_system_prompt(self) -> str:
-        """Build the system prompt with current portfolio context."""
+    def build_system_prompt(self, context: dict | None = None) -> str:
+        """Build the system prompt with current portfolio context.
+
+        Args:
+            context: Optional UI context dict with keys like current_tab,
+                     current_section, selected_symbol.
+        """
         ctx = self._portfolio_context
 
         nav = ctx.get("nav", 0.0)
@@ -104,7 +109,7 @@ class CortexChat:
         else:
             risk_text = "  (no risk data available)"
 
-        return f"""You are CORTEX AI, the intelligent assistant for an autonomous trading platform.
+        prompt = f"""You are CORTEX AI, the intelligent assistant for an autonomous trading platform.
 You help the operator understand their portfolio, market conditions, and trading strategy.
 
 ## Current Portfolio State
@@ -128,6 +133,35 @@ You help the operator understand their portfolio, market conditions, and trading
 - If you don't have specific data, say so rather than guessing.
 - Format currency values with $ and commas. Format percentages with %.
 - You are NOT executing trades. You are providing analysis and answering questions."""
+
+        # Add UI context if provided
+        if context:
+            current_tab = context.get("current_tab", "unknown")
+            current_section = context.get("current_section", "unknown")
+            selected_symbol = context.get("selected_symbol")
+
+            prompt += f"\n\n## Current User Context\n"
+            prompt += f"The user is currently on the '{current_tab}' tab"
+            if current_section != "unknown":
+                prompt += f", in the '{current_section}' section"
+            prompt += ".\n"
+
+            if selected_symbol:
+                prompt += f"They are looking at the symbol: {selected_symbol}\n"
+
+            # Tab-specific context hints
+            if current_tab == "scanner":
+                prompt += "Focus on trading opportunities, signals, and entry/exit analysis.\n"
+            elif current_tab == "financials":
+                prompt += "Focus on fundamental analysis, financial metrics, news impact, and SEC filings.\n"
+            elif current_tab == "war_room":
+                prompt += "Focus on portfolio risk, squadron health, and overall strategy.\n"
+            elif current_tab == "markets":
+                prompt += "Focus on technical analysis, chart patterns, and price action.\n"
+            elif current_tab == "watchlist":
+                prompt += "Focus on position management, P&L, and trade monitoring.\n"
+
+        return prompt
 
     async def _get_client(self):
         if self._client is None:
@@ -156,11 +190,17 @@ You help the operator understand their portfolio, market conditions, and trading
         self,
         user_message: str,
         conversation_id: str = "default",
+        context: dict | None = None,
     ) -> AsyncGenerator[str, None]:
         """Stream a response from Claude.
 
         Yields text chunks as they arrive. Appends both user message and
         full assistant response to conversation history.
+
+        Args:
+            user_message: The user's chat message.
+            conversation_id: ID for conversation history isolation.
+            context: Optional UI context (current_tab, current_section, selected_symbol).
         """
         self._request_count += 1
         history = self._get_history(conversation_id)
@@ -176,7 +216,7 @@ You help the operator understand their portfolio, market conditions, and trading
             yield fallback
             return
 
-        system_prompt = self.build_system_prompt()
+        system_prompt = self.build_system_prompt(context)
         messages = self._history_to_messages(conversation_id)
 
         try:

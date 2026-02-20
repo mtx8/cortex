@@ -144,8 +144,8 @@ async def test_poll_once_broadcasts_quotes(feed, bus):
     assert first_call_msg.type.value == "market_quote"
     assert first_call_msg.payload["ticker"] == "AAPL"
 
-    # Should have published 2 signals to the bus
-    assert mock_publish.call_count == 2
+    # Should have published 4 signals to the bus (2 feeds.market_quote + 2 alpha.market_signal bridge)
+    assert mock_publish.call_count == 4
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,11 @@ class MessageType(str, Enum):
     CHAT_CHUNK = "chat_chunk"
     TICKER_SEARCH_RESULTS = "ticker_search_results"
     MARKET_QUOTE = "market_quote"
+    FINANCIALS_PROFILE = "financials_profile"
+    FINANCIALS_NEWS = "financials_news"
+    FINANCIALS_FILINGS = "financials_filings"
+    FINANCIALS_SENTIMENT = "financials_sentiment"
+    FINANCIALS_AI_ANALYSIS = "financials_ai_analysis"
 
     # Client -> Server (commands)
     CMD_KILL_SWITCH = "cmd_kill_switch"
@@ -37,6 +42,8 @@ class MessageType(str, Enum):
     CMD_SUBSCRIBE_SCANNER = "cmd_subscribe_scanner"
     CMD_SEARCH_TICKER = "cmd_search_ticker"
     CMD_REQUEST_QUOTES = "cmd_request_quotes"
+    CMD_FINANCIALS_LOOKUP = "cmd_financials_lookup"
+    CMD_CONNECT_IBKR = "cmd_connect_ibkr"
 
 
 @dataclass

@@ -77,6 +77,16 @@ async def lifespan(app: FastAPI):
     if polygon_client is not None:
         await polygon_client.close()
 
+    # Close EDGAR client if present
+    edgar_client = components.get("edgar_client")
+    if edgar_client is not None:
+        await edgar_client.close()
+
+    # Disconnect IBKR if connected
+    ibkr_manager = components.get("ibkr_manager")
+    if ibkr_manager is not None and ibkr_manager.is_connected:
+        await ibkr_manager.disconnect()
+
     log.info("cortex.shutdown")
 
 
@@ -92,6 +102,7 @@ async def websocket_endpoint(ws: WebSocket):
     autonomy = components["autonomy"]
     chat = components.get("chat")
     polygon_client = components.get("polygon_client")
+    financials = components.get("financials")
 
     broadcaster.add_client(ws)
     log.info("ws.connected", clients=broadcaster.client_count)
@@ -126,6 +137,7 @@ async def websocket_endpoint(ws: WebSocket):
                 if chat is not None:
                     user_text = msg.payload.get("message", "")
                     conversation_id = msg.payload.get("conversation_id", "default")
+                    context = msg.payload.get("context")  # Tab/section context
                     log.info(
                         "ws.chat_message",
                         length=len(user_text),
@@ -136,6 +148,7 @@ async def websocket_endpoint(ws: WebSocket):
                         async for chunk in chat.stream_response(
                             user_message=user_text,
                             conversation_id=conversation_id,
+                            context=context,
                         ):
                             chunk_msg = CortexMessage(
                                 type=MessageType.CHAT_CHUNK,
@@ -187,6 +200,42 @@ async def websocket_endpoint(ws: WebSocket):
                         )
                         await ws.send_text(encode_message(err_msg))
 
+            elif msg.type == MessageType.CMD_FINANCIALS_LOOKUP:
+                if financials is not None:
+                    symbol = msg.payload.get("symbol", "")
+                    if symbol:
+                        log.info("ws.financials_lookup", symbol=symbol)
+                        asyncio.create_task(
+                            financials.lookup(symbol, ws=ws)
+                        )
+
+            elif msg.type == MessageType.CMD_CONNECT_IBKR:
+                ibkr_manager = components.get("ibkr_manager")
+                if ibkr_manager is not None:
+                    try:
+                        await ibkr_manager.connect()
+                        # Reconcile positions per CLAUDE.md
+                        await ibkr_manager._reconcile_positions()
+                        positions = ibkr_manager._ib.positions() if ibkr_manager._ib else []
+                        pos_count = len(positions) if positions else 0
+                        await ws.send_text(encode_message(CortexMessage(
+                            type=MessageType.ACTIVITY_EVENT,
+                            payload={
+                                "event_type": "ibkr_connected",
+                                "message": f"IBKR connected. {pos_count} positions reconciled.",
+                                "severity": "info",
+                            },
+                        )))
+                    except Exception as e:
+                        await ws.send_text(encode_message(CortexMessage(
+                            type=MessageType.ACTIVITY_EVENT,
+                            payload={
+                                "event_type": "ibkr_error",
+                                "message": f"IBKR connection failed: {e}",
+                                "severity": "critical",
+                            },
+                        )))
+
             else:
                 log.debug("ws.unhandled_command", msg_type=msg.type)
 
@@ -224,18 +273,23 @@ def create_app_components() -> dict:
     from cortex.feeds.market_data import MarketDataFeed
     from cortex.intelligence.chat import CortexChat
     from cortex.feeds.status_broadcaster import StatusBroadcaster
+    from cortex.connectors.ibkr.client import IBKRConnectionManager, IBKRConfig
+    from cortex.connectors.ibkr.rate_limiter import IBKRRateLimiter
+    from cortex.connectors.sec.edgar_client import EDGARClient
+    from cortex.feeds.financials import FinancialsAggregator
 
     bus = SignalBus()
     autonomy = AutonomyDial()
 
     # ECHO squadron
     kill_switch = KillSwitchCommander(bus=bus)
+    drawdown_shield = DrawdownShield()
     guardian = RiskGuardian(
         bus=bus,
         kill_switch_check=lambda: kill_switch.is_halted,
         pre_trade=PreTradeCheck(max_position_pct=5.0, max_concurrent=15, max_daily_trades=50),
         position_sizer=PositionSizer(max_position_pct=5.0, max_single_loss_usd=500.0),
-        drawdown_shield=DrawdownShield(),
+        drawdown_shield=drawdown_shield,
     )
 
     # TradePipeline
@@ -291,13 +345,6 @@ def create_app_components() -> dict:
     # Polygon REST client
     polygon_client = PolygonRESTClient(api_key=config.polygon_api_key)
 
-    # Market data feed
-    market_feed = MarketDataFeed(
-        polygon_client=polygon_client,
-        broadcaster=broadcaster,
-        bus=bus,
-    )
-
     # Claude chat interface
     chat = CortexChat(
         api_key=config.anthropic_api_key,
@@ -305,12 +352,44 @@ def create_app_components() -> dict:
         bus=bus,
     )
 
-    # Periodic status broadcaster
+    # SEC EDGAR client (free, no API key needed)
+    edgar_client = EDGARClient()
+
+    # Financials aggregator (combines Polygon, EDGAR, and AI)
+    financials = FinancialsAggregator(
+        polygon_client=polygon_client,
+        edgar_client=edgar_client,
+        chat=chat,
+    )
+
+    # Periodic status broadcaster (with drawdown_shield for NAV updates per CLAUDE.md)
     status_broadcaster = StatusBroadcaster(
         broadcaster=broadcaster,
         orchestrator=orchestrator,
+        bus=bus,
+        drawdown_shield=drawdown_shield,
         interval=5.0,
     )
+
+    # Market data feed (wired to status_broadcaster for simulated NAV until IBKR connects)
+    market_feed = MarketDataFeed(
+        polygon_client=polygon_client,
+        broadcaster=broadcaster,
+        bus=bus,
+        status_broadcaster=status_broadcaster,
+    )
+
+    # IBKR (optional — only if TWS/Gateway is running)
+    ibkr_rate_limiter = IBKRRateLimiter()
+
+    # Don't auto-connect IBKR — it requires TWS/Gateway to be running
+    # Instead, create it but only connect on demand or when TWS is detected
+    ibkr_config = IBKRConfig(
+        host=config.ibkr_host,
+        port=config.ibkr_port,
+        client_id=config.ibkr_client_id,
+    )
+    ibkr_manager = IBKRConnectionManager(config=ibkr_config)
 
     return {
         "bus": bus,
@@ -324,6 +403,11 @@ def create_app_components() -> dict:
         "market_feed": market_feed,
         "chat": chat,
         "status_broadcaster": status_broadcaster,
+        "ibkr_rate_limiter": ibkr_rate_limiter,
+        "ibkr_manager": ibkr_manager,
+        "drawdown_shield": drawdown_shield,
+        "edgar_client": edgar_client,
+        "financials": financials,
     }
 
 
