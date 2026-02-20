@@ -85,6 +85,85 @@ def test_build_system_prompt_negative_pnl():
     assert "$-500.00" in prompt
 
 
+# ─── Context-Aware System Prompt ────────────────────────────────────
+
+def test_build_system_prompt_with_ui_context_scanner():
+    chat = CortexChat(api_key="test-key")
+    context = {"current_tab": "scanner", "current_section": "options_flow"}
+    prompt = chat.build_system_prompt(context=context)
+    assert "scanner" in prompt
+    assert "options_flow" in prompt
+    assert "trading opportunities" in prompt
+
+
+def test_build_system_prompt_with_ui_context_financials():
+    chat = CortexChat(api_key="test-key")
+    context = {"current_tab": "financials", "selected_symbol": "AAPL"}
+    prompt = chat.build_system_prompt(context=context)
+    assert "financials" in prompt
+    assert "AAPL" in prompt
+    assert "fundamental analysis" in prompt
+
+
+def test_build_system_prompt_with_ui_context_war_room():
+    chat = CortexChat(api_key="test-key")
+    context = {"current_tab": "war_room"}
+    prompt = chat.build_system_prompt(context=context)
+    assert "war_room" in prompt
+    assert "portfolio risk" in prompt
+
+
+def test_build_system_prompt_with_ui_context_markets():
+    chat = CortexChat(api_key="test-key")
+    context = {"current_tab": "markets"}
+    prompt = chat.build_system_prompt(context=context)
+    assert "markets" in prompt
+    assert "technical analysis" in prompt
+
+
+def test_build_system_prompt_with_ui_context_watchlist():
+    chat = CortexChat(api_key="test-key")
+    context = {"current_tab": "watchlist"}
+    prompt = chat.build_system_prompt(context=context)
+    assert "watchlist" in prompt
+    assert "position management" in prompt
+
+
+def test_build_system_prompt_no_context():
+    """build_system_prompt still works fine with no context (backward compat)."""
+    chat = CortexChat(api_key="test-key")
+    prompt = chat.build_system_prompt()
+    assert "Current User Context" not in prompt
+    assert "CORTEX AI" in prompt
+
+
+def test_build_system_prompt_context_none_explicit():
+    """Passing None explicitly should be same as no context."""
+    chat = CortexChat(api_key="test-key")
+    prompt = chat.build_system_prompt(context=None)
+    assert "Current User Context" not in prompt
+
+
+def test_build_system_prompt_context_unknown_tab():
+    """Unknown tabs don't add tab-specific hints but still add context section."""
+    chat = CortexChat(api_key="test-key")
+    context = {"current_tab": "settings", "current_section": "unknown"}
+    prompt = chat.build_system_prompt(context=context)
+    assert "settings" in prompt
+    # No tab-specific hints for 'settings'
+    assert "trading opportunities" not in prompt
+    assert "fundamental analysis" not in prompt
+
+
+def test_build_system_prompt_context_with_selected_symbol():
+    """Verify selected_symbol appears in context section."""
+    chat = CortexChat(api_key="test-key")
+    context = {"current_tab": "financials", "selected_symbol": "NVDA"}
+    prompt = chat.build_system_prompt(context=context)
+    assert "NVDA" in prompt
+    assert "looking at the symbol" in prompt
+
+
 # ─── Conversation History ────────────────────────────────────────────
 
 def test_conversation_history_management():
@@ -286,3 +365,54 @@ async def test_stream_passes_system_prompt():
     assert "$75,000.00" in call_kwargs["system"]
     assert "$+300.00" in call_kwargs["system"]
     assert call_kwargs["messages"][0]["content"] == "Test"
+
+
+@pytest.mark.asyncio
+async def test_stream_passes_context_to_system_prompt():
+    """Verify UI context is included in the system prompt sent to Claude."""
+    chat = CortexChat(api_key="test-key")
+
+    class MockTextStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+    class MockStreamContext:
+        def __init__(self):
+            self.text_stream = MockTextStream()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    mock_client = MagicMock()
+    mock_client.messages.stream.return_value = MockStreamContext()
+
+    context = {"current_tab": "financials", "selected_symbol": "TSLA"}
+
+    with patch.object(chat, "_get_client", new_callable=AsyncMock, return_value=mock_client):
+        async for _ in chat.stream_response("Analyze this stock", context=context):
+            pass
+
+    call_kwargs = mock_client.messages.stream.call_args.kwargs
+    assert "financials" in call_kwargs["system"]
+    assert "TSLA" in call_kwargs["system"]
+    assert "fundamental analysis" in call_kwargs["system"]
+
+
+@pytest.mark.asyncio
+async def test_stream_response_no_context_backward_compat():
+    """Verify stream_response works without context parameter (backward compatibility)."""
+    chat = CortexChat(api_key="test-key")
+
+    with patch.object(chat, "_get_client", new_callable=AsyncMock, return_value=None):
+        chunks = []
+        async for chunk in chat.stream_response("Hello"):
+            chunks.append(chunk)
+
+    assert len(chunks) == 1
+    assert "unavailable" in chunks[0].lower()

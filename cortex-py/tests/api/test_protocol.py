@@ -114,3 +114,49 @@ def test_market_quote_message():
     parsed = orjson.loads(encoded)
     assert parsed["type"] == "market_quote"
     assert parsed["payload"]["symbol"] == "AAPL"
+
+
+# ─── Financials Message Types ────────────────────────────────────────
+
+def test_financials_message_types_exist():
+    """Verify all financials-related message types exist."""
+    assert MessageType.FINANCIALS_PROFILE == "financials_profile"
+    assert MessageType.FINANCIALS_NEWS == "financials_news"
+    assert MessageType.FINANCIALS_FILINGS == "financials_filings"
+    assert MessageType.FINANCIALS_SENTIMENT == "financials_sentiment"
+    assert MessageType.FINANCIALS_AI_ANALYSIS == "financials_ai_analysis"
+    assert MessageType.CMD_FINANCIALS_LOOKUP == "cmd_financials_lookup"
+
+
+def test_financials_profile_message():
+    msg = CortexMessage(
+        type=MessageType.FINANCIALS_PROFILE,
+        payload={"symbol": "AAPL", "price": 185.50, "market_cap": 2800000000000},
+    )
+    encoded = encode_message(msg)
+    parsed = orjson.loads(encoded)
+    assert parsed["type"] == "financials_profile"
+    assert parsed["payload"]["symbol"] == "AAPL"
+
+
+def test_financials_filings_message():
+    msg = CortexMessage(
+        type=MessageType.FINANCIALS_FILINGS,
+        payload={"items": [{"type": "10-K", "filed_date": "2024-11-01"}]},
+    )
+    encoded = encode_message(msg)
+    parsed = orjson.loads(encoded)
+    assert parsed["type"] == "financials_filings"
+    assert len(parsed["payload"]["items"]) == 1
+
+
+def test_cmd_financials_lookup_roundtrip():
+    msg = CortexMessage(
+        type=MessageType.CMD_FINANCIALS_LOOKUP,
+        payload={"symbol": "NVDA"},
+    )
+    encoded = encode_message(msg)
+    parsed = orjson.loads(encoded)
+    decoded = decode_message(parsed)
+    assert decoded.type == MessageType.CMD_FINANCIALS_LOOKUP
+    assert decoded.payload["symbol"] == "NVDA"
