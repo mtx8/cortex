@@ -50,6 +50,9 @@ public enum SortField: String, CaseIterable, Identifiable, Sendable {
     case score = "Score"
     case ticker = "Ticker"
     case rr = "R:R"
+    case type = "Type"
+    case direction = "Direction"
+    case sector = "Sector"
 
     public var id: String { rawValue }
 }
@@ -69,6 +72,8 @@ public final class ScannerFilterStore {
 
     public init() {}
 
+    /// Apply all filters and sorting to the opportunities list.
+    /// Nil/Unknown fields pass through all filters (never filtered out due to missing data).
     public func filtered(_ opportunities: [Opportunity]) -> [Opportunity] {
         var result = opportunities
 
@@ -82,24 +87,43 @@ public final class ScannerFilterStore {
             break
         }
 
-        // Filter by market
-        switch market {
-        case .usStocks:
-            result = result.filter { $0.market == "US Stocks" || $0.market == nil }
-        case .crypto:
-            result = result.filter { $0.market == "Crypto" }
-        case .all:
-            break
+        // Filter by market — nil market passes through (matches any filter)
+        if market != .all {
+            result = result.filter { opp in
+                guard let oppMarket = opp.market, !oppMarket.isEmpty else {
+                    return true // nil or empty market always passes
+                }
+                switch market {
+                case .usStocks:
+                    return oppMarket == "US Stocks"
+                case .crypto:
+                    return oppMarket == "Crypto"
+                case .all:
+                    return true
+                }
+            }
         }
 
-        // Filter by sector
+        // Filter by sector — nil or "Unknown" sector passes through (matches any filter)
         if sector != .all {
-            result = result.filter { $0.sector == sector.rawValue }
+            result = result.filter { opp in
+                guard let oppSector = opp.sector,
+                      !oppSector.isEmpty,
+                      oppSector != "Unknown" else {
+                    return true // nil, empty, or "Unknown" sector always passes
+                }
+                return oppSector == sector.rawValue
+            }
         }
 
-        // Filter by cap size
+        // Filter by cap size — nil marketCap passes through (matches any filter)
         if capSize != .all {
-            result = result.filter { $0.marketCap == capSize.rawValue }
+            result = result.filter { opp in
+                guard let oppCap = opp.marketCap, !oppCap.isEmpty else {
+                    return true // nil or empty marketCap always passes
+                }
+                return oppCap == capSize.rawValue
+            }
         }
 
         // Filter by minimum score
@@ -115,6 +139,16 @@ public final class ScannerFilterStore {
             result.sort { sortAscending ? $0.ticker < $1.ticker : $0.ticker > $1.ticker }
         case .rr:
             result.sort { sortAscending ? $0.riskReward < $1.riskReward : $0.riskReward > $1.riskReward }
+        case .type:
+            result.sort { sortAscending ? $0.type.rawValue < $1.type.rawValue : $0.type.rawValue > $1.type.rawValue }
+        case .direction:
+            result.sort { sortAscending ? $0.direction.rawValue < $1.direction.rawValue : $0.direction.rawValue > $1.direction.rawValue }
+        case .sector:
+            result.sort {
+                let a = $0.sector ?? ""
+                let b = $1.sector ?? ""
+                return sortAscending ? a < b : a > b
+            }
         }
 
         return result
@@ -130,6 +164,7 @@ public final class ScannerFilterStore {
         sortAscending = false
     }
 
+    /// Number of currently active filters (non-default values).
     public var activeFilterCount: Int {
         var count = 0
         if direction != .both { count += 1 }
@@ -138,5 +173,10 @@ public final class ScannerFilterStore {
         if capSize != .all { count += 1 }
         if minScore > 0 { count += 1 }
         return count
+    }
+
+    /// Count of results after applying all filters. Requires the full opportunity list.
+    public func resultCount(from opportunities: [Opportunity]) -> Int {
+        filtered(opportunities).count
     }
 }

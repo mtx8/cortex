@@ -47,6 +47,9 @@ public final class ChatStore {
     public var isProcessing: Bool = false
     public var webSocket: WebSocketClient?
     public var currentStreamingMessageId: String?
+    public var currentTab: String = ""
+    public var currentSection: String = ""
+    public var selectedSymbol: String = ""
 
     public init() {
         // Add welcome message
@@ -75,9 +78,20 @@ public final class ChatStore {
 
         // Try to send via WebSocket first
         if let ws = webSocket, ws.isConnected {
+            var context: [String: Any] = [
+                "current_tab": currentTab,
+                "current_section": currentSection,
+            ]
+            if !selectedSymbol.isEmpty {
+                context["selected_symbol"] = selectedSymbol
+            }
             let payload: [String: Any] = [
                 "type": "cmd_chat_message",
-                "payload": ["message": text]
+                "payload": [
+                    "message": text,
+                    "conversation_id": "default",
+                    "context": context,
+                ] as [String: Any]
             ]
             // Create a placeholder streaming message
             let streamId = UUID().uuidString
@@ -96,6 +110,19 @@ public final class ChatStore {
                     fallbackMockResponse(for: text)
                 }
             }
+
+            // Streaming timeout safety net: auto-recover if stuck
+            let capturedStreamId = streamId
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(90))
+                guard isProcessing, currentStreamingMessageId == capturedStreamId else { return }
+                if let idx = messages.firstIndex(where: { $0.id == capturedStreamId }) {
+                    if messages[idx].content.isEmpty {
+                        messages[idx].content = "Response timed out. Please try again."
+                    }
+                }
+                finishStreaming()
+            }
         } else {
             // Fallback: simulate AI response when WebSocket is not connected
             fallbackMockResponse(for: text)
@@ -104,6 +131,8 @@ public final class ChatStore {
 
     /// Append a chunk of streamed text to the current streaming message.
     public func appendChunk(_ chunk: String) {
+        // Skip internal status markers
+        guard !chunk.hasPrefix("__STATUS__:") else { return }
         guard let streamId = currentStreamingMessageId,
               let idx = messages.firstIndex(where: { $0.id == streamId }) else { return }
         messages[idx].content += chunk
@@ -242,15 +271,17 @@ public final class ChatStore {
             return ChatMessage(
                 role: .assistant,
                 content: """
-                I can help with:
+                I'm currently in **offline mode** -- the Python backend is not connected, so I can't access live AI.
 
-                - **Market Analysis** -- "Analyze AAPL" or "What's the setup on NVDA?"
-                - **Trade Opportunities** -- "Show me trade signals" or "Top opportunity"
-                - **Portfolio Review** -- "Biggest risk?" or "How's my portfolio?"
-                - **Strategy** -- "Market thesis" or "Sector rotation?"
-                - **Overnight Watch** -- "What should I watch overnight?"
+                While offline, try these keywords for cached analysis:
+                - **"AAPL"** or **"Apple"** -- Ticker analysis
+                - **"risk"** -- Portfolio risk assessment
+                - **"opportunity"** or **"trade"** or **"signal"** -- Active opportunities
+                - **"thesis"** or **"market"** -- Market thesis
+                - **"overnight"** or **"watch"** -- Overnight watch list
+                - **"sector"** or **"rotation"** -- Sector rotation analysis
 
-                I have full context on all 44 agents across 6 squadrons, your positions, and real-time market data.
+                Start the Python backend (`python -m cortex.main`) for full AI-powered analysis.
                 """
             )
         }

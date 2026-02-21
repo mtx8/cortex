@@ -34,6 +34,8 @@ public final class WebSocketClient {
         session = newSession
         webSocketTask = newSession.webSocketTask(with: wsURL)
         webSocketTask?.resume()
+        isConnected = true
+        reconnectAttempt = 0
         lastError = nil
         receiveMessages()
     }
@@ -66,10 +68,6 @@ public final class WebSocketClient {
                 guard let self = self else { return }
                 switch result {
                 case .success(let message):
-                    if !self.isConnected {
-                        self.isConnected = true
-                        self.reconnectAttempt = 0
-                    }
                     self.messagesReceived += 1
                     self.handleMessage(message)
                     self.receiveMessages() // Continue listening

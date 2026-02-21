@@ -372,6 +372,13 @@ public final class FinancialsStore {
         )
     }
 
+    /// Apply error from backend — clears loading state
+    public func applyError(_ error: String) {
+        searchTimeoutTask?.cancel()
+        isLoading = false
+        errorMessage = error
+    }
+
     /// Apply AI analysis from backend
     public func applyAIAnalysis(_ data: [String: Any]) {
         searchTimeoutTask?.cancel()
