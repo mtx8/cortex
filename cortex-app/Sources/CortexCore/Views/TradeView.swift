@@ -145,7 +145,7 @@ public struct TradeView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(environment.trade.positions) { position in
                         tradePositionRow(position)
-                        Divider().overlay(Color(white: 0.08))
+                        Divider().overlay(CortexDesign.bgCard)
                     }
                 }
             }
@@ -223,7 +223,7 @@ public struct TradeView: View {
             Spacer()
 
             HStack(spacing: 12) {
-                statBadge("Pending", count: environment.trade.pendingOrders.count, color: .orange)
+                statBadge("Pending", count: environment.trade.pendingOrders.count, color: CortexDesign.warning)
                 statBadge("Filled", count: environment.trade.filledOrders.count, color: CortexDesign.profit)
             }
         }
@@ -267,7 +267,7 @@ public struct TradeView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(environment.trade.orders.reversed()) { order in
                         orderRow(order)
-                        Divider().overlay(Color(white: 0.08))
+                        Divider().overlay(CortexDesign.bgCard)
                     }
                 }
             }
@@ -330,7 +330,7 @@ public struct TradeView: View {
         let color: Color = switch status {
         case "filled": CortexDesign.profit
         case "cancelled": CortexDesign.loss
-        case "pending": .orange
+        case "pending": CortexDesign.warning
         default: CortexDesign.neutral
         }
 
@@ -352,15 +352,15 @@ public struct TradeView: View {
             Spacer()
             Image(systemName: icon)
                 .font(.system(size: 40))
-                .foregroundStyle(Color(white: 0.2))
+                .foregroundStyle(CortexDesign.border)
 
             Text(title)
                 .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(Color(white: 0.6))
+                .foregroundStyle(CortexDesign.neutral)
 
             Text(subtitle)
                 .font(.system(size: 12))
-                .foregroundStyle(Color(white: 0.4))
+                .foregroundStyle(CortexDesign.neutral)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 350)
 

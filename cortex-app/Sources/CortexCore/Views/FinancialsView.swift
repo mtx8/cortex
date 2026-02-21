@@ -28,7 +28,7 @@ public struct FinancialsView: View {
             searchBar
 
             Divider()
-                .overlay(Color(white: 0.15))
+                .overlay(CortexDesign.bgElevated)
 
             if store.isLoading {
                 Spacer()
@@ -40,7 +40,7 @@ public struct FinancialsView: View {
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle")
                         .font(.system(size: 36))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(CortexDesign.warning)
                     Text(error)
                         .font(.system(size: 14))
                         .foregroundStyle(.secondary)
@@ -81,7 +81,7 @@ public struct FinancialsView: View {
                 emptyState
             }
         }
-        .background(Color(nsColor: NSColor(red: 0.06, green: 0.06, blue: 0.09, alpha: 1.0)))
+        .background(CortexDesign.bgDeepest)
         .onChange(of: store.selectedSymbol) { _, newSymbol in
             if let sym = newSymbol {
                 chatStore?.selectedSymbol = sym
@@ -140,11 +140,11 @@ public struct FinancialsView: View {
             .padding(.vertical, 10)
             .background(
                 RoundedRectangle(cornerRadius: 10)
-                    .fill(Color(nsColor: NSColor(red: 0.10, green: 0.10, blue: 0.14, alpha: 1.0)))
+                    .fill(CortexDesign.bgHover)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(Color(white: 0.18), lineWidth: 1)
+                    .strokeBorder(CortexDesign.borderHover, lineWidth: 1)
             )
 
             // Recent searches
@@ -182,7 +182,7 @@ public struct FinancialsView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
-        .background(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+        .background(CortexDesign.bgCard)
     }
 
     // MARK: - Profile Header
@@ -215,7 +215,7 @@ public struct FinancialsView: View {
                                         isPositive ? "+" : "", profile.changePercent))
                                 .font(.system(size: 13, weight: .medium, design: .monospaced))
                         }
-                        .foregroundStyle(isPositive ? Color.green : Color.red)
+                        .foregroundStyle(isPositive ? CortexDesign.profit : CortexDesign.loss)
                     }
                 }
 
@@ -241,11 +241,11 @@ public struct FinancialsView: View {
         .padding(16)
         .background(
             RoundedRectangle(cornerRadius: 12)
-                .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                .fill(CortexDesign.bgCard)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 12)
-                .strokeBorder(Color(white: 0.15), lineWidth: 1)
+                .strokeBorder(CortexDesign.bgElevated, lineWidth: 1)
         )
     }
 
@@ -290,7 +290,7 @@ public struct FinancialsView: View {
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                .fill(CortexDesign.bgCard)
         )
     }
 
@@ -307,7 +307,7 @@ public struct FinancialsView: View {
                         .foregroundStyle(activeSection == section ? .white : .secondary)
                         .background(
                             activeSection == section
-                                ? Color(nsColor: NSColor(red: 0.14, green: 0.14, blue: 0.20, alpha: 1.0))
+                                ? CortexDesign.bgElevated
                                 : Color.clear
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -318,11 +318,11 @@ public struct FinancialsView: View {
         .padding(4)
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                .fill(CortexDesign.bgCard)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(Color(white: 0.15), lineWidth: 1)
+                .strokeBorder(CortexDesign.bgElevated, lineWidth: 1)
         )
     }
 
@@ -364,7 +364,7 @@ public struct FinancialsView: View {
                 HStack {
                     Text(formatCurrency(profile.week52Low))
                         .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.red)
+                        .foregroundStyle(CortexDesign.loss)
                     Spacer()
                     Text(formatCurrency(profile.price))
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
@@ -372,13 +372,13 @@ public struct FinancialsView: View {
                     Spacer()
                     Text(formatCurrency(profile.week52High))
                         .font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.green)
+                        .foregroundStyle(CortexDesign.profit)
                 }
             }
             .padding(12)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                    .fill(CortexDesign.bgCard)
             )
 
             // Volume Comparison
@@ -418,7 +418,7 @@ public struct FinancialsView: View {
             .padding(12)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                    .fill(CortexDesign.bgCard)
             )
 
             // Valuation Metrics
@@ -441,7 +441,7 @@ public struct FinancialsView: View {
                         .foregroundStyle(.secondary)
                     Text(String(format: "%.2f%%", profile.shortInterest))
                         .font(.system(size: 16, weight: .bold, design: .monospaced))
-                        .foregroundStyle(profile.shortInterest > 5 ? .red : profile.shortInterest > 2 ? .orange : .green)
+                        .foregroundStyle(profile.shortInterest > 5 ? CortexDesign.loss : profile.shortInterest > 2 ? CortexDesign.warning : CortexDesign.profit)
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -450,7 +450,7 @@ public struct FinancialsView: View {
                         .foregroundStyle(.secondary)
                     Text(String(format: "%.1f days", profile.shortRatio))
                         .font(.system(size: 16, weight: .bold, design: .monospaced))
-                        .foregroundStyle(profile.shortRatio > 3 ? .orange : .white)
+                        .foregroundStyle(profile.shortRatio > 3 ? CortexDesign.warning : .white)
                 }
 
                 Spacer()
@@ -463,7 +463,7 @@ public struct FinancialsView: View {
                     GeometryReader { geo in
                         ZStack(alignment: .leading) {
                             RoundedRectangle(cornerRadius: 3)
-                                .fill(Color(white: 0.15))
+                                .fill(CortexDesign.bgElevated)
                             RoundedRectangle(cornerRadius: 3)
                                 .fill(squeezeColor(profile.shortInterest))
                                 .frame(width: max(0, geo.size.width * min(profile.shortInterest / 20.0, 1.0)))
@@ -476,7 +476,7 @@ public struct FinancialsView: View {
             .padding(12)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                    .fill(CortexDesign.bgCard)
             )
         }
     }
@@ -527,11 +527,11 @@ public struct FinancialsView: View {
             .padding(12)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                    .fill(CortexDesign.bgCard)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(Color(white: 0.13), lineWidth: 1)
+                    .strokeBorder(CortexDesign.border, lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
@@ -599,11 +599,11 @@ public struct FinancialsView: View {
             .padding(12)
             .background(
                 RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                    .fill(CortexDesign.bgCard)
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 8)
-                    .strokeBorder(Color(white: 0.13), lineWidth: 1)
+                    .strokeBorder(CortexDesign.border, lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
@@ -642,7 +642,7 @@ public struct FinancialsView: View {
                     HStack {
                         Text("BEARISH")
                             .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.red)
+                            .foregroundStyle(CortexDesign.loss)
                         Spacer()
                         Text("NEUTRAL")
                             .font(.system(size: 10, weight: .bold))
@@ -650,7 +650,7 @@ public struct FinancialsView: View {
                         Spacer()
                         Text("BULLISH")
                             .font(.system(size: 10, weight: .bold))
-                            .foregroundStyle(.green)
+                            .foregroundStyle(CortexDesign.profit)
                     }
 
                     GeometryReader { geo in
@@ -688,7 +688,7 @@ public struct FinancialsView: View {
                 .padding(16)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                        .fill(CortexDesign.bgCard)
                 )
 
                 // Mention Volume and Trend
@@ -735,7 +735,7 @@ public struct FinancialsView: View {
                 .padding(16)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                        .fill(CortexDesign.bgCard)
                 )
 
                 // Top Keywords
@@ -752,20 +752,20 @@ public struct FinancialsView: View {
                                 .padding(.vertical, 5)
                                 .background(
                                     RoundedRectangle(cornerRadius: 14)
-                                        .fill(Color.cyan.opacity(0.10))
+                                        .fill(CortexDesign.accentPrimary.opacity(0.10))
                                 )
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 14)
-                                        .strokeBorder(Color.cyan.opacity(0.25), lineWidth: 1)
+                                        .strokeBorder(CortexDesign.accentPrimary.opacity(0.25), lineWidth: 1)
                                 )
-                                .foregroundStyle(.cyan)
+                                .foregroundStyle(CortexDesign.accentPrimary)
                         }
                     }
                 }
                 .padding(16)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                        .fill(CortexDesign.bgCard)
                 )
             } else {
                 emptySection("No sentiment data available", icon: "chart.bar")
@@ -814,9 +814,9 @@ public struct FinancialsView: View {
                             .padding(.vertical, 8)
                             .background(
                                 RoundedRectangle(cornerRadius: 10)
-                                    .fill(Color.red.opacity(0.15))
+                                    .fill(CortexDesign.loss.opacity(0.15))
                             )
-                            .foregroundStyle(.red)
+                            .foregroundStyle(CortexDesign.loss)
                         }
                     }
 
@@ -830,7 +830,7 @@ public struct FinancialsView: View {
 
                         ZStack {
                             Circle()
-                                .stroke(Color(white: 0.15), lineWidth: 4)
+                                .stroke(CortexDesign.bgElevated, lineWidth: 4)
                                 .frame(width: 52, height: 52)
                             Circle()
                                 .trim(from: 0, to: analysis.confidence)
@@ -847,7 +847,7 @@ public struct FinancialsView: View {
                 .padding(16)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                        .fill(CortexDesign.bgCard)
                 )
 
                 // Summary
@@ -865,7 +865,7 @@ public struct FinancialsView: View {
                 .padding(16)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                        .fill(CortexDesign.bgCard)
                 )
 
                 // Key Catalysts
@@ -874,7 +874,7 @@ public struct FinancialsView: View {
                         HStack(spacing: 6) {
                             Image(systemName: "bolt.fill")
                                 .font(.system(size: 11))
-                                .foregroundStyle(.green)
+                                .foregroundStyle(CortexDesign.profit)
                             Text("Key Catalysts")
                                 .font(.system(size: 11, weight: .bold))
                                 .foregroundStyle(.secondary)
@@ -883,7 +883,7 @@ public struct FinancialsView: View {
                         ForEach(Array(analysis.keyCatalysts.enumerated()), id: \.offset) { _, catalyst in
                             HStack(alignment: .top, spacing: 8) {
                                 Circle()
-                                    .fill(Color.green.opacity(0.6))
+                                    .fill(CortexDesign.profit.opacity(0.6))
                                     .frame(width: 6, height: 6)
                                     .padding(.top, 5)
 
@@ -896,11 +896,11 @@ public struct FinancialsView: View {
                     .padding(16)
                     .background(
                         RoundedRectangle(cornerRadius: 10)
-                            .fill(Color(nsColor: NSColor(red: 0.06, green: 0.09, blue: 0.07, alpha: 1.0)))
+                            .fill(CortexDesign.profit.opacity(0.06))
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 10)
-                            .strokeBorder(Color.green.opacity(0.15), lineWidth: 1)
+                            .strokeBorder(CortexDesign.profit.opacity(0.15), lineWidth: 1)
                     )
                 }
 
@@ -910,7 +910,7 @@ public struct FinancialsView: View {
                         HStack(spacing: 6) {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.system(size: 11))
-                                .foregroundStyle(.red)
+                                .foregroundStyle(CortexDesign.loss)
                             Text("Key Risks")
                                 .font(.system(size: 11, weight: .bold))
                                 .foregroundStyle(.secondary)
@@ -919,7 +919,7 @@ public struct FinancialsView: View {
                         ForEach(Array(analysis.keyRisks.enumerated()), id: \.offset) { _, risk in
                             HStack(alignment: .top, spacing: 8) {
                                 Circle()
-                                    .fill(Color.red.opacity(0.6))
+                                    .fill(CortexDesign.loss.opacity(0.6))
                                     .frame(width: 6, height: 6)
                                     .padding(.top, 5)
 
@@ -932,11 +932,11 @@ public struct FinancialsView: View {
                     .padding(16)
                     .background(
                         RoundedRectangle(cornerRadius: 10)
-                            .fill(Color(nsColor: NSColor(red: 0.09, green: 0.06, blue: 0.06, alpha: 1.0)))
+                            .fill(CortexDesign.loss.opacity(0.06))
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 10)
-                            .strokeBorder(Color.red.opacity(0.15), lineWidth: 1)
+                            .strokeBorder(CortexDesign.loss.opacity(0.15), lineWidth: 1)
                     )
                 }
 
@@ -1011,7 +1011,7 @@ public struct FinancialsView: View {
 
             Image(systemName: "building.columns")
                 .font(.system(size: 48))
-                .foregroundStyle(Color(white: 0.3))
+                .foregroundStyle(CortexDesign.neutral)
 
             Text("Search for a stock")
                 .font(.system(size: 18, weight: .bold))
@@ -1096,7 +1096,7 @@ public struct FinancialsView: View {
         .padding(.vertical, 12)
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                .fill(CortexDesign.bgCard)
         )
     }
 
@@ -1113,7 +1113,7 @@ public struct FinancialsView: View {
         .padding(.vertical, 12)
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+                .fill(CortexDesign.bgCard)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10)
@@ -1125,7 +1125,7 @@ public struct FinancialsView: View {
         VStack(spacing: 8) {
             Image(systemName: icon)
                 .font(.system(size: 24))
-                .foregroundStyle(Color(white: 0.3))
+                .foregroundStyle(CortexDesign.neutral)
             Text(message)
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
@@ -1190,39 +1190,39 @@ public struct FinancialsView: View {
     // MARK: - Color Helpers
 
     private func sentimentColor(_ score: Double) -> Color {
-        if score > 0.3 { return .green }
-        if score < -0.3 { return .red }
+        if score > 0.3 { return CortexDesign.profit }
+        if score < -0.3 { return CortexDesign.loss }
         return .yellow
     }
 
     private func trendTextColor(_ trend: SentimentData.Trend) -> Color {
         switch trend {
-        case .rising: return .green
-        case .falling: return .red
+        case .rising: return CortexDesign.profit
+        case .falling: return CortexDesign.loss
         case .stable: return .gray
         }
     }
 
     private func squeezeColor(_ shortInterest: Double) -> Color {
-        if shortInterest > 10 { return .red }
-        if shortInterest > 5 { return .orange }
-        return .green
+        if shortInterest > 10 { return CortexDesign.loss }
+        if shortInterest > 5 { return CortexDesign.warning }
+        return CortexDesign.profit
     }
 
     private func recommendationColor(_ rec: AIStockAnalysis.Recommendation) -> Color {
         switch rec {
-        case .strongBuy: return .green
-        case .buy: return Color(nsColor: NSColor(red: 0.4, green: 0.85, blue: 0.4, alpha: 1.0))
+        case .strongBuy: return CortexDesign.profit
+        case .buy: return CortexDesign.profit.opacity(0.8)
         case .hold: return .yellow
-        case .sell: return .orange
-        case .strongSell: return .red
+        case .sell: return CortexDesign.warning
+        case .strongSell: return CortexDesign.loss
         }
     }
 
     private func confidenceColor(_ confidence: Double) -> Color {
-        if confidence >= 0.7 { return .green }
+        if confidence >= 0.7 { return CortexDesign.profit }
         if confidence >= 0.4 { return .yellow }
-        return .red
+        return CortexDesign.loss
     }
 }
 

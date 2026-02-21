@@ -89,14 +89,14 @@ public struct OrderPanelView: View {
                                 RoundedRectangle(cornerRadius: 6)
                                     .fill(store.tradingMode == mode
                                           ? modeColor(mode).opacity(0.2)
-                                          : Color(white: 0.10))
+                                          : CortexDesign.bgHover)
                             )
                             .overlay(
                                 RoundedRectangle(cornerRadius: 6)
                                     .strokeBorder(
                                         store.tradingMode == mode
                                             ? modeColor(mode).opacity(0.5)
-                                            : Color(white: 0.15),
+                                            : CortexDesign.bgElevated,
                                         lineWidth: 1
                                     )
                             )
@@ -165,7 +165,7 @@ public struct OrderPanelView: View {
                             .padding(.vertical, 5)
                             .background(
                                 RoundedRectangle(cornerRadius: 4)
-                                    .fill(quantity == qty ? CortexDesign.accentPrimary.opacity(0.15) : Color(white: 0.10))
+                                    .fill(quantity == qty ? CortexDesign.accentPrimary.opacity(0.15) : CortexDesign.bgHover)
                             )
                             .foregroundStyle(quantity == qty ? CortexDesign.accentPrimary : .secondary)
                     }
@@ -193,14 +193,14 @@ public struct OrderPanelView: View {
                                 RoundedRectangle(cornerRadius: 6)
                                     .fill(orderType == type
                                           ? CortexDesign.accentSecondary.opacity(0.15)
-                                          : Color(white: 0.10))
+                                          : CortexDesign.bgHover)
                             )
                             .overlay(
                                 RoundedRectangle(cornerRadius: 6)
                                     .strokeBorder(
                                         orderType == type
                                             ? CortexDesign.accentSecondary.opacity(0.5)
-                                            : Color(white: 0.15),
+                                            : CortexDesign.bgElevated,
                                         lineWidth: 1
                                     )
                             )

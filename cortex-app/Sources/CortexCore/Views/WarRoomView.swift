@@ -31,7 +31,7 @@ public struct WarRoomView: View {
                 overviewLayout
             }
         }
-        .background(Color(white: 0.05))
+        .background(CortexDesign.bgDeepest)
     }
 
     // MARK: - Overview (3-column layout)
@@ -82,7 +82,7 @@ public struct WarRoomView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text("SQUADRON STATUS")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
 
@@ -100,14 +100,14 @@ public struct WarRoomView: View {
             HStack(spacing: 8) {
                 Text("ACTIVITY LOG")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
 
                 Text("\(environment.activity.events.count) events")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.35))
+                    .foregroundStyle(CortexDesign.neutral)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(Color(white: 0.10))
+                    .background(CortexDesign.bgHover)
                     .clipShape(RoundedRectangle(cornerRadius: 4))
 
                 Spacer()
@@ -136,7 +136,7 @@ public struct WarRoomView: View {
             VStack(alignment: .leading, spacing: 16) {
                 Text("RISK ALERTS")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
 
@@ -145,35 +145,35 @@ public struct WarRoomView: View {
                     riskMetricCard(
                         title: "DAILY P&L",
                         value: String(format: "$%.2f", environment.portfolio.dailyPnL),
-                        color: environment.portfolio.dailyPnL >= 0 ? .green : .red,
+                        color: environment.portfolio.dailyPnL >= 0 ? CortexDesign.profit : CortexDesign.loss,
                         icon: "chart.line.uptrend.xyaxis"
                     )
 
                     riskMetricCard(
                         title: "MAX DRAWDOWN",
                         value: String(format: "%.1f%%", environment.settings.maxDrawdownPct),
-                        color: environment.settings.maxDrawdownPct > 5 ? .orange : .green,
+                        color: environment.settings.maxDrawdownPct > 5 ? CortexDesign.warning : CortexDesign.profit,
                         icon: "arrow.down.right"
                     )
 
                     riskMetricCard(
                         title: "OPEN POSITIONS",
                         value: "\(environment.portfolio.openPositionCount)",
-                        color: .cyan,
+                        color: CortexDesign.accentPrimary,
                         icon: "briefcase.fill"
                     )
 
                     riskMetricCard(
                         title: "BUYING POWER",
                         value: String(format: "$%.0f", environment.portfolio.buyingPower),
-                        color: .blue,
+                        color: CortexDesign.accentSecondary,
                         icon: "banknote"
                     )
 
                     riskMetricCard(
                         title: "MAX DAILY LOSS",
                         value: String(format: "$%.0f", environment.settings.maxDailyLoss),
-                        color: .orange,
+                        color: CortexDesign.warning,
                         icon: "exclamationmark.shield"
                     )
 
@@ -192,14 +192,14 @@ public struct WarRoomView: View {
                 HStack(spacing: 8) {
                     Text("RISK EVENTS")
                         .font(.system(size: 11, weight: .bold, design: .monospaced))
-                        .foregroundStyle(Color(white: 0.4))
+                        .foregroundStyle(CortexDesign.neutral)
 
                     Text("\(riskEvents.count)")
                         .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .foregroundStyle(riskEvents.isEmpty ? Color(white: 0.35) : .orange)
+                        .foregroundStyle(riskEvents.isEmpty ? CortexDesign.neutral : CortexDesign.warning)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Color(white: 0.10))
+                        .background(CortexDesign.bgHover)
                         .clipShape(RoundedRectangle(cornerRadius: 4))
 
                     Spacer()
@@ -210,15 +210,15 @@ public struct WarRoomView: View {
                     VStack(spacing: 8) {
                         Image(systemName: "checkmark.shield.fill")
                             .font(.system(size: 40))
-                            .foregroundStyle(Color(white: 0.2))
+                            .foregroundStyle(CortexDesign.border)
 
                         Text("No Risk Alerts")
                             .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(Color(white: 0.5))
+                            .foregroundStyle(CortexDesign.neutral)
 
                         Text("All systems operating within risk parameters")
                             .font(.system(size: 12))
-                            .foregroundStyle(Color(white: 0.35))
+                            .foregroundStyle(CortexDesign.neutral)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 40)
@@ -248,17 +248,17 @@ public struct WarRoomView: View {
 
             Text(title)
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color(white: 0.4))
+                .foregroundStyle(CortexDesign.neutral)
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 14)
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.06))
+                .fill(CortexDesign.bgDeepest)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(Color(white: 0.10), lineWidth: 1)
+                .strokeBorder(CortexDesign.bgHover, lineWidth: 1)
         )
     }
 }
@@ -274,7 +274,7 @@ struct KillSwitchBanner: View {
         HStack(spacing: 10) {
             // Pulsing status dot
             Circle()
-                .fill(killSwitch.isActive ? Color.red : Color.green)
+                .fill(killSwitch.isActive ? CortexDesign.loss : CortexDesign.profit)
                 .frame(width: 7, height: 7)
                 .opacity(pulseOpacity)
                 .onAppear {
@@ -303,13 +303,13 @@ struct KillSwitchBanner: View {
             Group {
                 if killSwitch.isActive {
                     LinearGradient(
-                        colors: [Color.red.opacity(0.15), Color.red.opacity(0.08)],
+                        colors: [CortexDesign.loss.opacity(0.15), CortexDesign.loss.opacity(0.08)],
                         startPoint: .leading,
                         endPoint: .trailing
                     )
                 } else {
                     LinearGradient(
-                        colors: [Color.green.opacity(0.06), Color.green.opacity(0.02)],
+                        colors: [CortexDesign.profit.opacity(0.06), CortexDesign.profit.opacity(0.02)],
                         startPoint: .leading,
                         endPoint: .trailing
                     )
@@ -319,13 +319,13 @@ struct KillSwitchBanner: View {
         .overlay(
             Rectangle()
                 .frame(height: 1)
-                .foregroundStyle(Color(white: 0.10)),
+                .foregroundStyle(CortexDesign.bgHover),
             alignment: .bottom
         )
         .overlay(
             Rectangle()
                 .frame(height: 1)
-                .foregroundStyle(Color(white: 0.10)),
+                .foregroundStyle(CortexDesign.bgHover),
             alignment: .top
         )
     }
@@ -354,13 +354,13 @@ struct KillSwitchButton: View {
             .padding(.vertical, 5)
             .background(
                 Capsule()
-                    .fill(store.isActive ? Color.red : Color.clear)
+                    .fill(store.isActive ? CortexDesign.loss : Color.clear)
             )
             .overlay(
                 Capsule()
-                    .strokeBorder(store.isActive ? Color.red : Color.green.opacity(0.4), lineWidth: 1)
+                    .strokeBorder(store.isActive ? CortexDesign.loss : CortexDesign.profit.opacity(0.4), lineWidth: 1)
             )
-            .foregroundStyle(store.isActive ? .white : .green)
+            .foregroundStyle(store.isActive ? .white : CortexDesign.profit)
         }
         .buttonStyle(.plain)
     }
@@ -384,7 +384,7 @@ struct LiveSignalFeed: View {
             HStack(spacing: 6) {
                 if hasRecentSignals {
                     Circle()
-                        .fill(Color.red)
+                        .fill(CortexDesign.loss)
                         .frame(width: 6, height: 6)
                         .opacity(liveDotOpacity)
                         .onAppear {
@@ -396,16 +396,16 @@ struct LiveSignalFeed: View {
 
                 Text("LIVE SIGNALS")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
 
                 Spacer()
 
                 Text("\(signalFeed.recentSignals.count)")
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.35))
+                    .foregroundStyle(CortexDesign.neutral)
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(Color(white: 0.10))
+                    .background(CortexDesign.bgHover)
                     .clipShape(RoundedRectangle(cornerRadius: 4))
             }
             .padding(.horizontal, 12)
@@ -439,11 +439,11 @@ struct LiveSignalFeed: View {
         }
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.06))
+                .fill(CortexDesign.bgDeepest)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(Color(white: 0.10), lineWidth: 1)
+                .strokeBorder(CortexDesign.bgHover, lineWidth: 1)
         )
         .padding(.horizontal, 8)
         .padding(.top, 8)
@@ -491,12 +491,12 @@ struct SignalRow: View {
             if let dir = direction {
                 Text(dir == "LONG" ? "\u{25B2}" : "\u{25BC}")
                     .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(dir == "LONG" ? .green : .red)
+                    .foregroundStyle(dir == "LONG" ? CortexDesign.profit : CortexDesign.loss)
                     .frame(width: 14)
             } else {
                 Image(systemName: "bolt.fill")
                     .font(.system(size: 9))
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(CortexDesign.accentPrimary)
                     .frame(width: 14)
             }
 
@@ -504,14 +504,14 @@ struct SignalRow: View {
             if !signal.symbol.isEmpty {
                 Text(signal.symbol)
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(CortexDesign.accentPrimary)
                     .frame(minWidth: 40, alignment: .leading)
             }
 
             // Signal type (shortened)
             Text(shortSignalType(signal.signalType))
                 .font(.system(size: 10))
-                .foregroundStyle(Color(white: 0.55))
+                .foregroundStyle(CortexDesign.neutral)
                 .lineLimit(1)
 
             Spacer()
@@ -522,28 +522,28 @@ struct SignalRow: View {
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
                     .padding(.horizontal, 4)
                     .padding(.vertical, 1)
-                    .background(Color.green.opacity(0.12))
-                    .foregroundStyle(.green)
+                    .background(CortexDesign.profit.opacity(0.12))
+                    .foregroundStyle(CortexDesign.profit)
                     .clipShape(RoundedRectangle(cornerRadius: 3))
             }
 
             // Squadron
             Text(signal.sourceSquadron.uppercased())
                 .font(.system(size: 8, weight: .medium, design: .monospaced))
-                .foregroundStyle(Color(white: 0.3))
+                .foregroundStyle(CortexDesign.neutral)
                 .frame(width: 48, alignment: .trailing)
 
             // Timestamp
             Text(relativeTime)
                 .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(Color(white: 0.3))
+                .foregroundStyle(CortexDesign.neutral)
                 .frame(width: 52, alignment: .trailing)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
         .background(
             RoundedRectangle(cornerRadius: 4)
-                .fill(Color(white: 0.07))
+                .fill(CortexDesign.bgCard)
         )
     }
 
@@ -569,14 +569,14 @@ struct WarRoomActivityFeedView: View {
             HStack(spacing: 6) {
                 Text("ACTIVITY")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
 
                 Text("\(activity.events.count)")
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.35))
+                    .foregroundStyle(CortexDesign.neutral)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 2)
-                    .background(Color(white: 0.10))
+                    .background(CortexDesign.bgHover)
                     .clipShape(RoundedRectangle(cornerRadius: 4))
 
                 Spacer()
@@ -597,11 +597,11 @@ struct WarRoomActivityFeedView: View {
         }
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.06))
+                .fill(CortexDesign.bgDeepest)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(Color(white: 0.10), lineWidth: 1)
+                .strokeBorder(CortexDesign.bgHover, lineWidth: 1)
         )
         .padding(.horizontal, 8)
         .padding(.bottom, 8)
@@ -640,7 +640,7 @@ struct ActivityEventRow: View {
                 // Message
                 Text(event.message)
                     .font(.system(size: 11))
-                    .foregroundStyle(Color(white: 0.75))
+                    .foregroundStyle(.white.opacity(0.75))
                     .lineLimit(1)
 
                 Spacer()
@@ -648,14 +648,14 @@ struct ActivityEventRow: View {
                 // Relative timestamp
                 Text(relativeTime)
                     .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.3))
+                    .foregroundStyle(CortexDesign.neutral)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
         }
         .background(
             RoundedRectangle(cornerRadius: 4)
-                .fill(event.severity == .critical ? Color.red.opacity(0.04) : Color(white: 0.07))
+                .fill(event.severity == .critical ? CortexDesign.loss.opacity(0.04) : CortexDesign.bgCard)
         )
     }
 
@@ -669,17 +669,17 @@ struct ActivityEventRow: View {
 
     private var severityColor: Color {
         switch event.severity {
-        case .info: return .cyan
-        case .warning: return .orange
-        case .critical: return .red
+        case .info: return CortexDesign.accentPrimary
+        case .warning: return CortexDesign.warning
+        case .critical: return CortexDesign.loss
         }
     }
 
     private var severityBorderColor: Color {
         switch event.severity {
         case .info: return .clear
-        case .warning: return .orange.opacity(0.5)
-        case .critical: return .red.opacity(0.7)
+        case .warning: return CortexDesign.warning.opacity(0.5)
+        case .critical: return CortexDesign.loss.opacity(0.7)
         }
     }
 }

@@ -168,7 +168,7 @@ public struct Level2View: View {
             Spacer()
             Image(systemName: "chart.bar.doc.horizontal")
                 .font(.system(size: 24))
-                .foregroundStyle(Color(white: 0.2))
+                .foregroundStyle(CortexDesign.border)
             Text("No Level 2 data")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)

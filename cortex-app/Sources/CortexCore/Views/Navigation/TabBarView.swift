@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Horizontal top tab bar for CORTEX navigation.
-/// Left: CORTEX logo. Center: Tab buttons. Right: AI sparkle, connection dot, daily P&L.
+/// Left: CORTEX logo. Center: Text-only pill tab buttons. Right: AI sparkle, connection dot, daily P&L.
 public struct TabBarView: View {
     @Binding var selectedTab: AppTab
     let onSparklesTapped: () -> Void
@@ -30,14 +30,14 @@ public struct TabBarView: View {
             // Left: CORTEX logo
             Text("CORTEX")
                 .font(.system(size: 15, weight: .black, design: .monospaced))
-                .foregroundStyle(.cyan)
+                .foregroundStyle(CortexDesign.accentPrimary)
                 .padding(.leading, 16)
                 .padding(.trailing, 20)
 
-            // Center: Tab buttons
-            HStack(spacing: 2) {
+            // Center: Text-only pill tab buttons
+            HStack(spacing: 4) {
                 ForEach(AppTab.allCases) { tab in
-                    TabBarButton(
+                    TabBarPillButton(
                         tab: tab,
                         isSelected: selectedTab == tab,
                         isHovered: hoveredTab == tab
@@ -58,11 +58,11 @@ public struct TabBarView: View {
                 Button(action: onSparklesTapped) {
                     Image(systemName: "sparkles")
                         .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(isAIPaneVisible ? .cyan : Color(white: 0.5))
+                        .foregroundStyle(isAIPaneVisible ? .cyan : CortexDesign.neutral)
                         .frame(width: 30, height: 30)
                         .background(
                             RoundedRectangle(cornerRadius: 6)
-                                .fill(isAIPaneVisible ? Color.cyan.opacity(0.15) : Color.clear)
+                                .fill(isAIPaneVisible ? CortexDesign.accentPrimary.opacity(0.15) : Color.clear)
                         )
                         .contentShape(Rectangle())
                 }
@@ -72,34 +72,34 @@ public struct TabBarView: View {
                 // Connection status
                 HStack(spacing: 5) {
                     Circle()
-                        .fill(isConnected ? Color.green : Color.orange)
+                        .fill(isConnected ? CortexDesign.profit : CortexDesign.warning)
                         .frame(width: 7, height: 7)
-                        .shadow(color: (isConnected ? Color.green : Color.orange).opacity(0.5), radius: 3)
+                        .shadow(color: (isConnected ? CortexDesign.profit : CortexDesign.warning).opacity(0.5), radius: 3)
                     Text(isConnected ? "Live" : "Local")
                         .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(Color(white: 0.5))
+                        .foregroundStyle(CortexDesign.neutral)
                 }
 
                 // Daily P&L
                 HStack(spacing: 4) {
                     Image(systemName: dailyPnL >= 0 ? "arrow.up.right" : "arrow.down.right")
                         .font(.system(size: 10, weight: .semibold))
-                        .foregroundStyle(dailyPnL >= 0 ? .green : .red)
+                        .foregroundStyle(dailyPnL >= 0 ? CortexDesign.profit : CortexDesign.loss)
                     Text(formatCurrency(dailyPnL))
                         .font(.system(size: 12, weight: .bold, design: .monospaced))
-                        .foregroundStyle(dailyPnL >= 0 ? .green : .red)
+                        .foregroundStyle(dailyPnL >= 0 ? CortexDesign.profit : CortexDesign.loss)
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
                 .background(
                     RoundedRectangle(cornerRadius: 6)
-                        .fill((dailyPnL >= 0 ? Color.green : Color.red).opacity(0.08))
+                        .fill((dailyPnL >= 0 ? CortexDesign.profit : CortexDesign.loss).opacity(0.08))
                 )
             }
             .padding(.trailing, 16)
         }
-        .frame(height: 52)
-        .background(Color(nsColor: NSColor(red: 0.07, green: 0.07, blue: 0.10, alpha: 1.0)))
+        .frame(height: 44)
+        .background(CortexDesign.bgDeepest)
     }
 
     private func formatCurrency(_ value: Double) -> String {
@@ -108,9 +108,9 @@ public struct TabBarView: View {
     }
 }
 
-// MARK: - Tab Bar Button
+// MARK: - Tab Bar Pill Button (text-only, no icons)
 
-struct TabBarButton: View {
+struct TabBarPillButton: View {
     let tab: AppTab
     let isSelected: Bool
     let isHovered: Bool
@@ -118,33 +118,31 @@ struct TabBarButton: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 3) {
-                Image(systemName: tab.icon)
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(isSelected ? .cyan : isHovered ? Color(white: 0.7) : Color(white: 0.45))
-                    .frame(height: 18)
-
-                Text(tab.rawValue)
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(isSelected ? .cyan : isHovered ? Color(white: 0.7) : Color(white: 0.45))
-                    .lineLimit(1)
-            }
-            .frame(width: 80, height: 44)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(isHovered && !isSelected ? Color(white: 0.12) : Color.clear)
-            )
-            .overlay(alignment: .bottom) {
-                if isSelected {
-                    RoundedRectangle(cornerRadius: 1)
-                        .fill(Color.cyan)
-                        .frame(width: 40, height: 2)
-                        .offset(y: 2)
-                }
-            }
-            .contentShape(Rectangle())
+            Text(tab.rawValue)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(
+                    isSelected ? .white : CortexDesign.neutral
+                )
+                .lineLimit(1)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 6)
+                .background(
+                    Capsule()
+                        .fill(pillBackground)
+                )
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .help(tab.rawValue)
+    }
+
+    private var pillBackground: Color {
+        if isSelected {
+            return CortexDesign.accentPrimary
+        } else if isHovered {
+            return CortexDesign.bgCard
+        } else {
+            return .clear
+        }
     }
 }

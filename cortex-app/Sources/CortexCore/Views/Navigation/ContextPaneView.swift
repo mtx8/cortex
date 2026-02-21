@@ -21,7 +21,7 @@ public struct ContextPaneView: View {
             paneHeader
 
             Divider()
-                .overlay(Color(white: 0.12))
+                .overlay(CortexDesign.border)
 
             // Section links
             ScrollView {
@@ -37,7 +37,7 @@ public struct ContextPaneView: View {
             Spacer()
         }
         .frame(width: mode.width)
-        .background(Color(nsColor: NSColor(red: 0.06, green: 0.06, blue: 0.09, alpha: 1.0)))
+        .background(CortexDesign.bgDeepest)
         .clipped()
     }
 
@@ -49,10 +49,10 @@ public struct ContextPaneView: View {
             HStack(spacing: 8) {
                 Image(systemName: tab.icon)
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.cyan)
+                    .foregroundStyle(CortexDesign.accentPrimary)
                 Text(tab.rawValue.uppercased())
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.5))
+                    .foregroundStyle(CortexDesign.neutral)
                 Spacer()
             }
             .padding(.horizontal, 14)
@@ -61,7 +61,7 @@ public struct ContextPaneView: View {
             // Icon-only header: just the tab icon centered
             Image(systemName: tab.icon)
                 .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.cyan)
+                .foregroundStyle(CortexDesign.accentPrimary)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 14)
                 .help(tab.rawValue)
@@ -120,12 +120,12 @@ struct ContextSectionButtonFull: View {
             HStack(spacing: 10) {
                 Image(systemName: icon)
                     .font(.system(size: 14, weight: isSelected ? .semibold : .regular))
-                    .foregroundStyle(isSelected ? .cyan : Color(white: 0.5))
+                    .foregroundStyle(isSelected ? .cyan : CortexDesign.neutral)
                     .frame(width: 20, height: 20)
 
                 Text(label)
                     .font(.system(size: 12, weight: isSelected ? .semibold : .regular))
-                    .foregroundStyle(isSelected ? Color(white: 0.85) : Color(white: 0.6))
+                    .foregroundStyle(isSelected ? .white.opacity(0.85) : CortexDesign.neutral)
                     .lineLimit(1)
 
                 Spacer()
@@ -136,14 +136,14 @@ struct ContextSectionButtonFull: View {
                 RoundedRectangle(cornerRadius: 6)
                     .fill(
                         isSelected
-                            ? Color.cyan.opacity(0.10)
-                            : isHovered ? Color(white: 0.08) : Color.clear
+                            ? CortexDesign.accentPrimary.opacity(0.10)
+                            : isHovered ? CortexDesign.bgCard : Color.clear
                     )
             )
             .overlay(alignment: .leading) {
                 if isSelected {
                     RoundedRectangle(cornerRadius: 1.5)
-                        .fill(Color.cyan)
+                        .fill(CortexDesign.accentPrimary)
                         .frame(width: 3)
                         .padding(.vertical, 4)
                 }
@@ -167,20 +167,20 @@ struct ContextSectionButtonIcon: View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 16, weight: isSelected ? .semibold : .regular))
-                .foregroundStyle(isSelected ? .cyan : Color(white: 0.5))
+                .foregroundStyle(isSelected ? .cyan : CortexDesign.neutral)
                 .frame(width: 36, height: 36)
                 .background(
                     RoundedRectangle(cornerRadius: 6)
                         .fill(
                             isSelected
-                                ? Color.cyan.opacity(0.10)
-                                : isHovered ? Color(white: 0.08) : Color.clear
+                                ? CortexDesign.accentPrimary.opacity(0.10)
+                                : isHovered ? CortexDesign.bgCard : Color.clear
                         )
                 )
                 .overlay(alignment: .leading) {
                     if isSelected {
                         RoundedRectangle(cornerRadius: 1.5)
-                            .fill(Color.cyan)
+                            .fill(CortexDesign.accentPrimary)
                             .frame(width: 3, height: 24)
                     }
                 }

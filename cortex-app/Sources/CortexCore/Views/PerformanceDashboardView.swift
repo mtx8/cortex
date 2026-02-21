@@ -3,12 +3,29 @@ import Charts
 
 public struct PerformanceDashboardView: View {
     let store: PerformanceStore
+    @Environment(\.cortexSelectedSection) private var selectedSection
 
     public init(store: PerformanceStore) {
         self.store = store
     }
 
     public var body: some View {
+        switch selectedSection {
+        case "Equity Curve":
+            equityCurveFullView
+        case "Trade Log":
+            tradeLogPlaceholder
+        case "Tax Report":
+            taxReportPlaceholder
+        default: // "Dashboard"
+            dashboardView
+        }
+    }
+
+    // MARK: - Dashboard (default full view)
+
+    @ViewBuilder
+    private var dashboardView: some View {
         ScrollView {
             VStack(spacing: 20) {
                 // Stats grid
@@ -41,7 +58,7 @@ public struct PerformanceDashboardView: View {
                     GroupBox("Daily P&L") {
                         Chart(store.dailyPnL) { point in
                             BarMark(x: .value("Date", point.date), y: .value("P&L", point.pnl))
-                                .foregroundStyle(point.isPositive ? .green : .red)
+                                .foregroundStyle(point.isPositive ? CortexDesign.profit : CortexDesign.loss)
                         }
                         .frame(height: 200)
                     }
@@ -50,6 +67,111 @@ public struct PerformanceDashboardView: View {
             }
             .padding(.vertical)
         }
+    }
+
+    // MARK: - Equity Curve (expanded)
+
+    @ViewBuilder
+    private var equityCurveFullView: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text("EQUITY CURVE")
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(CortexDesign.neutral)
+
+                Spacer()
+
+                if !store.equityCurve.isEmpty {
+                    Text("\(store.equityCurve.count) data points")
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(CortexDesign.neutral)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+
+            if store.equityCurve.isEmpty {
+                Spacer()
+                VStack(spacing: 12) {
+                    Image(systemName: "chart.line.uptrend.xyaxis")
+                        .font(.system(size: 40))
+                        .foregroundStyle(CortexDesign.border)
+
+                    Text("No Equity Data")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(CortexDesign.neutral)
+
+                    Text("Equity curve will populate as trades are executed")
+                        .font(.system(size: 12))
+                        .foregroundStyle(CortexDesign.neutral)
+                }
+                Spacer()
+            } else {
+                Chart(store.equityCurve) { point in
+                    LineMark(x: .value("Date", point.date), y: .value("Value", point.value))
+                        .foregroundStyle(.blue)
+                    AreaMark(x: .value("Date", point.date), y: .value("Value", point.value))
+                        .foregroundStyle(.blue.opacity(0.1))
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 20)
+            }
+        }
+        .background(CortexDesign.bgDeepest)
+    }
+
+    // MARK: - Trade Log Placeholder
+
+    @ViewBuilder
+    private var tradeLogPlaceholder: some View {
+        VStack(spacing: 16) {
+            Spacer()
+
+            Image(systemName: "list.number")
+                .font(.system(size: 40))
+                .foregroundStyle(CortexDesign.border)
+
+            Text("Trade Log")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(CortexDesign.neutral)
+
+            Text("Trade history will appear here when trades are executed.\nAll entries, exits, and partial fills are recorded.")
+                .font(.system(size: 12))
+                .foregroundStyle(CortexDesign.neutral)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 400)
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(CortexDesign.bgDeepest)
+    }
+
+    // MARK: - Tax Report Placeholder
+
+    @ViewBuilder
+    private var taxReportPlaceholder: some View {
+        VStack(spacing: 16) {
+            Spacer()
+
+            Image(systemName: "doc.text")
+                .font(.system(size: 40))
+                .foregroundStyle(CortexDesign.border)
+
+            Text("Tax Report")
+                .font(.system(size: 14, weight: .bold))
+                .foregroundStyle(CortexDesign.neutral)
+
+            Text("Tax-optimized trade reporting coming soon.\nTracks wash sales, short/long term capital gains,\nand generates IRS-ready reports.")
+                .font(.system(size: 12))
+                .foregroundStyle(CortexDesign.neutral)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 400)
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(CortexDesign.bgDeepest)
     }
 }
 

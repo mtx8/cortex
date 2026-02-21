@@ -156,7 +156,7 @@ public struct KPIBar: View {
                 VStack(alignment: .leading, spacing: 3) {
                     Text(label)
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundStyle(Color(white: 0.4))
+                        .foregroundStyle(CortexDesign.neutral)
                         .tracking(0.5)
 
                     Text(value)
@@ -170,7 +170,7 @@ public struct KPIBar: View {
                     if let changeText = changeText {
                         Text(changeText)
                             .font(.system(size: 10, weight: .medium, design: .monospaced))
-                            .foregroundStyle(changeText.hasPrefix("-") ? Color.red : Color.green)
+                            .foregroundStyle(changeText.hasPrefix("-") ? CortexDesign.loss : CortexDesign.profit)
                     } else {
                         // Spacer to maintain consistent height
                         Text(" ")
@@ -184,11 +184,11 @@ public struct KPIBar: View {
         .frame(height: 72)
         .background(
             RoundedRectangle(cornerRadius: 10)
-                .fill(Color(white: 0.07))
+                .fill(CortexDesign.bgCard)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(Color(white: 0.10), lineWidth: 1)
+                .strokeBorder(CortexDesign.bgHover, lineWidth: 1)
         )
         .clipShape(RoundedRectangle(cornerRadius: 10))
     }
@@ -220,7 +220,7 @@ public struct KPIBar: View {
     // MARK: - Formatting
 
     private func pnlColor(_ value: Double) -> Color {
-        value > 0 ? .green : value < 0 ? .red : .white
+        value > 0 ? CortexDesign.profit : value < 0 ? CortexDesign.loss : .white
     }
 
     private func changePercent(_ value: Double, base: Double) -> String {

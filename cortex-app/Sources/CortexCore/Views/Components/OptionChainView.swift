@@ -131,7 +131,7 @@ public struct OptionChainView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(store.strikes, id: \.self) { strike in
                         chainRow(strike: strike)
-                        Divider().overlay(Color(white: 0.06))
+                        Divider().overlay(CortexDesign.bgDeepest)
                     }
                 }
             }
@@ -219,13 +219,13 @@ public struct OptionChainView: View {
             Spacer()
             Image(systemName: "tablecells")
                 .font(.system(size: 36))
-                .foregroundStyle(Color(white: 0.2))
+                .foregroundStyle(CortexDesign.border)
             Text("No Option Chain Data")
                 .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(Color(white: 0.6))
+                .foregroundStyle(CortexDesign.neutral)
             Text("Search a symbol in Financials to load its option chain.")
                 .font(.system(size: 12))
-                .foregroundStyle(Color(white: 0.4))
+                .foregroundStyle(CortexDesign.neutral)
                 .multilineTextAlignment(.center)
             Spacer()
         }

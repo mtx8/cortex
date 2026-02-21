@@ -158,14 +158,14 @@ public struct WatchlistView: View {
         VStack(spacing: 0) {
             HStack {
                 Image(systemName: "briefcase.fill")
-                    .foregroundStyle(.green)
+                    .foregroundStyle(CortexDesign.profit)
                 Text("Open Positions")
                     .font(.headline)
                 Spacer()
                 let pnl = store.totalUnrealizedPnL
                 Text(String(format: "%@$%.2f", pnl >= 0 ? "+" : "", pnl))
                     .font(.headline)
-                    .foregroundStyle(pnl >= 0 ? .green : .red)
+                    .foregroundStyle(pnl >= 0 ? CortexDesign.profit : CortexDesign.loss)
             }
             .padding()
 
@@ -417,22 +417,22 @@ public struct WatchlistView: View {
 
             Image(systemName: "clock.arrow.circlepath")
                 .font(.system(size: 40))
-                .foregroundStyle(Color(white: 0.2))
+                .foregroundStyle(CortexDesign.border)
 
             Text("Order History")
                 .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(Color(white: 0.6))
+                .foregroundStyle(CortexDesign.neutral)
 
             Text("Recent order executions will appear here.\nAll filled, cancelled, and pending orders are logged.")
                 .font(.system(size: 12))
-                .foregroundStyle(Color(white: 0.4))
+                .foregroundStyle(CortexDesign.neutral)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 350)
 
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(white: 0.05))
+        .background(CortexDesign.bgDeepest)
     }
 }
 
@@ -461,7 +461,7 @@ struct WatchlistRow: View {
                 Text(String(format: "%@%.2f%%", item.changePercent >= 0 ? "+" : "", item.changePercent))
                     .font(.caption2.monospacedDigit())
             }
-            .foregroundStyle(item.change >= 0 ? .green : .red)
+            .foregroundStyle(item.change >= 0 ? CortexDesign.profit : CortexDesign.loss)
             .frame(width: 90, alignment: .trailing)
 
             Text(formatVolume(item.volume))
@@ -472,7 +472,7 @@ struct WatchlistRow: View {
             if let rsi = item.rsi {
                 Text(String(format: "%.1f", rsi))
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(rsi > 70 ? .red : rsi < 30 ? .green : .primary)
+                    .foregroundStyle(rsi > 70 ? CortexDesign.loss : rsi < 30 ? CortexDesign.profit : .primary)
                     .frame(width: 50, alignment: .trailing)
             } else {
                 Text("--")
@@ -503,8 +503,8 @@ struct WatchlistRow: View {
 
     func signalColor(_ signal: String) -> Color {
         switch signal {
-        case "buy": return .green
-        case "sell": return .red
+        case "buy": return CortexDesign.profit
+        case "sell": return CortexDesign.loss
         default: return .gray
         }
     }
@@ -535,13 +535,13 @@ struct PositionRow: View {
                     .font(.caption2.bold())
                     .padding(.horizontal, 6)
                     .padding(.vertical, 2)
-                    .background(position.side == "long" ? Color.green.opacity(0.2) : Color.red.opacity(0.2))
-                    .foregroundStyle(position.side == "long" ? .green : .red)
+                    .background(position.side == "long" ? CortexDesign.profit.opacity(0.2) : CortexDesign.loss.opacity(0.2))
+                    .foregroundStyle(position.side == "long" ? CortexDesign.profit : CortexDesign.loss)
                     .clipShape(Capsule())
                 Spacer()
                 Text(String(format: "%@$%.2f", position.unrealizedPnL >= 0 ? "+" : "", position.unrealizedPnL))
                     .font(.body.bold().monospacedDigit())
-                    .foregroundStyle(position.unrealizedPnL >= 0 ? .green : .red)
+                    .foregroundStyle(position.unrealizedPnL >= 0 ? CortexDesign.profit : CortexDesign.loss)
             }
 
             HStack {
@@ -552,7 +552,7 @@ struct PositionRow: View {
                 Text(String(format: "Current: $%.2f", position.currentPrice))
                 Spacer()
                 Text(String(format: "Stop: $%.2f", position.stopLoss))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(CortexDesign.loss)
             }
             .font(.caption)
             .foregroundStyle(.secondary)

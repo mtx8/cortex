@@ -168,7 +168,7 @@ public struct ProfitCalculatorView: View {
                         path.addLine(to: CGPoint(x: width, y: zeroY))
                     }
                 }
-                .stroke(Color(white: 0.2), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                .stroke(CortexDesign.border, style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
 
                 // Profit fill (green above zero, red below)
                 if priceRange > 0 && profitRange > 0 {
@@ -305,13 +305,13 @@ public struct ProfitCalculatorView: View {
             Spacer()
             Image(systemName: "function")
                 .font(.system(size: 36))
-                .foregroundStyle(Color(white: 0.2))
+                .foregroundStyle(CortexDesign.border)
             Text("No Legs Selected")
                 .font(.system(size: 14, weight: .bold))
-                .foregroundStyle(Color(white: 0.6))
+                .foregroundStyle(CortexDesign.neutral)
             Text("Click on calls or puts in the option chain to add legs.\nThe P&L graph will update automatically.")
                 .font(.system(size: 12))
-                .foregroundStyle(Color(white: 0.4))
+                .foregroundStyle(CortexDesign.neutral)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 350)
             Spacer()

@@ -105,7 +105,7 @@ public struct TimeSalesView: View {
             Spacer()
             Image(systemName: "clock.arrow.circlepath")
                 .font(.system(size: 24))
-                .foregroundStyle(Color(white: 0.2))
+                .foregroundStyle(CortexDesign.border)
             Text("No time & sales data")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)

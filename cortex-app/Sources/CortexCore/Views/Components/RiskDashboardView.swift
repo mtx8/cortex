@@ -33,10 +33,10 @@ public struct RiskDashboardView: View {
 
     /// Drawdown gauge color based on severity.
     private var drawdownColor: Color {
-        if drawdownPct > 0.75 { return .red }
-        if drawdownPct > 0.50 { return .orange }
+        if drawdownPct > 0.75 { return CortexDesign.loss }
+        if drawdownPct > 0.50 { return CortexDesign.warning }
         if drawdownPct > 0.25 { return .yellow }
-        return .green
+        return CortexDesign.profit
     }
 
     public var body: some View {
@@ -47,7 +47,7 @@ public struct RiskDashboardView: View {
                     .foregroundStyle(CortexDesign.accentPrimary)
                 Text("RISK DASHBOARD")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.5))
+                    .foregroundStyle(CortexDesign.neutral)
                 Spacer()
             }
 
@@ -55,19 +55,19 @@ public struct RiskDashboardView: View {
             drawdownGauge
 
             Divider()
-                .overlay(Color(white: 0.10))
+                .overlay(CortexDesign.bgHover)
 
             // VaR display
             varDisplay
 
             Divider()
-                .overlay(Color(white: 0.10))
+                .overlay(CortexDesign.bgHover)
 
             // Risk limit metrics
             riskLimitsSection
 
             Divider()
-                .overlay(Color(white: 0.10))
+                .overlay(CortexDesign.bgHover)
 
             // Kill switch status
             killSwitchStatus
@@ -86,7 +86,7 @@ public struct RiskDashboardView: View {
             ZStack {
                 // Background track
                 Circle()
-                    .stroke(Color(white: 0.12), lineWidth: 8)
+                    .stroke(CortexDesign.border, lineWidth: 8)
                     .frame(width: 90, height: 90)
 
                 // Progress arc
@@ -114,7 +114,7 @@ public struct RiskDashboardView: View {
 
                     Text("DRAWDOWN")
                         .font(.system(size: 7, weight: .bold, design: .monospaced))
-                        .foregroundStyle(Color(white: 0.35))
+                        .foregroundStyle(CortexDesign.neutral)
                 }
             }
 
@@ -122,10 +122,10 @@ public struct RiskDashboardView: View {
             HStack(spacing: 4) {
                 Text("Limit:")
                     .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(Color(white: 0.35))
+                    .foregroundStyle(CortexDesign.neutral)
                 Text(String(format: "%.1f%%", settings.maxDrawdownPct))
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.5))
+                    .foregroundStyle(CortexDesign.neutral)
             }
         }
     }
@@ -138,19 +138,19 @@ public struct RiskDashboardView: View {
             HStack {
                 Text("VALUE AT RISK (1D)")
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
                 Spacer()
             }
 
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text(String(format: "$%.0f", valueAtRisk))
                     .font(.system(size: 22, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(CortexDesign.warning)
                     .contentTransition(.numericText())
 
                 Text("95% CI")
                     .font(.system(size: 9, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.35))
+                    .foregroundStyle(CortexDesign.neutral)
 
                 Spacer()
             }
@@ -159,7 +159,7 @@ public struct RiskDashboardView: View {
             HStack {
                 Text(String(format: "%.2f%% of NAV", portfolio.nav > 0 ? (valueAtRisk / portfolio.nav) * 100 : 0))
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
                 Spacer()
             }
         }
@@ -173,7 +173,7 @@ public struct RiskDashboardView: View {
             HStack {
                 Text("RISK LIMITS")
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
                 Spacer()
             }
 
@@ -195,7 +195,7 @@ public struct RiskDashboardView: View {
                 label: "Position Count",
                 current: Double(portfolio.openPositionCount),
                 limit: 20,
-                color: .cyan
+                color: CortexDesign.accentPrimary
             )
         }
     }
@@ -208,22 +208,22 @@ public struct RiskDashboardView: View {
             HStack {
                 Text(label)
                     .font(.system(size: 9, weight: .medium))
-                    .foregroundStyle(Color(white: 0.45))
+                    .foregroundStyle(CortexDesign.neutral)
                 Spacer()
                 Text(String(format: "%.0f%%", utilization * 100))
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(utilization > 0.8 ? .red : utilization > 0.5 ? .orange : color)
+                    .foregroundStyle(utilization > 0.8 ? CortexDesign.loss : utilization > 0.5 ? CortexDesign.warning : color)
             }
 
             // Progress bar
             GeometryReader { geo in
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 2)
-                        .fill(Color(white: 0.10))
+                        .fill(CortexDesign.bgHover)
                         .frame(height: 3)
 
                     RoundedRectangle(cornerRadius: 2)
-                        .fill(utilization > 0.8 ? Color.red : utilization > 0.5 ? Color.orange : color)
+                        .fill(utilization > 0.8 ? CortexDesign.loss : utilization > 0.5 ? CortexDesign.warning : color)
                         .frame(width: geo.size.width * utilization, height: 3)
                         .animation(.easeInOut(duration: 0.4), value: utilization)
                 }
@@ -243,11 +243,11 @@ public struct RiskDashboardView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("KILL SWITCH")
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
 
                 Text(killSwitch.isActive ? "ENGAGED" : "STANDBY")
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
-                    .foregroundStyle(killSwitch.isActive ? .red : .green)
+                    .foregroundStyle(killSwitch.isActive ? CortexDesign.loss : CortexDesign.profit)
             }
 
             Spacer()
@@ -271,10 +271,10 @@ public struct RiskDashboardView: View {
 
     private var autonomyColor: Color {
         switch settings.autonomyLevel {
-        case .fullManual: return .cyan
+        case .fullManual: return CortexDesign.accentPrimary
         case .suggestOnly: return .blue
-        case .semiAuto: return .orange
-        case .fullAuto: return .red
+        case .semiAuto: return CortexDesign.warning
+        case .fullAuto: return CortexDesign.loss
         }
     }
 }
@@ -292,16 +292,16 @@ private struct KillSwitchPulse: View {
         ZStack {
             // Outer pulse ring
             Circle()
-                .fill(isActive ? Color.red : Color.green)
+                .fill(isActive ? CortexDesign.loss : CortexDesign.profit)
                 .frame(width: 20, height: 20)
                 .opacity(pulseOpacity * 0.3)
                 .scaleEffect(pulseScale)
 
             // Inner solid dot
             Circle()
-                .fill(isActive ? Color.red : Color.green)
+                .fill(isActive ? CortexDesign.loss : CortexDesign.profit)
                 .frame(width: 10, height: 10)
-                .shadow(color: (isActive ? Color.red : Color.green).opacity(0.5), radius: 4)
+                .shadow(color: (isActive ? CortexDesign.loss : CortexDesign.profit).opacity(0.5), radius: 4)
         }
         .onAppear {
             let duration = isActive ? 0.6 : 2.0

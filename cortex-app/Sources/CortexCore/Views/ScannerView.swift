@@ -1,20 +1,28 @@
 import SwiftUI
 
-/// Full scanner view with granular filters, short selling support, and AI integration.
+/// Professional Bloomberg-grade opportunity scanner with filtering, sorting, and expandable detail rows.
 public struct ScannerView: View {
     let opportunities: OpportunityStore
     let scannerFilter: ScannerFilterStore
+    let webSocket: WebSocketClient
     let onAnalyzeWithAI: (String) -> Void
 
+    @Environment(\.cortexSelectedSection) private var selectedSection
     @State private var expandedId: String? = nil
+    @State private var hoveredRowId: String? = nil
+    @State private var lastScanTime: Date = Date()
+    @State private var scanTimer: Timer? = nil
+    @State private var secondsSinceLastScan: Int = 0
 
     public init(
         opportunities: OpportunityStore,
         scannerFilter: ScannerFilterStore,
+        webSocket: WebSocketClient,
         onAnalyzeWithAI: @escaping (String) -> Void = { _ in }
     ) {
         self.opportunities = opportunities
         self.scannerFilter = scannerFilter
+        self.webSocket = webSocket
         self.onAnalyzeWithAI = onAnalyzeWithAI
     }
 
@@ -22,34 +30,80 @@ public struct ScannerView: View {
         scannerFilter.filtered(opportunities.opportunities)
     }
 
+    /// Further filter by the selected left-pane section.
+    private var sectionFilteredOpportunities: [Opportunity] {
+        let baseFiltered = filteredOpportunities
+        switch selectedSection {
+        case "Momentum":
+            return baseFiltered.filter { $0.type == .momentum }
+        case "Volume Surges":
+            return baseFiltered.filter { $0.type == .volume }
+        case "Breakouts":
+            return baseFiltered.filter { $0.type == .breakout }
+        case "Short Candidates":
+            return baseFiltered.filter { $0.direction == .short }
+        case "Catalyst Events":
+            return baseFiltered.filter { $0.type == .catalyst }
+        case "Options Flow":
+            return baseFiltered.filter { $0.type == .flow }
+        default: // "All Opportunities"
+            return baseFiltered
+        }
+    }
+
+    /// Description text for the current section filter.
+    private var sectionDescription: String? {
+        switch selectedSection {
+        case "Momentum": return "Stocks showing strong directional momentum with RSI and MACD confirmation"
+        case "Volume Surges": return "Unusual volume activity exceeding average thresholds"
+        case "Breakouts": return "Stocks breaking key resistance levels with volume confirmation"
+        case "Short Candidates": return "Bearish setups with elevated short interest or breakdown patterns"
+        case "Catalyst Events": return "Event-driven opportunities from earnings, FDA, or regulatory catalysts"
+        case "Options Flow": return "Unusual options activity indicating institutional positioning"
+        default: return nil
+        }
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             // Header
-            headerBar
+            scannerHeader
 
-            Divider().overlay(Color(white: 0.12))
+            // Section sub-header (when not "All Opportunities")
+            if let desc = sectionDescription {
+                sectionSubHeader(selectedSection.uppercased(), description: desc)
+            }
+
+            // Separator
+            Rectangle()
+                .fill(CortexDesign.bgHover)
+                .frame(height: 1)
 
             // Filter bar
             ScannerFilterBar(filter: scannerFilter)
 
-            Divider().overlay(Color(white: 0.12))
+            // Separator
+            Rectangle()
+                .fill(CortexDesign.bgHover)
+                .frame(height: 1)
 
+            // Content area
             if opportunities.opportunities.isEmpty {
                 emptyStateNoData
-            } else if filteredOpportunities.isEmpty {
+            } else if sectionFilteredOpportunities.isEmpty {
                 emptyStateNoMatch
             } else {
                 // Column headers
                 columnHeaders
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
 
-                Divider().overlay(Color(white: 0.10))
+                Rectangle()
+                    .fill(CortexDesign.bgHover)
+                    .frame(height: 1)
 
-                // Results
+                // Data table
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(Array(filteredOpportunities.enumerated()), id: \.element.id) { rank, opp in
+                        ForEach(Array(sectionFilteredOpportunities.enumerated()), id: \.element.id) { rank, opp in
                             VStack(spacing: 0) {
                                 opportunityRow(opp, rank: rank + 1)
                                     .contentShape(Rectangle())
@@ -58,53 +112,129 @@ public struct ScannerView: View {
                                             expandedId = expandedId == opp.id ? nil : opp.id
                                         }
                                     }
+                                    .onHover { hovering in
+                                        hoveredRowId = hovering ? opp.id : nil
+                                    }
 
                                 if expandedId == opp.id {
                                     expandedDetail(opp)
+                                        .transition(.asymmetric(
+                                            insertion: .opacity.combined(with: .move(edge: .top)),
+                                            removal: .opacity
+                                        ))
                                 }
-
-                                Divider().overlay(Color(white: 0.08))
                             }
                         }
                     }
-                    .padding(.horizontal, 16)
                 }
             }
         }
-        .background(Color(nsColor: NSColor(red: 0.06, green: 0.06, blue: 0.08, alpha: 1.0)))
+        .background(CortexDesign.bgDeepest)
+        .onAppear {
+            lastScanTime = Date()
+            startScanTimer()
+        }
+        .onDisappear {
+            scanTimer?.invalidate()
+        }
     }
 
-    // MARK: - Header
+    // MARK: - Section Sub-Header
 
-    private var headerBar: some View {
-        HStack {
-            Image(systemName: "antenna.radiowaves.left.and.right")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.cyan)
-            Text("SCANNER")
-                .font(.system(size: 14, weight: .black, design: .monospaced))
-                .foregroundStyle(.white)
+    @ViewBuilder
+    private func sectionSubHeader(_ title: String, description: String) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundStyle(CortexDesign.accentPrimary)
+
+            Text("\u{2014}")
+                .foregroundStyle(CortexDesign.border)
+
+            Text(description)
+                .font(.system(size: 11))
+                .foregroundStyle(CortexDesign.neutral)
+                .lineLimit(1)
 
             Spacer()
 
-            if scannerFilter.activeFilterCount > 0 {
-                Text("\(scannerFilter.activeFilterCount) filters active")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.cyan)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
+            Text("\(sectionFilteredOpportunities.count) results")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(CortexDesign.neutral)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(CortexDesign.accentPrimary.opacity(0.03))
+    }
+
+    // MARK: - Scanner Header
+
+    private var scannerHeader: some View {
+        HStack(spacing: 12) {
+            // Title
+            Text("OPPORTUNITY SCANNER")
+                .font(.system(size: 13, weight: .black, design: .monospaced))
+                .foregroundStyle(CortexDesign.neutral)
+
+            // Result count pill
+            if !opportunities.opportunities.isEmpty {
+                Text("\(sectionFilteredOpportunities.count) opportunities")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(CortexDesign.accentPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
                     .background(
                         RoundedRectangle(cornerRadius: 10)
-                            .fill(Color.cyan.opacity(0.1))
+                            .fill(CortexDesign.accentPrimary.opacity(0.08))
                     )
             }
 
-            Text("\(filteredOpportunities.count) results")
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .foregroundStyle(.secondary)
+            Spacer()
+
+            // Last scan timestamp
+            Text("Last scan: \(scanTimeLabel)")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(CortexDesign.neutral)
+
+            // Refresh button
+            Button(action: {
+                lastScanTime = Date()
+                secondsSinceLastScan = 0
+            }) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(CortexDesign.neutral)
+                    .frame(width: 28, height: 28)
+                    .background(
+                        RoundedRectangle(cornerRadius: CortexDesign.badgeRadius)
+                            .fill(CortexDesign.bgCard)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: CortexDesign.badgeRadius)
+                            .strokeBorder(CortexDesign.border, lineWidth: 1)
+                    )
+            }
+            .buttonStyle(.plain)
+            .help("Refresh scanner")
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .frame(height: 40)
+    }
+
+    private var scanTimeLabel: String {
+        if secondsSinceLastScan < 5 { return "just now" }
+        if secondsSinceLastScan < 60 { return "\(secondsSinceLastScan)s ago" }
+        let minutes = secondsSinceLastScan / 60
+        return "\(minutes)m ago"
+    }
+
+    private func startScanTimer() {
+        scanTimer?.invalidate()
+        scanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            Task { @MainActor in
+                secondsSinceLastScan = Int(Date().timeIntervalSince(lastScanTime))
+            }
+        }
     }
 
     // MARK: - Empty States
@@ -113,19 +243,36 @@ public struct ScannerView: View {
         VStack(spacing: 16) {
             Spacer()
 
-            ProgressView()
-                .controlSize(.small)
-                .tint(.cyan)
+            if webSocket.isConnected {
+                Image(systemName: "antenna.radiowaves.left.and.right")
+                    .font(.system(size: 40, weight: .light))
+                    .foregroundStyle(CortexDesign.border)
+                    .symbolEffect(.pulse, options: .repeating)
 
-            Text("Waiting for scanner data...")
-                .font(.system(size: 14, weight: .medium, design: .monospaced))
-                .foregroundStyle(.secondary)
+                Text("Scanner is warming up...")
+                    .font(.system(size: 14, weight: .medium, design: .monospaced))
+                    .foregroundStyle(CortexDesign.neutral)
 
-            Text("Scanner results will appear when the Rust engine is connected.")
-                .font(.system(size: 12))
-                .foregroundStyle(Color(white: 0.4))
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 300)
+                Text("Opportunities will appear as squadrons analyze the market")
+                    .font(.system(size: 12))
+                    .foregroundStyle(CortexDesign.neutral)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 350)
+            } else {
+                Image(systemName: "wifi.slash")
+                    .font(.system(size: 40, weight: .light))
+                    .foregroundStyle(CortexDesign.border)
+
+                Text("Backend Not Connected")
+                    .font(.system(size: 14, weight: .medium, design: .monospaced))
+                    .foregroundStyle(CortexDesign.neutral)
+
+                Text("Start the Python backend to receive scanner data.\npython -m cortex.main")
+                    .font(.system(size: 12))
+                    .foregroundStyle(CortexDesign.neutral)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 350)
+            }
 
             Spacer()
         }
@@ -136,36 +283,35 @@ public struct ScannerView: View {
         VStack(spacing: 16) {
             Spacer()
 
-            Image(systemName: "binoculars")
+            Image(systemName: "line.3.horizontal.decrease.circle")
                 .font(.system(size: 40, weight: .light))
-                .foregroundStyle(Color(white: 0.3))
+                .foregroundStyle(CortexDesign.border)
 
             Text("No opportunities match your filters")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(Color(white: 0.6))
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(CortexDesign.neutral)
 
-            Text("The market is currently in a consolidation phase. Consider broadening your search criteria or adjusting your minimum score threshold.")
+            Text("Try adjusting your filters or resetting them")
                 .font(.system(size: 12))
-                .foregroundStyle(Color(white: 0.4))
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 400)
+                .foregroundStyle(CortexDesign.neutral)
 
             Button(action: { scannerFilter.resetFilters() }) {
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.counterclockwise")
-                    Text("Reset All Filters")
+                        .font(.system(size: 11))
+                    Text("Reset Filters")
+                        .font(.system(size: 12, weight: .semibold))
                 }
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.cyan)
+                .foregroundStyle(CortexDesign.accentPrimary)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
                 .background(
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color.cyan.opacity(0.1))
+                    RoundedRectangle(cornerRadius: CortexDesign.cardRadius)
+                        .fill(CortexDesign.accentPrimary.opacity(0.08))
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(Color.cyan.opacity(0.2), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: CortexDesign.cardRadius)
+                        .strokeBorder(CortexDesign.accentPrimary.opacity(0.3), lineWidth: 1)
                 )
             }
             .buttonStyle(.plain)
@@ -175,335 +321,397 @@ public struct ScannerView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: - Column Headers
+    // MARK: - Column Headers (Sortable)
 
     private var columnHeaders: some View {
         HStack(spacing: 0) {
-            Text("#")
-                .frame(width: 30, alignment: .leading)
+            sortableHeader("#", field: nil, width: 30, alignment: .leading)
 
-            Text("TICKER")
-                .frame(width: 80, alignment: .leading)
+            sortableHeader("TICKER", field: .ticker, width: 70, alignment: .leading)
 
-            Button(action: {
-                if scannerFilter.sortBy == .score {
-                    scannerFilter.sortAscending.toggle()
-                } else {
-                    scannerFilter.sortBy = .score
-                    scannerFilter.sortAscending = false
-                }
-            }) {
-                HStack(spacing: 4) {
-                    Text("SCORE")
-                    if scannerFilter.sortBy == .score {
-                        Image(systemName: scannerFilter.sortAscending ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 8))
-                    }
-                }
-            }
-            .buttonStyle(.plain)
-            .frame(width: 130, alignment: .leading)
+            sortableHeader("SCORE", field: .score, width: 80, alignment: .leading)
 
-            Text("TYPE")
-                .frame(width: 90, alignment: .leading)
+            sortableHeader("TYPE", field: .type, width: 85, alignment: .leading)
 
-            Text("DIR")
-                .frame(width: 60, alignment: .center)
+            sortableHeader("DIR", field: .direction, width: 55, alignment: .center)
 
-            Text("SECTOR")
-                .frame(width: 100, alignment: .leading)
+            sortableHeader("SECTOR", field: .sector, width: 80, alignment: .leading)
 
+            sortableHeader("R:R", field: .rr, width: 50, alignment: .trailing)
+
+            // Thesis fills remaining
             Text("THESIS")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(CortexDesign.neutral)
+                .textCase(.uppercase)
                 .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(CortexDesign.bgDeepest)
+    }
 
+    @ViewBuilder
+    private func sortableHeader(_ label: String, field: SortField?, width: CGFloat, alignment: Alignment) -> some View {
+        if let field = field {
             Button(action: {
-                if scannerFilter.sortBy == .rr {
+                if scannerFilter.sortBy == field {
                     scannerFilter.sortAscending.toggle()
                 } else {
-                    scannerFilter.sortBy = .rr
+                    scannerFilter.sortBy = field
                     scannerFilter.sortAscending = false
                 }
             }) {
-                HStack(spacing: 4) {
-                    Text("R:R")
-                    if scannerFilter.sortBy == .rr {
+                HStack(spacing: 3) {
+                    Text(label)
+                    if scannerFilter.sortBy == field {
                         Image(systemName: scannerFilter.sortAscending ? "chevron.up" : "chevron.down")
-                            .font(.system(size: 8))
+                            .font(.system(size: 7, weight: .bold))
+                            .foregroundStyle(CortexDesign.accentPrimary)
                     }
                 }
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(scannerFilter.sortBy == field ? CortexDesign.accentPrimary : CortexDesign.neutral)
+                .textCase(.uppercase)
             }
             .buttonStyle(.plain)
-            .frame(width: 50, alignment: .trailing)
-
-            Text("")
-                .frame(width: 30)
+            .frame(width: width, alignment: alignment)
+        } else {
+            Text(label)
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(CortexDesign.neutral)
+                .textCase(.uppercase)
+                .frame(width: width, alignment: alignment)
         }
-        .font(.system(size: 10, weight: .bold, design: .monospaced))
-        .foregroundStyle(Color(white: 0.45))
     }
 
     // MARK: - Opportunity Row
 
     private func opportunityRow(_ opp: Opportunity, rank: Int) -> some View {
-        HStack(spacing: 0) {
+        let isExpanded = expandedId == opp.id
+        let isHovered = hoveredRowId == opp.id
+
+        return HStack(spacing: 0) {
             // Rank
             Text("\(rank)")
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .foregroundStyle(Color(white: 0.4))
+                .foregroundStyle(CortexDesign.neutral)
                 .frame(width: 30, alignment: .leading)
 
             // Ticker
             Text(opp.ticker)
-                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .font(.system(size: 12, weight: .bold, design: .monospaced))
                 .foregroundStyle(.white)
-                .frame(width: 80, alignment: .leading)
+                .underline(isHovered, color: .cyan.opacity(0.5))
+                .frame(width: 70, alignment: .leading)
 
-            // Composite Score with bar
-            HStack(spacing: 8) {
-                GeometryReader { geo in
+            // Score with bar
+            HStack(spacing: 6) {
+                // Score bar
+                GeometryReader { _ in
                     ZStack(alignment: .leading) {
-                        RoundedRectangle(cornerRadius: 3)
-                            .fill(Color(white: 0.12))
-                            .frame(height: 8)
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(CortexDesign.bgHover)
+                            .frame(height: 6)
 
-                        RoundedRectangle(cornerRadius: 3)
-                            .fill(scoreColor(opp.compositeScore))
-                            .frame(width: geo.size.width * min(opp.compositeScore / 100.0, 1.0), height: 8)
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(scoreGradient(opp.compositeScore))
+                            .frame(
+                                width: 50 * min(opp.compositeScore / 100.0, 1.0),
+                                height: 6
+                            )
                     }
                 }
-                .frame(height: 8)
-                .frame(width: 70)
+                .frame(width: 50, height: 6)
 
                 Text(String(format: "%.0f", opp.compositeScore))
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundStyle(scoreColor(opp.compositeScore))
             }
-            .frame(width: 130, alignment: .leading)
+            .frame(width: 80, alignment: .leading)
 
             // Type badge
             Text(opp.type.rawValue)
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 9, weight: .semibold))
                 .foregroundStyle(typeColor(opp.type))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(typeColor(opp.type).opacity(0.12))
-                )
-                .frame(width: 90, alignment: .leading)
-
-            // Direction badge
-            Text(opp.direction.rawValue)
-                .font(.system(size: 9, weight: .bold))
-                .foregroundStyle(opp.direction == .long ? .green : .red)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 2)
                 .background(
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill((opp.direction == .long ? Color.green : Color.red).opacity(0.12))
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(typeColor(opp.type).opacity(0.12))
                 )
-                .frame(width: 60, alignment: .center)
+                .frame(width: 85, alignment: .leading)
+
+            // Direction badge
+            Text(opp.direction.rawValue)
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundStyle(opp.direction == .long ? CortexDesign.profit : CortexDesign.loss)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill((opp.direction == .long ? CortexDesign.profit : CortexDesign.loss).opacity(0.12))
+                )
+                .frame(width: 55, alignment: .center)
 
             // Sector
-            Text(opp.sector ?? "--")
+            Text(sectorDisplay(opp.sector))
                 .font(.system(size: 11))
-                .foregroundStyle(Color(white: 0.5))
+                .foregroundStyle(CortexDesign.neutral)
                 .lineLimit(1)
-                .frame(width: 100, alignment: .leading)
-
-            // Thesis (truncated)
-            Text(opp.thesis)
-                .font(.system(size: 12))
-                .foregroundStyle(Color(white: 0.6))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(width: 80, alignment: .leading)
 
             // R:R Ratio
             Text(String(format: "%.1f", opp.riskReward))
-                .font(.system(size: 13, weight: .bold, design: .monospaced))
-                .foregroundStyle(opp.riskReward >= 2.0 ? .green : opp.riskReward >= 1.5 ? .yellow : .orange)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundStyle(rrColor(opp.riskReward))
                 .frame(width: 50, alignment: .trailing)
 
-            // AI Insight icon
-            Button(action: {
-                onAnalyzeWithAI("Analyze \(opp.ticker): \(opp.thesis)")
-            }) {
-                Image(systemName: "sparkles")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.cyan.opacity(0.6))
-                    .frame(width: 30, height: 30)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("Analyze with AI")
+            // Thesis (truncated, fills remaining)
+            Text(opp.thesis)
+                .font(.system(size: 11))
+                .foregroundStyle(CortexDesign.neutral)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, 8)
         }
-        .padding(.vertical, 10)
+        .padding(.horizontal, 16)
+        .frame(height: 40)
         .background(
-            expandedId == opp.id
-                ? Color(white: 0.07)
-                : Color.clear
+            isExpanded
+                ? CortexDesign.bgCard
+                : isHovered
+                    ? CortexDesign.bgCard
+                    : (rank % 2 == 0 ? CortexDesign.bgDeepest : CortexDesign.bgDeepest)
         )
     }
 
-    // MARK: - Expanded Detail
+    // MARK: - Expanded Detail Panel
 
     private func expandedDetail(_ opp: Opportunity) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top, spacing: 24) {
-                // Left column: Full thesis
-                VStack(alignment: .leading, spacing: 8) {
-                    detailLabel("THESIS")
-                    Text(opp.thesis)
-                        .font(.system(size: 12))
-                        .foregroundStyle(Color(white: 0.7))
-                        .fixedSize(horizontal: false, vertical: true)
+        HStack(alignment: .top, spacing: 20) {
+            // Column 1: Thesis & AI Insight
+            VStack(alignment: .leading, spacing: 10) {
+                detailSectionLabel("THESIS")
 
-                    // Short interest badge (if applicable)
-                    if let si = opp.shortInterest {
-                        HStack(spacing: 6) {
-                            Text("Short Interest:")
-                                .font(.system(size: 11))
-                                .foregroundStyle(Color(white: 0.5))
-                            Text(String(format: "%.1f%%", si))
-                                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                                .foregroundStyle(si >= 20 ? .red : si >= 10 ? .orange : .yellow)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 4)
-                                        .fill((si >= 20 ? Color.red : si >= 10 ? Color.orange : Color.yellow).opacity(0.12))
-                                )
-                        }
-                    }
+                Text(opp.thesis)
+                    .font(.system(size: 12))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .lineLimit(4)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let insight = opp.aiInsight, !insight.isEmpty {
+                    detailSectionLabel("AI INSIGHT")
+
+                    Text(insight)
+                        .font(.system(size: 11))
+                        .foregroundStyle(CortexDesign.accentPrimary.opacity(0.9))
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: CortexDesign.badgeRadius)
+                                .fill(CortexDesign.accentPrimary.opacity(0.05))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: CortexDesign.badgeRadius)
+                                .strokeBorder(CortexDesign.accentPrimary.opacity(0.12), lineWidth: 1)
+                        )
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-                // Center column: Key metrics
-                VStack(alignment: .leading, spacing: 6) {
-                    detailLabel("KEY METRICS")
-                    detailRow("Composite Score", String(format: "%.1f / 100", opp.compositeScore))
-                    detailRow("Risk : Reward", String(format: "%.1f : 1", opp.riskReward))
-                    detailRow("Type", opp.type.rawValue)
-                    detailRow("Direction", opp.direction.rawValue)
-                    if let horizon = opp.timeHorizon {
-                        detailRow("Time Horizon", horizon)
-                    }
-                    detailRow("Detected", relativeTime(opp.timestamp))
+            // Column 2: Key Metrics
+            VStack(alignment: .leading, spacing: 6) {
+                detailSectionLabel("KEY METRICS")
+
+                metricRow("Score", value: String(format: "%.1f", opp.compositeScore),
+                          color: scoreColor(opp.compositeScore))
+                metricRow("Risk / Reward", value: String(format: "%.1f : 1", opp.riskReward),
+                          color: rrColor(opp.riskReward))
+
+                HStack {
+                    Text("Direction")
+                        .font(.system(size: 11))
+                        .foregroundStyle(CortexDesign.neutral)
+                    Spacer()
+                    Text(opp.direction.rawValue)
+                        .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        .foregroundStyle(opp.direction == .long ? CortexDesign.profit : CortexDesign.loss)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill((opp.direction == .long ? CortexDesign.profit : CortexDesign.loss).opacity(0.12))
+                        )
                 }
-                .frame(width: 200)
 
-                // Right column: Entry/Exit
-                VStack(alignment: .leading, spacing: 6) {
-                    detailLabel("LEVELS")
+                if let si = opp.shortInterest {
+                    metricRow("Short Interest", value: String(format: "%.1f%%", si),
+                              color: si >= 20 ? CortexDesign.loss : si >= 10 ? CortexDesign.warning : .yellow)
+                }
+
+                metricRow("Sector", value: sectorDisplay(opp.sector), color: .white.opacity(0.7))
+
+                if let cap = opp.marketCap, !cap.isEmpty {
+                    metricRow("Market Cap", value: cap, color: .white.opacity(0.7))
+                }
+
+                if let horizon = opp.timeHorizon {
+                    metricRow("Time Horizon", value: horizon, color: .white.opacity(0.7))
+                }
+
+                metricRow("Detected", value: relativeTime(opp.timestamp), color: CortexDesign.neutral)
+            }
+            .frame(width: 180)
+
+            // Column 3: Levels + Actions
+            VStack(alignment: .leading, spacing: 6) {
+                // Price Levels
+                if opp.entryPrice != nil || opp.exitPrice != nil || opp.stopLoss != nil {
+                    detailSectionLabel("PRICE LEVELS")
+
                     if let entry = opp.entryPrice {
-                        detailRow("Entry", String(format: "$%.2f", entry))
+                        metricRow("Entry", value: String(format: "$%.2f", entry), color: .white)
                     }
-                    if let exit = opp.exitPrice {
-                        detailRow("Target", String(format: "$%.2f", exit))
+                    if let target = opp.exitPrice {
+                        metricRow("Target", value: String(format: "$%.2f", target), color: CortexDesign.profit)
                     }
                     if let stop = opp.stopLoss {
-                        detailRow("Stop Loss", String(format: "$%.2f", stop))
+                        metricRow("Stop Loss", value: String(format: "$%.2f", stop), color: CortexDesign.loss)
                     }
-                    if opp.entryPrice == nil && opp.exitPrice == nil && opp.stopLoss == nil {
-                        Text("Levels pending analysis")
-                            .font(.system(size: 11))
-                            .foregroundStyle(Color(white: 0.35))
-                    }
+                } else {
+                    detailSectionLabel("PRICE LEVELS")
+                    Text("Pending analysis")
+                        .font(.system(size: 11))
+                        .foregroundStyle(CortexDesign.neutral)
                 }
-                .frame(width: 160)
-            }
 
-            // Action buttons
-            HStack(spacing: 12) {
-                actionButton("Analyze with AI", icon: "sparkles", color: .cyan) {
+                Spacer().frame(height: 8)
+
+                // Action buttons
+                detailSectionLabel("ACTIONS")
+
+                actionButton("Analyze with AI", icon: "sparkles", color: CortexDesign.accentPrimary, filled: true) {
                     onAnalyzeWithAI("Give me a detailed analysis of \(opp.ticker). Current thesis: \(opp.thesis)")
                 }
 
-                actionButton("Add to Watchlist", icon: "eye", color: .blue) {
+                actionButton("Add to Watchlist", icon: "eye", color: .blue, filled: false) {
                     // Watchlist action placeholder
                 }
 
-                actionButton("Quick Trade", icon: "bolt.fill", color: .green) {
+                actionButton(
+                    opp.direction == .long ? "Quick Trade" : "Quick Short",
+                    icon: "bolt.fill",
+                    color: opp.direction == .long ? CortexDesign.profit : CortexDesign.loss,
+                    filled: false
+                ) {
                     // Quick trade action placeholder
                 }
-
-                Spacer()
             }
+            .frame(width: 160)
         }
         .padding(16)
-        .background(
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color(white: 0.06))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(Color(white: 0.10), lineWidth: 1)
-                )
+        .background(CortexDesign.bgDeepest)
+        .overlay(
+            VStack(spacing: 0) {
+                Rectangle().fill(CortexDesign.bgHover).frame(height: 1)
+                Spacer()
+                Rectangle().fill(CortexDesign.bgHover).frame(height: 1)
+            }
         )
-        .padding(.vertical, 4)
     }
 
-    // MARK: - Helpers
+    // MARK: - Component Builders
 
-    private func detailLabel(_ label: String) -> some View {
+    private func detailSectionLabel(_ label: String) -> some View {
         Text(label)
-            .font(.system(size: 9, weight: .bold, design: .monospaced))
-            .foregroundStyle(Color(white: 0.4))
+            .font(.system(size: 10, weight: .bold, design: .monospaced))
+            .foregroundStyle(CortexDesign.neutral)
+            .padding(.bottom, 2)
     }
 
-    private func detailRow(_ label: String, _ value: String) -> some View {
+    private func metricRow(_ label: String, value: String, color: Color) -> some View {
         HStack {
             Text(label)
                 .font(.system(size: 11))
-                .foregroundStyle(Color(white: 0.45))
+                .foregroundStyle(CortexDesign.neutral)
             Spacer()
             Text(value)
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                .foregroundStyle(.white)
+                .foregroundStyle(color)
         }
     }
 
-    private func actionButton(_ title: String, icon: String, color: Color, action: @escaping () -> Void) -> some View {
+    private func actionButton(_ title: String, icon: String, color: Color, filled: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
-                    .font(.system(size: 11))
+                    .font(.system(size: 10))
                 Text(title)
                     .font(.system(size: 11, weight: .semibold))
             }
-            .foregroundStyle(color)
-            .padding(.horizontal, 12)
+            .foregroundStyle(filled ? .white : color)
+            .frame(maxWidth: .infinity)
             .padding(.vertical, 6)
             .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(color.opacity(0.1))
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(filled ? color : color.opacity(0.08))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .strokeBorder(color.opacity(0.2), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(filled ? Color.clear : color.opacity(0.25), lineWidth: 1)
             )
         }
         .buttonStyle(.plain)
     }
 
+    // MARK: - Color Helpers
+
     private func scoreColor(_ score: Double) -> Color {
-        if score >= 80 { return .green }
-        if score >= 60 { return .yellow }
-        if score >= 40 { return .orange }
-        return .red
+        if score >= 80 { return CortexDesign.profit }
+        if score >= 60 { return CortexDesign.accentPrimary }
+        if score >= 40 { return .yellow }
+        return CortexDesign.loss
+    }
+
+    private func scoreGradient(_ score: Double) -> LinearGradient {
+        let color: Color
+        if score >= 80 { color = CortexDesign.profit }
+        else if score >= 60 { color = CortexDesign.accentPrimary }
+        else if score >= 40 { color = .yellow }
+        else { color = CortexDesign.loss }
+        return LinearGradient(
+            colors: [color.opacity(0.7), color],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
     }
 
     private func typeColor(_ type: Opportunity.OpportunityType) -> Color {
         switch type {
-        case .momentum: return .cyan
-        case .breakout: return .green
+        case .momentum: return CortexDesign.accentPrimary
+        case .breakout: return CortexDesign.warning
         case .volume: return .purple
         case .catalyst: return .orange
         case .flow: return .yellow
         case .earnings: return .blue
-        case .reversal: return .red
+        case .reversal: return .purple
         case .sector: return .mint
         }
+    }
+
+    private func rrColor(_ ratio: Double) -> Color {
+        if ratio >= 2.0 { return CortexDesign.profit }
+        if ratio >= 1.0 { return .yellow }
+        return CortexDesign.loss
+    }
+
+    private func sectorDisplay(_ sector: String?) -> String {
+        guard let sector = sector, !sector.isEmpty, sector != "Unknown" else {
+            return "\u{2014}" // em dash
+        }
+        return sector
     }
 
     private func relativeTime(_ date: Date) -> String {
@@ -520,170 +728,243 @@ public struct ScannerView: View {
 struct ScannerFilterBar: View {
     let filter: ScannerFilterStore
 
+    @State private var showDirectionPopover = false
+    @State private var showMarketPopover = false
+    @State private var showSectorPopover = false
+    @State private var showCapSizePopover = false
+    @State private var showSortPopover = false
+    @State private var resetHovered = false
+
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                // Direction
-                filterMenu(
-                    label: filter.direction.rawValue,
+                // Direction filter chip
+                filterChip(
+                    label: "Direction",
+                    value: filter.direction.rawValue,
                     isActive: filter.direction != .both,
-                    icon: "arrow.up.arrow.down"
+                    isOpen: $showDirectionPopover
                 ) {
                     ForEach(Direction.allCases) { dir in
-                        Button(action: { filter.direction = dir }) {
-                            HStack {
-                                Text(dir.rawValue)
-                                if filter.direction == dir {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
+                        filterOption(dir.rawValue, selected: filter.direction == dir) {
+                            filter.direction = dir
+                            showDirectionPopover = false
                         }
                     }
                 }
 
-                // Market
-                filterMenu(
-                    label: filter.market.rawValue,
+                // Market filter chip
+                filterChip(
+                    label: "Market",
+                    value: filter.market.rawValue,
                     isActive: filter.market != .all,
-                    icon: "globe"
+                    isOpen: $showMarketPopover
                 ) {
                     ForEach(Market.allCases) { m in
-                        Button(action: { filter.market = m }) {
-                            HStack {
-                                Text(m.rawValue)
-                                if filter.market == m {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
+                        filterOption(m.rawValue, selected: filter.market == m) {
+                            filter.market = m
+                            showMarketPopover = false
                         }
                     }
                 }
 
-                // Sector
-                filterMenu(
-                    label: filter.sector.rawValue,
+                // Sector filter chip
+                filterChip(
+                    label: "Sector",
+                    value: filter.sector.rawValue,
                     isActive: filter.sector != .all,
-                    icon: "building.2"
+                    isOpen: $showSectorPopover
                 ) {
                     ForEach(Sector.allCases) { s in
-                        Button(action: { filter.sector = s }) {
-                            HStack {
-                                Text(s.rawValue)
-                                if filter.sector == s {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
+                        filterOption(s.rawValue, selected: filter.sector == s) {
+                            filter.sector = s
+                            showSectorPopover = false
                         }
                     }
                 }
 
-                // Cap Size
-                filterMenu(
-                    label: filter.capSize.rawValue,
+                // Cap Size filter chip
+                filterChip(
+                    label: "Cap Size",
+                    value: filter.capSize.rawValue,
                     isActive: filter.capSize != .all,
-                    icon: "chart.bar"
+                    isOpen: $showCapSizePopover
                 ) {
                     ForEach(CapSize.allCases) { c in
-                        Button(action: { filter.capSize = c }) {
-                            HStack {
-                                Text(c.rawValue)
-                                if filter.capSize == c {
-                                    Image(systemName: "checkmark")
-                                }
-                            }
+                        filterOption(c.rawValue, selected: filter.capSize == c) {
+                            filter.capSize = c
+                            showCapSizePopover = false
                         }
                     }
                 }
 
-                // Min Score slider
+                // Score slider chip
                 HStack(spacing: 6) {
-                    Text("Min:")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(Color(white: 0.5))
-                    Text(String(format: "%.0f", filter.minScore))
-                        .font(.system(size: 10, weight: .bold, design: .monospaced))
-                        .foregroundStyle(filter.minScore > 0 ? .cyan : Color(white: 0.5))
-                        .frame(width: 24)
+                    Text("Score")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(filter.minScore > 0 ? CortexDesign.accentPrimary : CortexDesign.neutral)
+
+                    Text("\u{2265} \(Int(filter.minScore))")
+                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .foregroundStyle(filter.minScore > 0 ? CortexDesign.accentPrimary : CortexDesign.neutral)
+                        .frame(width: 30, alignment: .trailing)
+
                     Slider(value: Binding(
                         get: { filter.minScore },
                         set: { filter.minScore = $0 }
                     ), in: 0...100, step: 5)
                     .frame(width: 80)
-                    .tint(.cyan)
+                    .tint(CortexDesign.accentPrimary)
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 5)
+                .padding(.vertical, 4)
                 .background(
-                    Capsule()
-                        .fill(filter.minScore > 0 ? Color.cyan.opacity(0.08) : Color(white: 0.08))
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(filter.minScore > 0 ? CortexDesign.accentPrimary.opacity(0.06) : CortexDesign.bgCard)
                 )
                 .overlay(
-                    Capsule()
-                        .strokeBorder(filter.minScore > 0 ? Color.cyan.opacity(0.25) : Color(white: 0.15), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 8)
+                        .strokeBorder(filter.minScore > 0 ? CortexDesign.accentPrimary.opacity(0.4) : CortexDesign.border, lineWidth: 1)
                 )
 
-                // Reset
+                // Sort chip
+                filterChip(
+                    label: "Sort",
+                    value: filter.sortBy.rawValue,
+                    isActive: true,
+                    isOpen: $showSortPopover
+                ) {
+                    ForEach(SortField.allCases) { s in
+                        filterOption(s.rawValue, selected: filter.sortBy == s) {
+                            filter.sortBy = s
+                            showSortPopover = false
+                        }
+                    }
+                }
+
+                // Ascending/Descending toggle
+                Button(action: {
+                    filter.sortAscending.toggle()
+                }) {
+                    Image(systemName: filter.sortAscending ? "arrow.up" : "arrow.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(CortexDesign.accentPrimary)
+                        .frame(width: 28, height: 28)
+                        .background(
+                            RoundedRectangle(cornerRadius: CortexDesign.cardRadius)
+                                .fill(CortexDesign.accentPrimary.opacity(0.06))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: CortexDesign.cardRadius)
+                                .strokeBorder(CortexDesign.accentPrimary.opacity(0.4), lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help(filter.sortAscending ? "Ascending" : "Descending")
+
+                // Reset button (only visible when filters active)
                 if filter.activeFilterCount > 0 {
                     Button(action: { filter.resetFilters() }) {
                         HStack(spacing: 4) {
                             Image(systemName: "arrow.counterclockwise")
                                 .font(.system(size: 10))
-                            Text("Reset")
-                                .font(.system(size: 10, weight: .medium))
+                            Text("Reset (\(filter.activeFilterCount))")
+                                .font(.system(size: 11, weight: .medium))
                         }
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(CortexDesign.neutral)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background(
-                            Capsule()
-                                .fill(Color.orange.opacity(0.08))
+                            RoundedRectangle(cornerRadius: CortexDesign.cardRadius)
+                                .fill(resetHovered ? CortexDesign.loss.opacity(0.1) : CortexDesign.bgCard)
                         )
                         .overlay(
-                            Capsule()
-                                .strokeBorder(Color.orange.opacity(0.25), lineWidth: 1)
+                            RoundedRectangle(cornerRadius: CortexDesign.cardRadius)
+                                .strokeBorder(resetHovered ? CortexDesign.loss.opacity(0.3) : CortexDesign.border, lineWidth: 1)
                         )
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        resetHovered = hovering
+                    }
                 }
 
                 Spacer()
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 10)
+            .padding(.vertical, 8)
         }
     }
 
+    // MARK: - Filter Chip with Popover
+
     @ViewBuilder
-    private func filterMenu<Content: View>(
+    private func filterChip<Content: View>(
         label: String,
+        value: String,
         isActive: Bool,
-        icon: String,
-        @ViewBuilder content: () -> Content
+        isOpen: Binding<Bool>,
+        @ViewBuilder content: @escaping () -> Content
     ) -> some View {
-        Menu {
-            content()
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: icon)
-                    .font(.system(size: 10))
-                Text(label)
-                    .font(.system(size: 11, weight: isActive ? .bold : .medium))
+        Button(action: {
+            isOpen.wrappedValue.toggle()
+        }) {
+            HStack(spacing: 4) {
+                Text(value)
+                    .font(.system(size: 11, weight: isActive ? .semibold : .medium))
                 Image(systemName: "chevron.down")
-                    .font(.system(size: 8))
+                    .font(.system(size: 8, weight: .semibold))
             }
-            .foregroundStyle(isActive ? .cyan : Color(white: 0.6))
+            .foregroundStyle(isActive ? CortexDesign.accentPrimary : CortexDesign.neutral)
             .padding(.horizontal, 10)
-            .padding(.vertical, 6)
+            .padding(.vertical, 5)
             .background(
-                Capsule()
-                    .fill(isActive ? Color.cyan.opacity(0.1) : Color(white: 0.08))
+                RoundedRectangle(cornerRadius: CortexDesign.cardRadius)
+                    .fill(isActive ? CortexDesign.accentPrimary.opacity(0.06) : CortexDesign.bgCard)
             )
             .overlay(
-                Capsule()
-                    .strokeBorder(isActive ? Color.cyan.opacity(0.3) : Color(white: 0.15), lineWidth: 1)
+                RoundedRectangle(cornerRadius: CortexDesign.cardRadius)
+                    .strokeBorder(isActive ? CortexDesign.accentPrimary.opacity(0.4) : CortexDesign.border, lineWidth: 1)
             )
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
+        .buttonStyle(.plain)
+        .popover(isPresented: isOpen, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label.uppercased())
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(CortexDesign.neutral)
+                    .padding(.horizontal, 8)
+                    .padding(.top, 8)
+                    .padding(.bottom, 4)
+
+                content()
+            }
+            .padding(.bottom, 6)
+            .frame(minWidth: 160)
+            .background(CortexDesign.bgHover)
+        }
+    }
+
+    // MARK: - Filter Option Row
+
+    private func filterOption(_ label: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Text(label)
+                    .font(.system(size: 12, weight: selected ? .semibold : .regular))
+                    .foregroundStyle(selected ? CortexDesign.accentPrimary : .white)
+                Spacer()
+                if selected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(CortexDesign.accentPrimary)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(selected ? CortexDesign.accentPrimary.opacity(0.08) : Color.clear)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }

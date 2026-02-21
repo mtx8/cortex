@@ -15,13 +15,13 @@ public struct ChatView: View {
             chatHeader
 
             Divider()
-                .overlay(Color(white: 0.15))
+                .overlay(CortexDesign.bgElevated)
 
             // Quick prompt buttons
             quickPromptsBar
 
             Divider()
-                .overlay(Color(white: 0.15))
+                .overlay(CortexDesign.bgElevated)
 
             // Main area: Chat + Opportunity side panel
             HSplitView {
@@ -37,12 +37,12 @@ public struct ChatView: View {
             }
 
             Divider()
-                .overlay(Color(white: 0.15))
+                .overlay(CortexDesign.bgElevated)
 
             // Input area
             chatInputArea
         }
-        .background(Color(nsColor: NSColor(red: 0.06, green: 0.06, blue: 0.09, alpha: 1.0)))
+        .background(CortexDesign.bgDeepest)
     }
 
     // MARK: - Header
@@ -62,7 +62,7 @@ public struct ChatView: View {
             // Connection indicator
             HStack(spacing: 4) {
                 Circle()
-                    .fill(store.webSocket?.isConnected == true ? Color.green : Color.orange)
+                    .fill(store.webSocket?.isConnected == true ? CortexDesign.profit : CortexDesign.warning)
                     .frame(width: 6, height: 6)
                 Text(store.webSocket?.isConnected == true ? "Live" : "Local")
                     .font(.system(size: 10, weight: .medium))
@@ -75,7 +75,7 @@ public struct ChatView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+        .background(CortexDesign.bgCard)
     }
 
     // MARK: - Quick Prompts
@@ -109,7 +109,7 @@ public struct ChatView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
         }
-        .background(Color(nsColor: NSColor(red: 0.07, green: 0.07, blue: 0.1, alpha: 1.0)))
+        .background(CortexDesign.bgCard)
     }
 
     // MARK: - Chat Messages Area
@@ -170,7 +170,7 @@ public struct ChatView: View {
                 .padding(.bottom, 8)
             }
         }
-        .background(Color(nsColor: NSColor(red: 0.07, green: 0.07, blue: 0.1, alpha: 1.0)))
+        .background(CortexDesign.bgCard)
     }
 
     // MARK: - Input Area
@@ -189,14 +189,14 @@ public struct ChatView: View {
             Button(action: { store.sendMessage() }) {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.system(size: 22))
-                    .foregroundStyle(store.inputText.isEmpty ? Color(white: 0.3) : .blue)
+                    .foregroundStyle(store.inputText.isEmpty ? CortexDesign.neutral : CortexDesign.accentSecondary)
             }
             .buttonStyle(.plain)
             .disabled(store.inputText.isEmpty || store.isProcessing)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
-        .background(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
+        .background(CortexDesign.bgCard)
     }
 }
 
@@ -226,8 +226,8 @@ struct ChatBubble: View {
                     .background(
                         RoundedRectangle(cornerRadius: 10)
                             .fill(message.role == .user
-                                  ? Color.blue.opacity(0.2)
-                                  : Color(white: 0.1))
+                                  ? CortexDesign.accentSecondary.opacity(0.2)
+                                  : CortexDesign.bgHover)
                     )
 
                 if let symbol = message.symbol {
@@ -259,11 +259,11 @@ struct ChatBubble: View {
     @ViewBuilder
     func actionBadge(_ action: ChatMessage.ActionType) -> some View {
         let (text, color): (String, Color) = switch action {
-        case .buySignal: ("BUY SIGNAL", .green)
-        case .sellSignal: ("SELL SIGNAL", .red)
+        case .buySignal: ("BUY SIGNAL", CortexDesign.profit)
+        case .sellSignal: ("SELL SIGNAL", CortexDesign.loss)
         case .watchAlert: ("WATCH", .yellow)
-        case .riskWarning: ("RISK", .orange)
-        case .analysis: ("ANALYSIS", .blue)
+        case .riskWarning: ("RISK", CortexDesign.warning)
+        case .analysis: ("ANALYSIS", CortexDesign.accentSecondary)
         }
 
         Text(text)
@@ -304,7 +304,7 @@ struct OpportunitySidePanelCard: View {
                 GeometryReader { geo in
                     ZStack(alignment: .leading) {
                         RoundedRectangle(cornerRadius: 2)
-                            .fill(Color(white: 0.15))
+                            .fill(CortexDesign.bgElevated)
                         RoundedRectangle(cornerRadius: 2)
                             .fill(scoreColor)
                             .frame(width: max(0, geo.size.width * opportunity.compositeScore / 100))
@@ -321,11 +321,11 @@ struct OpportunitySidePanelCard: View {
         .padding(8)
         .background(
             RoundedRectangle(cornerRadius: 6)
-                .fill(Color(white: 0.08))
+                .fill(CortexDesign.bgCard)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 6)
-                .strokeBorder(Color(white: 0.14), lineWidth: 1)
+                .strokeBorder(CortexDesign.border, lineWidth: 1)
         )
     }
 

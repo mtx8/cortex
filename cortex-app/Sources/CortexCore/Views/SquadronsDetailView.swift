@@ -39,7 +39,7 @@ public struct SquadronsDetailView: View {
             // Header
             headerBar
 
-            Divider().overlay(Color(white: 0.15))
+            Divider().overlay(CortexDesign.bgElevated)
 
             if squadrons.agents.isEmpty {
                 emptyState
@@ -51,7 +51,7 @@ public struct SquadronsDetailView: View {
                 allSquadronsView
             }
         }
-        .background(Color(nsColor: NSColor(red: 0.06, green: 0.06, blue: 0.08, alpha: 1.0)))
+        .background(CortexDesign.bgDeepest)
     }
 
     // MARK: - All Squadrons View
@@ -85,20 +85,20 @@ public struct SquadronsDetailView: View {
 
         return HStack(spacing: 0) {
             summaryMetric(value: "\(totalAgents)", label: "TOTAL AGENTS", color: .white)
-            Divider().frame(height: 28).overlay(Color(white: 0.15))
-            summaryMetric(value: "\(activeCount)", label: "ACTIVE", color: .green)
-            Divider().frame(height: 28).overlay(Color(white: 0.15))
-            summaryMetric(value: "\(totalSignals)", label: "SIGNALS", color: .cyan)
-            Divider().frame(height: 28).overlay(Color(white: 0.15))
-            summaryMetric(value: "\(totalErrors)", label: "ERRORS", color: totalErrors > 0 ? .red : Color(white: 0.35))
+            Divider().frame(height: 28).overlay(CortexDesign.bgElevated)
+            summaryMetric(value: "\(activeCount)", label: "ACTIVE", color: CortexDesign.profit)
+            Divider().frame(height: 28).overlay(CortexDesign.bgElevated)
+            summaryMetric(value: "\(totalSignals)", label: "SIGNALS", color: CortexDesign.accentPrimary)
+            Divider().frame(height: 28).overlay(CortexDesign.bgElevated)
+            summaryMetric(value: "\(totalErrors)", label: "ERRORS", color: totalErrors > 0 ? CortexDesign.loss : CortexDesign.neutral)
         }
         .padding(.vertical, 10)
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(Color(white: 0.07))
+                .fill(CortexDesign.bgCard)
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(Color(white: 0.12), lineWidth: 1)
+                        .strokeBorder(CortexDesign.border, lineWidth: 1)
                 )
         )
         .padding(.bottom, 8)
@@ -111,7 +111,7 @@ public struct SquadronsDetailView: View {
                 .foregroundStyle(color)
             Text(label)
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color(white: 0.4))
+                .foregroundStyle(CortexDesign.neutral)
         }
         .frame(maxWidth: .infinity)
     }
@@ -137,36 +137,36 @@ public struct SquadronsDetailView: View {
 
                             Text(info.description)
                                 .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(Color(white: 0.5))
+                                .foregroundStyle(CortexDesign.neutral)
                         }
 
                         Text("\(agents.count) agents registered")
                             .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(Color(white: 0.4))
+                            .foregroundStyle(CortexDesign.neutral)
                     }
 
                     Spacer()
 
                     HStack(spacing: 16) {
-                        singleSquadronStat("\(activeCount)", label: "Active", color: .green)
-                        singleSquadronStat("\(errorCount)", label: "Errors", color: errorCount > 0 ? .red : Color(white: 0.35))
-                        singleSquadronStat("\(totalSignals)", label: "Signals", color: .cyan)
+                        singleSquadronStat("\(activeCount)", label: "Active", color: CortexDesign.profit)
+                        singleSquadronStat("\(errorCount)", label: "Errors", color: errorCount > 0 ? CortexDesign.loss : CortexDesign.neutral)
+                        singleSquadronStat("\(totalSignals)", label: "Signals", color: CortexDesign.accentPrimary)
                     }
                 }
                 .padding(16)
                 .background(
                     RoundedRectangle(cornerRadius: 10)
-                        .fill(Color(white: 0.08))
+                        .fill(CortexDesign.bgCard)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 10)
-                        .strokeBorder(Color(white: 0.12), lineWidth: 1)
+                        .strokeBorder(CortexDesign.border, lineWidth: 1)
                 )
 
                 // Agent table header
                 Text("AGENTS")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
 
                 // Column headers
                 HStack(spacing: 0) {
@@ -182,7 +182,7 @@ public struct SquadronsDetailView: View {
                         .frame(width: 110, alignment: .trailing)
                 }
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color(white: 0.35))
+                .foregroundStyle(CortexDesign.neutral)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
 
@@ -191,15 +191,15 @@ public struct SquadronsDetailView: View {
                     VStack(spacing: 8) {
                         Image(systemName: "person.crop.circle.badge.questionmark")
                             .font(.system(size: 40))
-                            .foregroundStyle(Color(white: 0.2))
+                            .foregroundStyle(CortexDesign.border)
 
                         Text("No agents registered")
                             .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(Color(white: 0.5))
+                            .foregroundStyle(CortexDesign.neutral)
 
                         Text("Agents for \(info.name) squadron will appear when the backend starts")
                             .font(.system(size: 12))
-                            .foregroundStyle(Color(white: 0.35))
+                            .foregroundStyle(CortexDesign.neutral)
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 40)
@@ -223,7 +223,7 @@ public struct SquadronsDetailView: View {
                 .foregroundStyle(color)
             Text(label)
                 .font(.system(size: 9, weight: .bold, design: .monospaced))
-                .foregroundStyle(Color(white: 0.4))
+                .foregroundStyle(CortexDesign.neutral)
         }
     }
 
@@ -233,7 +233,7 @@ public struct SquadronsDetailView: View {
         HStack {
             Image(systemName: "person.3.fill")
                 .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(.cyan)
+                .foregroundStyle(CortexDesign.accentPrimary)
             Text("SQUADRONS")
                 .font(.system(size: 14, weight: .black, design: .monospaced))
                 .foregroundStyle(.white)
@@ -244,7 +244,7 @@ public struct SquadronsDetailView: View {
                 statusPill(
                     count: squadrons.agents.filter { $0.status == "active" }.count,
                     label: "Active",
-                    color: .green
+                    color: CortexDesign.profit
                 )
                 statusPill(
                     count: squadrons.agents.filter { $0.status == "idle" }.count,
@@ -254,7 +254,7 @@ public struct SquadronsDetailView: View {
                 statusPill(
                     count: squadrons.agents.filter { $0.status == "error" }.count,
                     label: "Error",
-                    color: .red
+                    color: CortexDesign.loss
                 )
             }
         }
@@ -269,7 +269,7 @@ public struct SquadronsDetailView: View {
                 .frame(width: 6, height: 6)
             Text("\(count) \(label)")
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
-                .foregroundStyle(Color(white: 0.6))
+                .foregroundStyle(CortexDesign.neutral)
         }
     }
 
@@ -290,13 +290,13 @@ public struct SquadronsDetailView: View {
 
                 Text("Agent status updates are arriving shortly.")
                     .font(.system(size: 12))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 300)
             } else {
                 Image(systemName: "wifi.slash")
                     .font(.system(size: 32, weight: .light))
-                    .foregroundStyle(Color(white: 0.3))
+                    .foregroundStyle(CortexDesign.neutral)
 
                 Text("Backend Not Connected")
                     .font(.system(size: 14, weight: .medium, design: .monospaced))
@@ -304,7 +304,7 @@ public struct SquadronsDetailView: View {
 
                 Text("Start the Python backend to see agent status.\npython -m cortex.main")
                     .font(.system(size: 12))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 300)
             }
@@ -348,7 +348,7 @@ private struct SquadronSection: View {
                             .frame(width: 110, alignment: .trailing)
                     }
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.35))
+                    .foregroundStyle(CortexDesign.neutral)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
 
@@ -359,7 +359,7 @@ private struct SquadronSection: View {
                     if agents.isEmpty {
                         Text("No agents registered")
                             .font(.system(size: 11, design: .monospaced))
-                            .foregroundStyle(Color(white: 0.3))
+                            .foregroundStyle(CortexDesign.neutral)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 12)
                     }
@@ -379,26 +379,26 @@ private struct SquadronSection: View {
 
                     Text(info.description)
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(Color(white: 0.45))
+                        .foregroundStyle(CortexDesign.neutral)
 
                     Spacer()
 
                     Text("\(agents.count) agents")
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Color(white: 0.4))
+                        .foregroundStyle(CortexDesign.neutral)
                 }
                 .padding(.vertical, 4)
             }
-            .tint(Color(white: 0.4))
+            .tint(CortexDesign.neutral)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(Color(white: 0.08))
+                .fill(CortexDesign.bgCard)
                 .overlay(
                     RoundedRectangle(cornerRadius: 8)
-                        .strokeBorder(Color(white: 0.12), lineWidth: 1)
+                        .strokeBorder(CortexDesign.border, lineWidth: 1)
                 )
         )
         .padding(.vertical, 3)
@@ -470,26 +470,26 @@ private struct AgentRow: View {
             // Signal count
             Text("\(agent.signalCount)")
                 .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .foregroundStyle(agent.signalCount > 0 ? .cyan : Color(white: 0.35))
+                .foregroundStyle(agent.signalCount > 0 ? CortexDesign.accentPrimary : CortexDesign.neutral)
                 .frame(width: 80, alignment: .trailing)
 
             // Error count
             Text("\(agent.errorCount)")
                 .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .foregroundStyle(agent.errorCount > 0 ? .red : Color(white: 0.35))
+                .foregroundStyle(agent.errorCount > 0 ? CortexDesign.loss : CortexDesign.neutral)
                 .frame(width: 70, alignment: .trailing)
 
             // Last update
             Text(lastUpdateText)
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(Color(white: 0.45))
+                .foregroundStyle(CortexDesign.neutral)
                 .frame(width: 110, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .background(
             RoundedRectangle(cornerRadius: 4)
-                .fill(isHovering ? Color(white: 0.09) : Color(white: 0.06))
+                .fill(isHovering ? CortexDesign.bgCard : CortexDesign.bgDeepest)
         )
         .onHover { hovering in
             isHovering = hovering
@@ -510,10 +510,10 @@ private struct AgentRow: View {
                     .foregroundStyle(.white)
                 Text("Squadron: \(agent.squadron.uppercased())")
                     .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.5))
+                    .foregroundStyle(CortexDesign.neutral)
             }
 
-            Divider().overlay(Color(white: 0.2))
+            Divider().overlay(CortexDesign.border)
 
             // Status with colored dot
             HStack(spacing: 6) {
@@ -531,18 +531,18 @@ private struct AgentRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Signals")
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundStyle(Color(white: 0.4))
+                        .foregroundStyle(CortexDesign.neutral)
                     Text("\(agent.signalCount)")
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
-                        .foregroundStyle(.cyan)
+                        .foregroundStyle(CortexDesign.accentPrimary)
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Errors")
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundStyle(Color(white: 0.4))
+                        .foregroundStyle(CortexDesign.neutral)
                     Text("\(agent.errorCount)")
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
-                        .foregroundStyle(agent.errorCount > 0 ? .red : Color(white: 0.35))
+                        .foregroundStyle(agent.errorCount > 0 ? CortexDesign.loss : CortexDesign.neutral)
                 }
             }
 
@@ -550,24 +550,24 @@ private struct AgentRow: View {
             HStack(spacing: 4) {
                 Text("Last Signal:")
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
                 Text(lastUpdateText)
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.6))
+                    .foregroundStyle(CortexDesign.neutral)
             }
 
             // Win rate
             HStack(spacing: 4) {
                 Text("Win Rate:")
                     .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Color(white: 0.4))
+                    .foregroundStyle(CortexDesign.neutral)
                 Text(winRate)
                     .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.green)
+                    .foregroundStyle(CortexDesign.profit)
             }
         }
         .padding(12)
         .frame(width: 220)
-        .background(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.10, alpha: 1.0)))
+        .background(CortexDesign.bgCard)
     }
 }

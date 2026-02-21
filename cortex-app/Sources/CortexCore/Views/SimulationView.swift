@@ -74,7 +74,7 @@ public struct SimulationView: View {
                                 RoundedRectangle(cornerRadius: 4)
                                     .fill(store.speed == speed
                                           ? CortexDesign.accentPrimary.opacity(0.15)
-                                          : Color(white: 0.10))
+                                          : CortexDesign.bgHover)
                             )
                             .foregroundStyle(store.speed == speed ? CortexDesign.accentPrimary : .secondary)
                     }
@@ -140,11 +140,11 @@ public struct SimulationView: View {
                     .padding(.vertical, 6)
                     .background(
                         RoundedRectangle(cornerRadius: 6)
-                            .fill(Color(white: 0.10))
+                            .fill(CortexDesign.bgHover)
                     )
                     .overlay(
                         RoundedRectangle(cornerRadius: 6)
-                            .strokeBorder(Color(white: 0.15), lineWidth: 1)
+                            .strokeBorder(CortexDesign.bgElevated, lineWidth: 1)
                     )
                 }
                 .buttonStyle(.plain)
@@ -227,7 +227,7 @@ public struct SimulationView: View {
                         VStack(spacing: 8) {
                             Image(systemName: "chart.line.uptrend.xyaxis")
                                 .font(.system(size: 24))
-                                .foregroundStyle(Color(white: 0.2))
+                                .foregroundStyle(CortexDesign.border)
                             Text("Start a simulation to see the equity curve")
                                 .font(.system(size: 11))
                                 .foregroundStyle(.tertiary)
@@ -264,7 +264,7 @@ public struct SimulationView: View {
                         path.move(to: CGPoint(x: 0, y: startY))
                         path.addLine(to: CGPoint(x: width, y: startY))
                     }
-                    .stroke(Color(white: 0.2), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                    .stroke(CortexDesign.border, style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
                 }
 
                 // Equity curve fill
@@ -382,7 +382,7 @@ public struct SimulationView: View {
 
                     ForEach(store.trades.suffix(20).reversed()) { trade in
                         tradeRow(trade)
-                        Divider().overlay(Color(white: 0.06))
+                        Divider().overlay(CortexDesign.bgDeepest)
                     }
                 }
                 .background(
@@ -470,7 +470,7 @@ public struct SimulationView: View {
                         VStack(spacing: 4) {
                             Image(systemName: "lightbulb")
                                 .font(.system(size: 16))
-                                .foregroundStyle(Color(white: 0.2))
+                                .foregroundStyle(CortexDesign.border)
                             Text("AI learning insights will appear as the simulation runs")
                                 .font(.system(size: 11))
                                 .foregroundStyle(.tertiary)
@@ -579,8 +579,8 @@ public struct SimulationView: View {
     private func insightBorderColor(_ category: String) -> Color {
         switch category {
         case "pattern": return .blue.opacity(0.2)
-        case "risk": return .orange.opacity(0.2)
-        case "timing": return .cyan.opacity(0.2)
+        case "risk": return CortexDesign.warning.opacity(0.2)
+        case "timing": return CortexDesign.accentPrimary.opacity(0.2)
         case "strategy": return .yellow.opacity(0.2)
         default: return CortexDesign.border
         }
