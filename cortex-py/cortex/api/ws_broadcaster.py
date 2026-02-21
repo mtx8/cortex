@@ -72,13 +72,14 @@ class WSBroadcaster:
 
     def build_signal_message(
         self, signal_type: str, source_agent: str,
-        symbol: str, payload: dict,
+        source_squadron: str, symbol: str, payload: dict,
     ) -> CortexMessage:
         return CortexMessage(
             type=MessageType.SIGNAL_FIRED,
             payload={
                 "signal_type": signal_type,
                 "source_agent": source_agent,
+                "source_squadron": source_squadron,
                 "symbol": symbol,
                 **payload,
             },
@@ -95,6 +96,7 @@ class WSBroadcaster:
         msg = self.build_signal_message(
             signal_type=signal.signal_type,
             source_agent=signal.source_agent,
+            source_squadron=signal.source_squadron,
             symbol=signal.payload.get("symbol", ""),
             payload=signal.payload,
         )

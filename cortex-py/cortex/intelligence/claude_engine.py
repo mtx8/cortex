@@ -48,7 +48,7 @@ class ClaudeEngine:
         self,
         bus: SignalBus,
         api_key: str,
-        model: str = "claude-sonnet-4-6",
+        model: str = "claude-opus-4-6",
         cycle_seconds: int = 300,
         max_tokens: int = 1024,
     ):

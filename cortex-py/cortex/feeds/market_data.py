@@ -18,10 +18,126 @@ from cortex.orchestrator.bus import SignalBus, Signal, SignalPriority
 log = structlog.get_logger()
 
 DEFAULT_WATCHLIST: list[str] = [
-    "AAPL", "NVDA", "MSFT", "TSLA", "META", "AMZN", "GOOG", "SPY", "QQQ",
+    # Mega Cap Tech
+    "AAPL", "NVDA", "MSFT", "GOOG", "META", "AMZN", "TSLA", "AVGO", "ORCL", "CRM",
+    # Large Cap Tech
+    "INTC", "NFLX", "ADBE", "CSCO", "QCOM", "AMAT", "MU", "PANW", "NOW", "UBER",
+    # Financials
+    "JPM", "BAC", "GS", "MS", "V", "MA", "BRK.B", "C", "WFC", "AXP",
+    # Healthcare
+    "UNH", "JNJ", "LLY", "PFE", "ABBV", "MRK", "TMO", "ABT", "BMY", "AMGN",
+    # Energy
+    "XOM", "CVX", "COP", "SLB", "EOG",
+    # Consumer
+    "WMT", "COST", "HD", "NKE", "SBUX", "MCD",
+    # Industrials
+    "CAT", "BA", "GE", "HON", "UPS",
+    # ETFs
+    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV",
 ]
 
+# Static metadata for sector and market cap classification.
+# Sector values match the Swift ScannerFilterStore.Sector enum raw values exactly.
+# Market cap values match the Swift ScannerFilterStore.CapSize enum raw values exactly.
+TICKER_METADATA: dict[str, dict[str, str]] = {
+    # Mega Cap Tech
+    "AAPL": {"sector": "Technology", "market_cap": "Mega"},
+    "NVDA": {"sector": "Technology", "market_cap": "Mega"},
+    "MSFT": {"sector": "Technology", "market_cap": "Mega"},
+    "GOOG": {"sector": "Communication", "market_cap": "Mega"},
+    "META": {"sector": "Communication", "market_cap": "Mega"},
+    "AMZN": {"sector": "Technology", "market_cap": "Mega"},
+    "TSLA": {"sector": "Consumer Disc.", "market_cap": "Mega"},
+    "AVGO": {"sector": "Technology", "market_cap": "Mega"},
+    "ORCL": {"sector": "Technology", "market_cap": "Mega"},
+    "CRM": {"sector": "Technology", "market_cap": "Large"},
+    # Large Cap Tech
+    "INTC": {"sector": "Technology", "market_cap": "Large"},
+    "NFLX": {"sector": "Communication", "market_cap": "Large"},
+    "ADBE": {"sector": "Technology", "market_cap": "Large"},
+    "CSCO": {"sector": "Technology", "market_cap": "Large"},
+    "QCOM": {"sector": "Technology", "market_cap": "Large"},
+    "AMAT": {"sector": "Technology", "market_cap": "Large"},
+    "MU": {"sector": "Technology", "market_cap": "Large"},
+    "PANW": {"sector": "Technology", "market_cap": "Large"},
+    "NOW": {"sector": "Technology", "market_cap": "Large"},
+    "UBER": {"sector": "Technology", "market_cap": "Large"},
+    # Financials
+    "JPM": {"sector": "Financials", "market_cap": "Mega"},
+    "BAC": {"sector": "Financials", "market_cap": "Large"},
+    "GS": {"sector": "Financials", "market_cap": "Large"},
+    "MS": {"sector": "Financials", "market_cap": "Large"},
+    "V": {"sector": "Financials", "market_cap": "Mega"},
+    "MA": {"sector": "Financials", "market_cap": "Mega"},
+    "BRK.B": {"sector": "Financials", "market_cap": "Mega"},
+    "C": {"sector": "Financials", "market_cap": "Large"},
+    "WFC": {"sector": "Financials", "market_cap": "Large"},
+    "AXP": {"sector": "Financials", "market_cap": "Large"},
+    # Healthcare
+    "UNH": {"sector": "Healthcare", "market_cap": "Mega"},
+    "JNJ": {"sector": "Healthcare", "market_cap": "Mega"},
+    "LLY": {"sector": "Healthcare", "market_cap": "Mega"},
+    "PFE": {"sector": "Healthcare", "market_cap": "Large"},
+    "ABBV": {"sector": "Healthcare", "market_cap": "Large"},
+    "MRK": {"sector": "Healthcare", "market_cap": "Large"},
+    "TMO": {"sector": "Healthcare", "market_cap": "Large"},
+    "ABT": {"sector": "Healthcare", "market_cap": "Large"},
+    "BMY": {"sector": "Healthcare", "market_cap": "Large"},
+    "AMGN": {"sector": "Healthcare", "market_cap": "Large"},
+    # Energy
+    "XOM": {"sector": "Energy", "market_cap": "Mega"},
+    "CVX": {"sector": "Energy", "market_cap": "Mega"},
+    "COP": {"sector": "Energy", "market_cap": "Large"},
+    "SLB": {"sector": "Energy", "market_cap": "Large"},
+    "EOG": {"sector": "Energy", "market_cap": "Large"},
+    # Consumer
+    "WMT": {"sector": "Consumer Staples", "market_cap": "Mega"},
+    "COST": {"sector": "Consumer Staples", "market_cap": "Large"},
+    "HD": {"sector": "Consumer Disc.", "market_cap": "Mega"},
+    "NKE": {"sector": "Consumer Disc.", "market_cap": "Large"},
+    "SBUX": {"sector": "Consumer Disc.", "market_cap": "Large"},
+    "MCD": {"sector": "Consumer Disc.", "market_cap": "Mega"},
+    # Industrials
+    "CAT": {"sector": "Industrials", "market_cap": "Large"},
+    "BA": {"sector": "Industrials", "market_cap": "Large"},
+    "GE": {"sector": "Industrials", "market_cap": "Large"},
+    "HON": {"sector": "Industrials", "market_cap": "Large"},
+    "UPS": {"sector": "Industrials", "market_cap": "Large"},
+    # ETFs — mapped to matching sector for sector-specific ETFs
+    "SPY": {"sector": "Financials", "market_cap": "Mega"},
+    "QQQ": {"sector": "Technology", "market_cap": "Mega"},
+    "IWM": {"sector": "Financials", "market_cap": "Large"},
+    "DIA": {"sector": "Industrials", "market_cap": "Large"},
+    "XLF": {"sector": "Financials", "market_cap": "Large"},
+    "XLE": {"sector": "Energy", "market_cap": "Large"},
+    "XLK": {"sector": "Technology", "market_cap": "Large"},
+    "XLV": {"sector": "Healthcare", "market_cap": "Large"},
+}
+
+# Sector-based score biases for more realistic scanner output
+_SECTOR_SCORE_BIAS: dict[str, tuple[float, float]] = {
+    "Technology": (50, 95),       # Tech: slight high-momentum bias
+    "Communication": (45, 90),    # Communication: moderate range
+    "Healthcare": (35, 80),       # Healthcare: value-oriented, lower ceiling
+    "Financials": (40, 85),       # Financials: moderate range
+    "Energy": (25, 98),           # Energy: wider, more volatile range
+    "Consumer Disc.": (40, 88),   # Consumer discretionary: moderate
+    "Consumer Staples": (35, 75), # Consumer staples: narrower, defensive
+    "Industrials": (38, 82),      # Industrials: moderate range
+    "Materials": (35, 85),        # Materials: moderate
+    "Utilities": (30, 70),        # Utilities: narrow, defensive
+    "Real Estate": (30, 75),      # Real estate: narrow
+}
+
 OPPORTUNITY_TYPES: list[str] = ["Momentum", "Volume", "Catalyst", "Breakout", "Flow"]
+
+OPPORTUNITY_THESES: dict[str, str] = {
+    "Momentum": "Strong momentum with RSI trending and volume confirmation",
+    "Volume": "Unusual volume spike detected, institutional activity likely",
+    "Catalyst": "Upcoming catalyst event with positive sentiment signals",
+    "Breakout": "Breaking above key resistance level with increasing volume",
+    "Flow": "Significant options flow detected, smart money positioning",
+}
 
 
 class MarketDataFeed:
@@ -89,7 +205,7 @@ class MarketDataFeed:
             snapshots = await self._polygon.get_snapshots(self._watchlist)
         except Exception as e:
             log.error("feed.poll_error", error=str(e))
-            return []
+            snapshots = []
 
         self._poll_count += 1
 
@@ -168,30 +284,48 @@ class MarketDataFeed:
         self._running = False
         log.info("feed.stop_requested")
 
+    @property
+    def scanner_opportunities(self) -> list[dict]:
+        """Return current scanner scores as a list of opportunity dicts (sorted by score desc)."""
+        opps = []
+        for ticker, state in self._scanner_scores.items():
+            opp_type = state.get("type", "Momentum")
+            score = round(state.get("score", 50), 1)
+            meta = TICKER_METADATA.get(ticker, {"sector": "Unknown", "market_cap": "Unknown"})
+            opps.append({
+                "ticker": ticker,
+                "score": score,
+                "type": opp_type,
+                "risk_reward": state.get("rr", 1.5),
+                "direction": "short" if opp_type == "Flow" else "long",
+                "thesis": f"{ticker}: {OPPORTUNITY_THESES.get(opp_type, 'Scanner result')}",
+                "sector": meta["sector"],
+                "market_cap": meta["market_cap"],
+            })
+        opps.sort(key=lambda x: x["score"], reverse=True)
+        return opps
+
     async def _broadcast_scanner_opportunities(self) -> None:
         """Generate and broadcast scanner opportunity data for watchlist symbols."""
         if self._broadcaster.client_count == 0:
             return
 
-        theses = {
-            "Momentum": "Strong momentum with RSI trending and volume confirmation",
-            "Volume": "Unusual volume spike detected, institutional activity likely",
-            "Catalyst": "Upcoming catalyst event with positive sentiment signals",
-            "Breakout": "Breaking above key resistance level with increasing volume",
-            "Flow": "Significant options flow detected, smart money positioning",
-        }
-
         for ticker in self._watchlist:
+            meta = TICKER_METADATA.get(ticker, {"sector": "Unknown", "market_cap": "Unknown"})
+            sector = meta["sector"]
+
             # Initialize or drift the score for this ticker
             if ticker not in self._scanner_scores:
+                # Use sector-based score range for more realistic variation
+                lo, hi = _SECTOR_SCORE_BIAS.get(sector, (40, 95))
                 self._scanner_scores[ticker] = {
-                    "score": self._rng.uniform(40, 95),
+                    "score": self._rng.uniform(lo, hi),
                     "type": self._rng.choice(OPPORTUNITY_TYPES),
                     "rr": round(self._rng.uniform(1.0, 3.0), 1),
                 }
 
             state = self._scanner_scores[ticker]
-            # Small random drift each cycle (±3 points)
+            # Small random drift each cycle (±3 points), clamped to [20, 98]
             state["score"] = max(20, min(98, state["score"] + self._rng.uniform(-3, 3)))
 
             opp_type = state["type"]
@@ -205,12 +339,12 @@ class MarketDataFeed:
                     "ticker": ticker,
                     "composite_score": score,
                     "type": opp_type,
-                    "thesis": f"{ticker}: {theses[opp_type]}",
+                    "thesis": f"{ticker}: {OPPORTUNITY_THESES.get(opp_type, 'Scanner result')}",
                     "risk_reward": state["rr"],
                     "direction": direction,
-                    "sector": "Unknown",
-                    "market": "stocks",
-                    "market_cap": 0,
+                    "sector": sector,
+                    "market": "US Stocks",
+                    "market_cap": meta["market_cap"],
                     "short_interest": 0.0,
                     "ai_insight": f"High momentum score ({score}) with {opp_type.lower()} pattern",
                 },

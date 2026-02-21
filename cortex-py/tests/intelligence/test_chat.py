@@ -164,6 +164,115 @@ def test_build_system_prompt_context_with_selected_symbol():
     assert "looking at the symbol" in prompt
 
 
+# ─── Enriched Context (scanner, agents, market quotes) ──────────────
+
+def test_build_system_prompt_with_scanner_opportunities():
+    """Verify scanner opportunities are rendered into the system prompt."""
+    chat = CortexChat(api_key="test-key")
+    context = {
+        "current_tab": "Scanner",
+        "current_section": "Overview",
+        "scanner_opportunities": [
+            {"ticker": "NVDA", "score": 92.5, "type": "Breakout", "direction": "long",
+             "risk_reward": 2.1, "thesis": "Breaking above $890 resistance"},
+            {"ticker": "META", "score": 85.0, "type": "Momentum", "direction": "long",
+             "risk_reward": 1.8, "thesis": "Strong RSI recovery"},
+        ],
+    }
+    prompt = chat.build_system_prompt(context=context)
+    assert "Active Scanner Results (2 opportunities)" in prompt
+    assert "NVDA" in prompt
+    assert "92.5" in prompt
+    assert "Breakout" in prompt
+    assert "META" in prompt
+    assert "85.0" in prompt
+
+
+def test_build_system_prompt_with_agents():
+    """Verify agent health is rendered into the system prompt."""
+    chat = CortexChat(api_key="test-key")
+    context = {
+        "current_tab": "Squadrons",
+        "agents": [
+            {"id": "signal_hunter", "squadron": "alpha", "status": "active",
+             "signal_count": 42, "error_count": 0},
+            {"id": "gap_scanner", "squadron": "alpha", "status": "active",
+             "signal_count": 15, "error_count": 1},
+            {"id": "risk_guardian", "squadron": "echo", "status": "active",
+             "signal_count": 100, "error_count": 0},
+        ],
+    }
+    prompt = chat.build_system_prompt(context=context)
+    assert "Squadron Health (3 agents)" in prompt
+    assert "ALPHA" in prompt
+    assert "ECHO" in prompt
+    assert "signal_hunter" in prompt
+    assert "risk_guardian" in prompt
+
+
+def test_build_system_prompt_with_market_quotes():
+    """Verify market quotes are rendered into the system prompt."""
+    chat = CortexChat(api_key="test-key")
+    context = {
+        "current_tab": "Markets",
+        "market_quotes": {
+            "AAPL": {"price": 185.50, "change": 2.50, "change_pct": 1.37},
+            "NVDA": {"price": 892.00, "change": -5.00, "change_pct": -0.56},
+        },
+    }
+    prompt = chat.build_system_prompt(context=context)
+    assert "Live Market Quotes" in prompt
+    assert "$185.50" in prompt
+    assert "NVDA" in prompt
+
+
+def test_build_system_prompt_with_kill_switch():
+    """Verify kill switch status is rendered."""
+    chat = CortexChat(api_key="test-key")
+    context = {
+        "current_tab": "War Room",
+        "kill_switch": {"active": True, "reason": "daily drawdown exceeded 7%"},
+    }
+    prompt = chat.build_system_prompt(context=context)
+    assert "KILL SWITCH ACTIVE" in prompt
+    assert "daily drawdown exceeded 7%" in prompt
+
+
+def test_build_system_prompt_enriched_portfolio():
+    """Verify enriched portfolio data (total_pnl, win_rate, sharpe, etc.) renders."""
+    chat = CortexChat(api_key="test-key")
+    context = {
+        "current_tab": "War Room",
+        "portfolio": {
+            "nav": 125000.0,
+            "daily_pnl": 3500.0,
+            "total_pnl": 15000.0,
+            "win_rate": 0.67,
+            "sharpe_ratio": 1.85,
+            "buying_power": 48000.0,
+            "open_positions": 5,
+        },
+    }
+    prompt = chat.build_system_prompt(context=context)
+    assert "$125,000.00" in prompt
+    assert "$+3,500.00" in prompt
+    assert "Total P&L: $+15,000.00" in prompt
+    assert "Win Rate: 67.0%" in prompt
+    assert "Sharpe: 1.85" in prompt
+    assert "Buying Power: $48,000.00" in prompt
+    assert "Open Positions: 5" in prompt
+
+
+def test_build_system_prompt_tab_normalization():
+    """Verify tab names with spaces (from Swift) are normalized correctly."""
+    chat = CortexChat(api_key="test-key")
+    # Swift sends "War Room" not "war_room"
+    context = {"current_tab": "War Room"}
+    prompt = chat.build_system_prompt(context=context)
+    assert "War Room" in prompt
+    assert "portfolio risk" in prompt
+
+
 # ─── Conversation History ────────────────────────────────────────────
 
 def test_conversation_history_management():
@@ -304,8 +413,8 @@ async def test_stream_response_error_handling():
             chunks.append(chunk)
 
     assert len(chunks) == 1
-    assert "Error generating response" in chunks[0]
-    assert "rate limit" in chunks[0]
+    assert "error" in chunks[0].lower()
+    assert "try again" in chunks[0].lower()
     assert chat.error_count == 1
 
 

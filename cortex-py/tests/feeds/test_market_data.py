@@ -164,13 +164,15 @@ async def test_poll_once_updates_last_quotes(feed, bus):
 
 @pytest.mark.asyncio
 async def test_poll_once_handles_error(feed, bus):
+    """On Polygon error, poll still runs (scanner opportunities still broadcast)."""
     with patch.object(
         feed._polygon, "get_snapshots", new_callable=AsyncMock, side_effect=Exception("API error")
     ):
-        results = await feed._poll_once()
+        with patch.object(feed._broadcaster, "broadcast", new_callable=AsyncMock):
+            results = await feed._poll_once()
 
     assert results == []
-    assert feed.poll_count == 0  # Should not increment on error
+    assert feed.poll_count == 1  # Still increments — scanner opportunities still broadcast
 
 
 @pytest.mark.asyncio

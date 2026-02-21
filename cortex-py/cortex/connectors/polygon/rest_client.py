@@ -270,6 +270,117 @@ class PolygonRESTClient:
         log.debug("polygon.aggregates", ticker=ticker, timespan=timespan, count=len(results))
         return results
 
+    async def get_ticker_details(self, ticker: str) -> dict:
+        """Get comprehensive ticker details (name, sector, market cap, etc.).
+
+        Uses /v3/reference/tickers/{ticker} — available on all Polygon plans.
+        Returns dict with fundamentals. Cached for 1 hour.
+        """
+        cache_key = f"details:{ticker}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            data = await self._request(f"/v3/reference/tickers/{ticker}")
+            r = data.get("results", {})
+            result = {
+                "ticker": r.get("ticker", ticker),
+                "name": r.get("name", ticker),
+                "market_cap": r.get("market_cap", 0),
+                "shares_outstanding": r.get("share_class_shares_outstanding", 0)
+                    or r.get("weighted_shares_outstanding", 0),
+                "description": r.get("description", ""),
+                "sic_code": r.get("sic_code", ""),
+                "sic_description": r.get("sic_description", ""),
+                "primary_exchange": r.get("primary_exchange", ""),
+                "type": r.get("type", ""),
+                "locale": r.get("locale", ""),
+                "homepage_url": r.get("homepage_url", ""),
+                "total_employees": r.get("total_employees", 0),
+                "list_date": r.get("list_date", ""),
+                "branding": r.get("branding", {}),
+            }
+            self._cache.set(cache_key, result, _TTL_DETAILS)
+            log.debug("polygon.ticker_details", ticker=ticker)
+            return result
+        except Exception as e:
+            log.warning("polygon.ticker_details_error", ticker=ticker, error=str(e))
+            return {"ticker": ticker, "name": ticker}
+
+    async def get_news(self, ticker: str, limit: int = 15) -> list[dict]:
+        """Get recent news articles for a ticker.
+
+        Uses /v2/reference/news — available on all Polygon plans.
+        Returns list of article dicts. Cached for 5 minutes.
+        """
+        cache_key = f"news:{ticker}:{limit}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            data = await self._request("/v2/reference/news", {
+                "ticker": ticker,
+                "limit": str(limit),
+            })
+            articles = data.get("results", [])
+            result = [
+                {
+                    "id": a.get("id", ""),
+                    "title": a.get("title", ""),
+                    "source": a.get("publisher", {}).get("name", "Unknown"),
+                    "published_at": a.get("published_utc", ""),
+                    "url": a.get("article_url", ""),
+                    "tickers": a.get("tickers", []),
+                }
+                for a in articles
+            ]
+            self._cache.set(cache_key, result, _TTL_SEARCH)
+            log.debug("polygon.news", ticker=ticker, count=len(result))
+            return result
+        except Exception as e:
+            log.warning("polygon.news_error", ticker=ticker, error=str(e))
+            return []
+
+    async def get_52_week_range(self, ticker: str) -> dict:
+        """Calculate 52-week high/low from daily aggregates.
+
+        Returns dict with keys: week_52_high, week_52_low. Cached for 1 hour.
+        """
+        cache_key = f"52wk:{ticker}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            from datetime import date, timedelta
+            to_date = date.today().isoformat()
+            from_date = (date.today() - timedelta(days=365)).isoformat()
+
+            data = await self._request(
+                f"/v2/aggs/ticker/{ticker}/range/1/day/{from_date}/{to_date}",
+                {"adjusted": "true", "sort": "asc", "limit": "370"},
+            )
+
+            results = data.get("results", [])
+            if not results:
+                return {"week_52_high": 0, "week_52_low": 0}
+
+            highs = [r.get("h", 0) for r in results]
+            lows = [r.get("l", float("inf")) for r in results if r.get("l", 0) > 0]
+
+            result = {
+                "week_52_high": max(highs) if highs else 0,
+                "week_52_low": min(lows) if lows else 0,
+            }
+            self._cache.set(cache_key, result, _TTL_DETAILS)
+            log.debug("polygon.52wk_range", ticker=ticker, high=result["week_52_high"], low=result["week_52_low"])
+            return result
+        except Exception as e:
+            log.warning("polygon.52wk_range_error", ticker=ticker, error=str(e))
+            return {"week_52_high": 0, "week_52_low": 0}
+
     @property
     def request_count(self) -> int:
         return self._request_count

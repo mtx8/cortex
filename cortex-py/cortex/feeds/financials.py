@@ -29,100 +29,189 @@ class FinancialsAggregator:
         symbol = symbol.upper()
         results = {}
 
-        # Run Polygon and EDGAR lookups in parallel
-        polygon_task = asyncio.create_task(self._get_polygon_data(symbol))
-        edgar_task = asyncio.create_task(self._get_edgar_data(symbol))
+        try:
+            # Run Polygon and EDGAR lookups in parallel
+            polygon_task = asyncio.create_task(self._get_polygon_data(symbol))
+            edgar_task = asyncio.create_task(self._get_edgar_data(symbol))
 
-        # Get Polygon data first (usually faster)
-        polygon_data = await polygon_task
-        if polygon_data and ws:
-            msg = CortexMessage(type=MessageType.FINANCIALS_PROFILE, payload=polygon_data)
-            await ws.send_text(encode_message(msg))
-        results["profile"] = polygon_data
+            # Get Polygon data first (usually faster)
+            polygon_data = await polygon_task
 
-        # Get EDGAR data
-        edgar_data = await edgar_task
-        if edgar_data.get("filings") and ws:
-            msg = CortexMessage(
-                type=MessageType.FINANCIALS_FILINGS,
-                payload={"items": edgar_data["filings"]},
-            )
-            await ws.send_text(encode_message(msg))
-        results["filings"] = edgar_data.get("filings", [])
-
-        # Get news from Polygon
-        news = await self._get_news(symbol)
-        if news and ws:
-            msg = CortexMessage(
-                type=MessageType.FINANCIALS_NEWS,
-                payload={"items": news},
-            )
-            await ws.send_text(encode_message(msg))
-        results["news"] = news
-
-        # Derive sentiment from news headlines and send to client
-        if news:
-            sentiment = self._derive_sentiment(news)
+            # Always send profile so the client clears isLoading
+            profile_payload = polygon_data or {
+                "symbol": symbol,
+                "name": symbol,
+                "price": 0,
+                "change": 0,
+                "change_percent": 0,
+                "sector": "Unknown",
+                "industry": "Unknown",
+                "exchange": "",
+                "market_cap": 0,
+                "volume": 0,
+            }
             if ws:
-                msg = CortexMessage(
-                    type=MessageType.FINANCIALS_SENTIMENT,
-                    payload=sentiment,
-                )
+                msg = CortexMessage(type=MessageType.FINANCIALS_PROFILE, payload=profile_payload)
                 await ws.send_text(encode_message(msg))
-            results["sentiment"] = sentiment
+            results["profile"] = profile_payload
 
-        # Generate AI analysis if chat is available
-        if self._chat:
-            ai_analysis = await self._generate_ai_analysis(symbol, polygon_data, edgar_data, news)
-            if ai_analysis and ws:
+            # Get EDGAR data
+            edgar_data = await edgar_task
+            if edgar_data.get("filings") and ws:
                 msg = CortexMessage(
-                    type=MessageType.FINANCIALS_AI_ANALYSIS,
-                    payload=ai_analysis,
+                    type=MessageType.FINANCIALS_FILINGS,
+                    payload={"items": edgar_data["filings"]},
                 )
                 await ws.send_text(encode_message(msg))
-            results["ai_analysis"] = ai_analysis
+            results["filings"] = edgar_data.get("filings", [])
+
+            # Get news from Polygon
+            news = await self._get_news(symbol)
+            if news and ws:
+                msg = CortexMessage(
+                    type=MessageType.FINANCIALS_NEWS,
+                    payload={"items": news},
+                )
+                await ws.send_text(encode_message(msg))
+            results["news"] = news
+
+            # Derive sentiment from news headlines and send to client
+            if news:
+                sentiment = self._derive_sentiment(news)
+                if ws:
+                    msg = CortexMessage(
+                        type=MessageType.FINANCIALS_SENTIMENT,
+                        payload=sentiment,
+                    )
+                    await ws.send_text(encode_message(msg))
+                results["sentiment"] = sentiment
+
+            # Generate AI analysis if chat is available
+            if self._chat:
+                ai_analysis = await self._generate_ai_analysis(symbol, polygon_data, edgar_data, news)
+                if ai_analysis and ws:
+                    msg = CortexMessage(
+                        type=MessageType.FINANCIALS_AI_ANALYSIS,
+                        payload=ai_analysis,
+                    )
+                    await ws.send_text(encode_message(msg))
+                results["ai_analysis"] = ai_analysis
+
+        except Exception as e:
+            log.error("financials.lookup_error", symbol=symbol, error=str(e))
+            if ws:
+                err_msg = CortexMessage(
+                    type=MessageType.FINANCIALS_ERROR,
+                    payload={"symbol": symbol, "error": str(e)},
+                )
+                await ws.send_text(encode_message(err_msg))
 
         return results
 
     async def _get_polygon_data(self, symbol: str) -> dict | None:
-        """Get stock profile data from Polygon."""
-        try:
-            # Get snapshot for current price
-            snapshots = await self._polygon.get_snapshots([symbol])
-            snapshot = snapshots[0] if snapshots else {}
+        """Get stock profile data from Polygon by combining multiple endpoints.
 
-            # Get previous close for change data
-            prev = await self._polygon.get_previous_close(symbol)
+        Data sources:
+        - Ticker Details (/v3/reference/tickers) → name, market_cap, sector, shares
+        - Previous Close (/v2/aggs/ticker/prev) → price, change, volume
+        - Snapshot (if available) → real-time price override
+        - 52-Week Range (from daily aggregates) → high/low
+        """
+        try:
+            # Run all lookups in parallel for speed
+            details_task = asyncio.create_task(self._polygon.get_ticker_details(symbol))
+            prev_task = asyncio.create_task(self._polygon.get_previous_close(symbol))
+            range_task = asyncio.create_task(self._polygon.get_52_week_range(symbol))
+
+            # Snapshot may fail on free plans — don't block on it
+            snapshot = {}
+            try:
+                snapshots = await self._polygon.get_snapshots([symbol])
+                snapshot = snapshots[0] if snapshots else {}
+            except Exception:
+                log.debug("financials.snapshot_unavailable", symbol=symbol)
+
+            details = await details_task
+            prev = await prev_task
+            week_range = await range_task
+
+            # Price: prefer snapshot (real-time) > prev close
+            price = snapshot.get("price") or prev.get("close", 0)
+            prev_close = snapshot.get("prev_close") or prev.get("close", 0)
+            change = snapshot.get("change") or (price - prev_close if prev_close else 0)
+            change_pct = snapshot.get("change_pct") or (
+                (change / prev_close * 100) if prev_close else 0
+            )
+
+            # Map SIC description to a sector category
+            sector = self._sic_to_sector(details.get("sic_description", ""))
 
             profile = {
                 "symbol": symbol,
-                "price": snapshot.get("price", prev.get("close", 0)),
-                "change": snapshot.get("change", 0),
-                "change_percent": snapshot.get("change_pct", 0),
-                "volume": snapshot.get("volume", 0),
-                "market_cap": snapshot.get("market_cap", 0),
-                "name": snapshot.get("name", symbol),
-                "sector": snapshot.get("sector", "Unknown"),
-                "industry": snapshot.get("industry", "Unknown"),
-                "exchange": snapshot.get("exchange", ""),
-                "shares_outstanding": snapshot.get("shares_outstanding", 0),
-                "float": snapshot.get("float", 0),
-                "short_interest": snapshot.get("short_interest", 0),
-                "short_ratio": snapshot.get("short_ratio", 0),
-                "avg_volume": snapshot.get("avg_volume", 0),
-                "week_52_high": snapshot.get("week52_high", 0),
-                "week_52_low": snapshot.get("week52_low", 0),
-                "pe_ratio": snapshot.get("pe_ratio"),
-                "forward_pe": snapshot.get("forward_pe"),
-                "dividend_yield": snapshot.get("dividend_yield"),
-                "beta": snapshot.get("beta"),
-                "prev_close": prev.get("close", 0),
+                "name": details.get("name", symbol),
+                "price": round(price, 2),
+                "change": round(change, 2),
+                "change_percent": round(change_pct, 2),
+                "volume": snapshot.get("volume") or prev.get("volume", 0),
+                "market_cap": details.get("market_cap", 0),
+                "sector": sector,
+                "industry": details.get("sic_description", "Unknown"),
+                "exchange": details.get("primary_exchange", ""),
+                "shares_outstanding": details.get("shares_outstanding", 0),
+                "float": details.get("shares_outstanding", 0),  # Approximate
+                "short_interest": 0,  # Not available in basic Polygon
+                "short_ratio": 0,
+                "avg_volume": 0,  # Would need multiple days of data
+                "week_52_high": week_range.get("week_52_high", 0),
+                "week_52_low": week_range.get("week_52_low", 0),
+                "pe_ratio": None,  # Would need earnings data
+                "forward_pe": None,
+                "dividend_yield": None,
+                "beta": None,
+                "prev_close": prev_close,
                 "prev_volume": prev.get("volume", 0),
             }
             return profile
         except Exception as e:
             log.error("financials.polygon_error", symbol=symbol, error=str(e))
             return None
+
+    @staticmethod
+    def _sic_to_sector(sic_description: str) -> str:
+        """Map SIC description to a broad sector category.
+
+        Order matters — more specific matches come before broader ones
+        to avoid false positives (e.g., "Industrial Chemicals" -> Materials, not Industrials).
+        """
+        if not sic_description:
+            return "Unknown"
+        desc = sic_description.lower()
+        # Check specific/compound terms before broad ones
+        if any(w in desc for w in ["real estate", "reit"]):
+            return "Real Estate"
+        if any(w in desc for w in ["software", "computer", "semiconductor", "electronic", "data processing"]):
+            return "Technology"
+        if any(w in desc for w in ["pharmaceutical", "medical", "biological", "health", "surgical"]):
+            return "Healthcare"
+        if any(w in desc for w in ["chemical", "paper", "metal", "steel", "lumber"]):
+            return "Materials"
+        if any(w in desc for w in ["bank", "insurance", "financial", "security broker"]):
+            return "Financials"
+        if any(w in desc for w in ["oil", "gas", "petroleum", "coal", "mining", "crude"]):
+            return "Energy"
+        if any(w in desc for w in ["retail", "restaurant", "hotel", "motor vehicle", "apparel"]):
+            return "Consumer Disc."
+        if any(w in desc for w in ["food", "beverage", "grocery", "tobacco", "household"]):
+            return "Consumer Staples"
+        if any(w in desc for w in ["aircraft", "industrial", "machinery", "construction", "defense"]):
+            return "Industrials"
+        if any(w in desc for w in ["electric", "gas distribution", "water supply", "utility"]):
+            return "Utilities"
+        if any(w in desc for w in ["television", "radio", "cable", "telephone", "communication", "publishing"]):
+            return "Communication"
+        if "investment" in desc or "trust" in desc:
+            return "Financials"
+        return "Other"
 
     async def _get_edgar_data(self, symbol: str) -> dict:
         """Get SEC filings and company info from EDGAR."""
@@ -142,37 +231,13 @@ class FinancialsAggregator:
             return {"filings": [], "company_info": None}
 
     async def _get_news(self, symbol: str) -> list[dict]:
-        """Get news from Polygon news API."""
+        """Get news from Polygon news API via the public client method."""
         try:
-            # Polygon has a news endpoint — /v2/reference/news?ticker=AAPL
-            client = await self._polygon._get_client()
-            resp = await client.get(
-                "/v2/reference/news",
-                params={
-                    "ticker": symbol,
-                    "limit": 15,
-                    "apiKey": self._polygon._api_key,
-                },
-            )
-            if resp.status_code != 200:
-                return []
-
-            data = resp.json()
-            articles = data.get("results", [])
-
-            news_items = []
+            articles = await self._polygon.get_news(symbol, limit=15)
+            # Add sentiment field for each article (Polygon doesn't provide it)
             for article in articles:
-                news_items.append({
-                    "id": article.get("id", ""),
-                    "title": article.get("title", ""),
-                    "source": article.get("publisher", {}).get("name", "Unknown"),
-                    "published_at": article.get("published_utc", ""),
-                    "url": article.get("article_url", ""),
-                    "sentiment": "neutral",  # Polygon doesn't provide sentiment
-                    "tickers": [t for t in article.get("tickers", [])],
-                })
-
-            return news_items
+                article["sentiment"] = "neutral"
+            return articles
         except Exception as e:
             log.error("financials.news_error", symbol=symbol, error=str(e))
             return []
@@ -275,7 +340,35 @@ class FinancialsAggregator:
         else:
             score = 50
 
+        # Derive trend from positive/negative balance
+        if positive_count > negative_count + 1:
+            trend = "rising"
+        elif negative_count > positive_count + 1:
+            trend = "falling"
+        else:
+            trend = "stable"
+
+        # Extract top keywords from headlines
+        from collections import Counter
+        word_counts: Counter[str] = Counter()
+        stop_words = {"the", "a", "an", "is", "in", "at", "to", "for", "of", "and", "on", "by", "with", "from"}
+        for item in news:
+            headline = item.get("title", "")
+            for word in headline.split():
+                cleaned = word.strip(".,!?:;\"'()[]").capitalize()
+                if len(cleaned) > 2 and cleaned.lower() not in stop_words:
+                    word_counts[cleaned] += 1
+        top_keywords = [w for w, _ in word_counts.most_common(7)]
+
+        # Convert score from 0-100 to -1..1 range for Swift sentiment gauge
+        sentiment_score = (score - 50) / 50.0
+
         return {
+            "sentiment_score": sentiment_score,
+            "mention_volume": total,
+            "trend": trend,
+            "top_keywords": top_keywords,
+            # Also include raw data for backward compat
             "overall_sentiment": overall,
             "score": score,
             "positive_count": positive_count,

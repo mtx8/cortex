@@ -39,10 +39,12 @@ def test_build_signal_message():
     msg = bc.build_signal_message(
         signal_type="alpha.entry_signal",
         source_agent="signal_hunter",
+        source_squadron="alpha",
         symbol="AAPL",
         payload={"confidence": 0.85},
     )
     assert msg.type == MessageType.SIGNAL_FIRED
+    assert msg.payload["source_squadron"] == "alpha"
 
 
 def test_build_kill_switch_message():

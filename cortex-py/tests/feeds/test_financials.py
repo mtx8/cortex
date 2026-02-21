@@ -59,35 +59,54 @@ def mock_ws():
 
 @pytest.mark.asyncio
 async def test_get_polygon_data(aggregator, polygon):
-    """Test Polygon data aggregation."""
+    """Test Polygon data aggregation from multiple endpoints."""
     with patch.object(
+        polygon, "get_ticker_details", new_callable=AsyncMock,
+        return_value={
+            "ticker": "AAPL", "name": "Apple Inc.", "market_cap": 2890000000000,
+            "shares_outstanding": 15460000000, "sic_description": "Electronic Computers",
+            "primary_exchange": "XNAS",
+        },
+    ), patch.object(
         polygon, "get_snapshots", new_callable=AsyncMock,
         return_value=[{
-            "ticker": "AAPL",
-            "price": 185.50,
-            "change": 2.50,
-            "change_pct": 1.37,
-            "volume": 50000000,
+            "ticker": "AAPL", "price": 185.50, "change": 2.50,
+            "change_pct": 1.37, "volume": 50000000, "prev_close": 183.0,
         }],
     ), patch.object(
         polygon, "get_previous_close", new_callable=AsyncMock,
         return_value={"ticker": "AAPL", "close": 183.0, "volume": 48000000},
+    ), patch.object(
+        polygon, "get_52_week_range", new_callable=AsyncMock,
+        return_value={"week_52_high": 199.62, "week_52_low": 164.08},
     ):
         result = await aggregator._get_polygon_data("AAPL")
 
     assert result is not None
     assert result["symbol"] == "AAPL"
+    assert result["name"] == "Apple Inc."
     assert result["price"] == 185.50
     assert result["change"] == 2.50
-    assert result["prev_close"] == 183.0
+    assert result["market_cap"] == 2890000000000
+    assert result["week_52_high"] == 199.62
+    assert result["sector"] == "Technology"
     await polygon.close()
 
 
 @pytest.mark.asyncio
 async def test_get_polygon_data_error(aggregator, polygon):
-    """Test Polygon error returns None."""
+    """Test Polygon error returns None when all endpoints fail."""
     with patch.object(
+        polygon, "get_ticker_details", new_callable=AsyncMock,
+        side_effect=Exception("API error"),
+    ), patch.object(
         polygon, "get_snapshots", new_callable=AsyncMock,
+        side_effect=Exception("API error"),
+    ), patch.object(
+        polygon, "get_previous_close", new_callable=AsyncMock,
+        side_effect=Exception("API error"),
+    ), patch.object(
+        polygon, "get_52_week_range", new_callable=AsyncMock,
         side_effect=Exception("API error"),
     ):
         result = await aggregator._get_polygon_data("AAPL")
@@ -97,13 +116,20 @@ async def test_get_polygon_data_error(aggregator, polygon):
 
 
 @pytest.mark.asyncio
-async def test_get_polygon_data_empty_snapshots(aggregator, polygon):
-    """Test Polygon data when snapshots return empty."""
+async def test_get_polygon_data_snapshot_unavailable(aggregator, polygon):
+    """Test Polygon data falls back to prev close when snapshot fails."""
     with patch.object(
-        polygon, "get_snapshots", new_callable=AsyncMock, return_value=[],
+        polygon, "get_ticker_details", new_callable=AsyncMock,
+        return_value={"ticker": "AAPL", "name": "Apple Inc.", "sic_description": ""},
+    ), patch.object(
+        polygon, "get_snapshots", new_callable=AsyncMock,
+        side_effect=Exception("403 Forbidden"),
     ), patch.object(
         polygon, "get_previous_close", new_callable=AsyncMock,
         return_value={"ticker": "AAPL", "close": 183.0, "volume": 48000000},
+    ), patch.object(
+        polygon, "get_52_week_range", new_callable=AsyncMock,
+        return_value={"week_52_high": 0, "week_52_low": 0},
     ):
         result = await aggregator._get_polygon_data("AAPL")
 
@@ -152,39 +178,33 @@ async def test_get_edgar_data_error(aggregator, edgar):
 
 @pytest.mark.asyncio
 async def test_get_news(aggregator, polygon):
-    """Test news fetching from Polygon."""
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {
-        "results": [
-            {
-                "id": "abc123",
-                "title": "Apple Reports Record Earnings",
-                "publisher": {"name": "Reuters"},
-                "published_utc": "2024-11-01T10:00:00Z",
-                "article_url": "https://reuters.com/...",
-                "tickers": ["AAPL"],
-            },
-            {
-                "id": "def456",
-                "title": "iPhone Sales Surge",
-                "publisher": {"name": "Bloomberg"},
-                "published_utc": "2024-10-31T08:00:00Z",
-                "article_url": "https://bloomberg.com/...",
-                "tickers": ["AAPL", "TSM"],
-            },
-        ]
-    }
+    """Test news fetching from Polygon via get_news."""
+    mock_articles = [
+        {
+            "id": "abc123",
+            "title": "Apple Reports Record Earnings",
+            "source": "Reuters",
+            "published_at": "2024-11-01T10:00:00Z",
+            "url": "https://reuters.com/...",
+            "tickers": ["AAPL"],
+        },
+        {
+            "id": "def456",
+            "title": "iPhone Sales Surge",
+            "source": "Bloomberg",
+            "published_at": "2024-10-31T08:00:00Z",
+            "url": "https://bloomberg.com/...",
+            "tickers": ["AAPL", "TSM"],
+        },
+    ]
 
-    mock_http_client = AsyncMock()
-    mock_http_client.get = AsyncMock(return_value=mock_resp)
-
-    with patch.object(polygon, "_get_client", new_callable=AsyncMock, return_value=mock_http_client):
+    with patch.object(polygon, "get_news", new_callable=AsyncMock, return_value=mock_articles):
         news = await aggregator._get_news("AAPL")
 
     assert len(news) == 2
     assert news[0]["title"] == "Apple Reports Record Earnings"
     assert news[0]["source"] == "Reuters"
+    assert news[0]["sentiment"] == "neutral"  # Added by _get_news
     assert news[1]["tickers"] == ["AAPL", "TSM"]
     await polygon.close()
 
@@ -192,10 +212,7 @@ async def test_get_news(aggregator, polygon):
 @pytest.mark.asyncio
 async def test_get_news_error(aggregator, polygon):
     """Test news error returns empty list."""
-    mock_http_client = AsyncMock()
-    mock_http_client.get = AsyncMock(side_effect=Exception("API error"))
-
-    with patch.object(polygon, "_get_client", new_callable=AsyncMock, return_value=mock_http_client):
+    with patch.object(polygon, "get_news", new_callable=AsyncMock, side_effect=Exception("API error")):
         news = await aggregator._get_news("AAPL")
 
     assert news == []
@@ -205,14 +222,7 @@ async def test_get_news_error(aggregator, polygon):
 @pytest.mark.asyncio
 async def test_get_news_empty_response(aggregator, polygon):
     """Test news with no results."""
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"results": []}
-
-    mock_http_client = AsyncMock()
-    mock_http_client.get = AsyncMock(return_value=mock_resp)
-
-    with patch.object(polygon, "_get_client", new_callable=AsyncMock, return_value=mock_http_client):
+    with patch.object(polygon, "get_news", new_callable=AsyncMock, return_value=[]):
         news = await aggregator._get_news("AAPL")
 
     assert news == []
