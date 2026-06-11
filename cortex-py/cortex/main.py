@@ -640,6 +640,7 @@ def create_app_components() -> dict:
     from cortex.api.ws_broadcaster import WSBroadcaster
     from cortex.connectors.polygon.rest_client import PolygonRESTClient
     from cortex.feeds.market_data import MarketDataFeed
+    from cortex.feeds.scanner_engine import ScannerEngine
     from cortex.intelligence.chat import CortexChat
     from cortex.intelligence.providers import build_router
     from cortex.feeds.status_broadcaster import StatusBroadcaster
@@ -665,6 +666,13 @@ def create_app_components() -> dict:
 
     bus = SignalBus()
     autonomy = AutonomyDial()
+
+    # Local-first LLM router (local Ollama/MLX -> Claude -> Gemini, offline_only aware).
+    # Built early so squadrons (e.g. DELTA news sentiment) can use it.
+    llm_router = build_router(config)
+
+    # Rust-accelerated technical scanner engine.
+    scanner_engine = ScannerEngine()
 
     # ECHO squadron
     kill_switch = KillSwitchCommander(bus=bus)
@@ -721,7 +729,7 @@ def create_app_components() -> dict:
     orchestrator.register_agent(harvest_bot)
 
     # DELTA squadron
-    news_catalyst = NewsCatalyst(bus=bus)
+    news_catalyst = NewsCatalyst(bus=bus, llm_router=llm_router)
     orchestrator.register_agent(news_catalyst)
 
     # GOLF squadron — Adaptive Learning
@@ -787,9 +795,6 @@ def create_app_components() -> dict:
         model=config.claude_model,
         bus=bus,
     )
-
-    # Local-first LLM router (local Ollama/MLX -> Claude -> Gemini, offline_only aware)
-    llm_router = build_router(config)
 
     # SEC EDGAR client (free, no API key needed)
     edgar_client = EDGARClient()
@@ -885,6 +890,7 @@ def create_app_components() -> dict:
         "maritime_analyst": maritime_analyst,
         "geo_risk_mapper": geo_risk_mapper,
         "llm_router": llm_router,
+        "scanner_engine": scanner_engine,
     }
 
 

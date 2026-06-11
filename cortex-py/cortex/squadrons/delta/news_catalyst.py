@@ -115,10 +115,14 @@ class NewsCatalyst(BaseAgent):
     squadron = "delta"
     subscriptions = [SignalTypes.NEWS_CATALYST]
 
-    def __init__(self, bus: SignalBus):
+    def __init__(self, bus: SignalBus, llm_router=None):
         super().__init__(bus)
         self._recent: deque[dict] = deque(maxlen=500)
         self._items_processed: int = 0
+        # Optional local-first LLM sentiment (Ollama/MLX -> Claude -> Gemini).
+        # When absent, the deterministic keyword scorer is used (and is the fallback).
+        self._llm = llm_router
+        self._llm_scored = 0
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -144,6 +148,43 @@ class NewsCatalyst(BaseAgent):
             confidence=abs(score),
         )
 
+    async def score_sentiment_llm(self, text: str) -> SentimentScore:
+        """LLM-based sentiment via the local-first router, with a keyword fallback
+        on any failure / unavailability. Returns a SentimentScore in [-1, 1]."""
+        if self._llm is None:
+            return self.score_sentiment(text)
+        try:
+            res = await self._llm.complete(
+                prompt=f"Headline: {text}",
+                system=("You are a financial-markets sentiment classifier. Rate the "
+                        "headline from -1.0 (very bearish) to 1.0 (very bullish). "
+                        "Respond with ONLY the number."),
+                max_tokens=8,
+                temperature=0.0,
+            )
+            if res is None:
+                return self.score_sentiment(text)
+            score = self._parse_score(res.text)
+            if score is None:
+                return self.score_sentiment(text)
+            self._llm_scored += 1
+            label = "positive" if score > 0.1 else ("negative" if score < -0.1 else "neutral")
+            return SentimentScore(score=score, label=label, confidence=abs(score))
+        except Exception as e:  # never let the LLM path break the news loop
+            log.warning("news_catalyst.llm_error", error=str(e))
+            return self.score_sentiment(text)
+
+    @staticmethod
+    def _parse_score(text: str) -> float | None:
+        import re
+        m = re.search(r"-?\d+(?:\.\d+)?", text or "")
+        if not m:
+            return None
+        try:
+            return max(-1.0, min(1.0, float(m.group())))
+        except ValueError:
+            return None
+
     def detect_catalyst(self, item: NewsItem) -> CatalystType:
         """Detect the catalyst type from a news headline via keyword matching."""
         headline_lower = item.headline.lower()
@@ -162,13 +203,14 @@ class NewsCatalyst(BaseAgent):
 
         return CatalystType.UNKNOWN
 
-    def process_item(self, item: NewsItem) -> dict | None:
+    def process_item(self, item: NewsItem, sentiment: SentimentScore | None = None) -> dict | None:
         """Score + classify a news item. Returns dict if actionable, else None.
 
         An item is actionable when it has at least one symbol and
-        abs(sentiment score) > 0.1.
+        abs(sentiment score) > 0.1. A precomputed `sentiment` (e.g. from the LLM
+        path) is used as-is; otherwise the deterministic keyword scorer runs.
         """
-        sentiment = self.score_sentiment(item.headline)
+        sentiment = sentiment or self.score_sentiment(item.headline)
         catalyst = self.detect_catalyst(item)
 
         if not item.symbols or abs(sentiment.score) <= 0.1:
@@ -215,7 +257,9 @@ class NewsCatalyst(BaseAgent):
             url=url,
         )
 
-        result = self.process_item(item)
+        # Prefer local-first LLM sentiment when a router is wired; keyword fallback.
+        sentiment = await self.score_sentiment_llm(headline) if self._llm is not None else None
+        result = self.process_item(item, sentiment=sentiment)
         if result:
             log.info(
                 "news_catalyst.processed",
@@ -234,5 +278,7 @@ class NewsCatalyst(BaseAgent):
         base.update({
             "items_processed": self._items_processed,
             "recent_count": len(self._recent),
+            "llm_scored": self._llm_scored,
+            "llm_enabled": self._llm is not None,
         })
         return base
