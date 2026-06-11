@@ -33,6 +33,12 @@ class MessageType(str, Enum):
     FINANCIALS_AI_ANALYSIS = "financials_ai_analysis"
     FINANCIALS_ERROR = "financials_error"
 
+    # Geo-intelligence (physical alpha — vessels, events, chokepoints, heatmaps)
+    GEO_POSITION = "geo_position"
+    GEO_SIGNAL = "geo_signal"
+    GEO_CHOKEPOINT = "geo_chokepoint"
+    GEO_HEATMAP = "geo_heatmap"
+
     # Trade View
     L2_UPDATE = "l2_update"
     TIME_SALES = "time_sales"

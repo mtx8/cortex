@@ -58,6 +58,17 @@ class SignalTypes:
     EXECUTION_RECOMMENDATION = "hotel.execution_recommendation"
     LATENCY_ALERT = "hotel.latency_alert"
 
+    # INDIA -> ECHO, GOLF, intelligence (geospatial alt-data / physical alpha)
+    GEO_VESSEL_BATCH = "india.geo_vessel_batch"          # feed -> analyst (raw AIS snapshot)
+    GEO_VESSEL_POSITION = "india.geo_vessel_position"
+    GEO_PHYSICAL_ALPHA = "india.geo_physical_alpha"       # actionable: tanker/supply -> tickers
+    GEO_FLOATING_STORAGE = "india.geo_floating_storage"
+    GEO_CHOKEPOINT_CONGESTION = "india.geo_chokepoint_congestion"
+    GEO_DARK_SHIP = "india.geo_dark_ship"
+    GEO_SEISMIC = "india.geo_seismic"                     # feed -> risk mapper
+    GEO_SEISMIC_PROXIMITY = "india.geo_seismic_proximity" # quake near an energy asset
+    EGRESS_VALIDATION_FAILED = "india.egress_failed"
+
     # System
     AGENT_HEALTH = "system.agent_health"
     STRATEGY_UPDATE = "intelligence.strategy_update"

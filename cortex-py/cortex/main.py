@@ -38,6 +38,12 @@ async def lifespan(app: FastAPI):
     if market_feed is not None:
         feed_task = asyncio.create_task(market_feed.start())
 
+    # Start geo-intelligence feed if available (maritime AIS + seismic)
+    geo_task = None
+    geo_feed = components.get("geo_feed")
+    if geo_feed is not None:
+        geo_task = asyncio.create_task(geo_feed.start())
+
     # Start status broadcaster if available
     status_task = None
     status_broadcaster = components.get("status_broadcaster")
@@ -62,6 +68,15 @@ async def lifespan(app: FastAPI):
         feed_task.cancel()
         try:
             await feed_task
+        except asyncio.CancelledError:
+            pass
+
+    if geo_feed is not None:
+        await geo_feed.stop()
+    if geo_task is not None:
+        geo_task.cancel()
+        try:
+            await geo_task
         except asyncio.CancelledError:
             pass
 
@@ -627,6 +642,10 @@ def create_app_components() -> dict:
     from cortex.feeds.market_data import MarketDataFeed
     from cortex.intelligence.chat import CortexChat
     from cortex.feeds.status_broadcaster import StatusBroadcaster
+    from cortex.connectors.geo.client import GeoEgressClient
+    from cortex.feeds.geo_feed import GeoIntelligenceFeed
+    from cortex.squadrons.india.maritime_analyst import MaritimeAnalyst
+    from cortex.squadrons.india.geo_risk_mapper import GeoRiskMapper
     from cortex.connectors.ibkr.client import IBKRConnectionManager, IBKRConfig
     from cortex.connectors.ibkr.rate_limiter import IBKRRateLimiter
     from cortex.connectors.sec.edgar_client import EDGARClient
@@ -748,6 +767,13 @@ def create_app_components() -> dict:
     latency_monitor = LatencyMonitor(bus=bus)
     orchestrator.register_agent(latency_monitor)
 
+    # INDIA squadron — Geospatial alt-data / physical alpha
+    maritime_analyst = MaritimeAnalyst(bus=bus)
+    orchestrator.register_agent(maritime_analyst)
+
+    geo_risk_mapper = GeoRiskMapper(bus=bus)
+    orchestrator.register_agent(geo_risk_mapper)
+
     # WebSocket broadcaster
     broadcaster = WSBroadcaster(bus=bus)
 
@@ -786,6 +812,16 @@ def create_app_components() -> dict:
         broadcaster=broadcaster,
         bus=bus,
         status_broadcaster=status_broadcaster,
+    )
+
+    # Geo-intelligence feed (maritime AIS + seismic through the hardened Rust egress)
+    geo_client = GeoEgressClient()
+    geo_feed = GeoIntelligenceFeed(
+        geo_client=geo_client,
+        broadcaster=broadcaster,
+        bus=bus,
+        poll_interval=config.geo_poll_interval,
+        enabled=config.geo_enabled,
     )
 
     # IBKR (optional — only if TWS/Gateway is running)
@@ -840,6 +876,10 @@ def create_app_components() -> dict:
         "learning_tracker": learning_tracker,
         "level2_feed": level2_feed,
         "options_feed": options_feed,
+        "geo_client": geo_client,
+        "geo_feed": geo_feed,
+        "maritime_analyst": maritime_analyst,
+        "geo_risk_mapper": geo_risk_mapper,
     }
 
 

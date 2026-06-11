@@ -20,8 +20,14 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-/// Hard cap on any single response body. Streamed + aborted past this.
+/// Default cap on any single response body. Streamed + aborted past this.
 pub const MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// Absolute ceiling a caller may raise the per-request cap to. Even a buggy or
+/// compromised backend caller cannot request an unbounded body (anti-OOM/DoS).
+/// Large trusted feeds (e.g. a full regional AIS snapshot) opt into a higher cap
+/// up to this ceiling; the WebView never calls egress directly.
+pub const MAX_BYTES_CEILING: usize = 32 * 1024 * 1024;
 
 /// Exact, lowercase host allowlist. `https` only. Each entry is documented with
 /// what it returns and why it is trusted (security requirement). Derived from
@@ -146,7 +152,9 @@ pub async fn guarded_get(
     url: &str,
     headers: Option<HashMap<String, String>>,
     timeout_ms: u64,
+    max_bytes: usize,
 ) -> Result<FetchOutcome, GeoError> {
+    let cap = max_bytes.clamp(64 * 1024, MAX_BYTES_CEILING);
     let parsed = reqwest::Url::parse(url).map_err(|_| GeoError::InvalidUrl)?;
     if parsed.scheme() != "https" {
         return Err(GeoError::BadScheme);
@@ -194,8 +202,8 @@ pub async fn guarded_get(
     let mut truncated = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| GeoError::Request(classify(&e).into()))?;
-        if buf.len() + chunk.len() > MAX_BYTES {
-            let take = MAX_BYTES.saturating_sub(buf.len());
+        if buf.len() + chunk.len() > cap {
+            let take = cap.saturating_sub(buf.len());
             buf.extend_from_slice(&chunk[..take]);
             truncated = true;
             break;
@@ -247,15 +255,16 @@ impl FetchResult {
 /// call it inside `await loop.run_in_executor(None, geo_fetch, url, ...)` so the
 /// asyncio event loop is never blocked. The GIL is released while in flight.
 #[pyfunction]
-#[pyo3(signature = (url, headers=None, timeout_ms=8000))]
+#[pyo3(signature = (url, headers=None, timeout_ms=8000, max_bytes=MAX_BYTES))]
 pub fn geo_fetch(
     py: Python<'_>,
     url: String,
     headers: Option<HashMap<String, String>>,
     timeout_ms: u64,
+    max_bytes: usize,
 ) -> PyResult<FetchResult> {
     let outcome = py.allow_threads(|| {
-        RUNTIME.block_on(async { guarded_get(&CLIENT, &url, headers, timeout_ms).await })
+        RUNTIME.block_on(async { guarded_get(&CLIENT, &url, headers, timeout_ms, max_bytes).await })
     })?;
     Ok(FetchResult {
         status: outcome.status,
@@ -314,14 +323,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_http_scheme_before_request() {
         let c = reqwest::Client::new();
-        let r = guarded_get(&c, "http://earthquake.usgs.gov/x", None, 3000).await;
+        let r = guarded_get(&c, "http://earthquake.usgs.gov/x", None, 3000, MAX_BYTES).await;
         assert!(matches!(r, Err(GeoError::BadScheme)));
     }
 
     #[tokio::test]
     async fn rejects_disallowed_host_before_request() {
         let c = reqwest::Client::new();
-        let r = guarded_get(&c, "https://attacker.example/secret", None, 3000).await;
+        let r = guarded_get(&c, "https://attacker.example/secret", None, 3000, MAX_BYTES).await;
         assert!(matches!(r, Err(GeoError::HostNotAllowed(_))));
     }
 }

@@ -31,6 +31,14 @@ class CortexConfig(BaseSettings):
     claude_model: str = "claude-opus-4-6"
     strategic_cycle_seconds: int = 300
 
+    # Geo-intelligence (physical alpha — maritime AIS, seismic, chokepoints)
+    geo_enabled: bool = True
+    geo_poll_interval: float = 60.0
+    # Free, keyless live AIS spine (Baltic). AISStream (global) needs a key.
+    aisstream_api_key: str = ""
+    eia_api_key: str = ""          # EIA petroleum status / chokepoint volumes
+    fred_api_key: str = ""         # FRED yield curve / econ series
+
     # Risk defaults
     max_position_pct: float = 5.0
     max_single_trade_loss_usd: float = 500.0
