@@ -23,6 +23,7 @@ public final class AppEnvironment {
     public let options = OptionsStore()
     public let simulation = SimulationStore()
     public let alerts = AlertStore()
+    public let geoIntelligence = GeoIntelligenceStore()
 
     public init() {
         // Stores populate from WebSocket when backend is connected.

@@ -133,6 +133,8 @@ struct ContentView: View {
             SquadronsDetailView(squadrons: environment.squadrons, webSocket: environment.webSocket)
         case .performance:
             PerformanceDashboardView(store: environment.performance)
+        case .geoIntelligence:
+            GeoIntelligenceView(store: environment.geoIntelligence)
         case .settings:
             SettingsView(settings: environment.settings)
         }

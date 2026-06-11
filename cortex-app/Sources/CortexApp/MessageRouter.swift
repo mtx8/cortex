@@ -66,6 +66,18 @@ public final class MessageRouter {
                 payload: payload["meta"] as? [String: String] ?? [:]
             )
             environment.signalFeed.append(signal)
+            // Geo physical-alpha signals (india.geo_*) also feed the globe panel.
+            if let st = payload["signal_type"] as? String, st.hasPrefix("india.geo") {
+                environment.geoIntelligence.applyBusSignal(type: st, payload)
+            }
+
+        // MARK: - Geo-Intelligence (maritime AIS + seismic)
+
+        case "geo_position":
+            environment.geoIntelligence.applyVessels(payload)
+
+        case "geo_signal":
+            environment.geoIntelligence.applyEvents(payload)
 
         case "kill_switch_status":
             let active = payload["active"] as? Bool ?? false

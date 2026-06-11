@@ -35,6 +35,7 @@ public enum AppTab: String, CaseIterable, Identifiable {
     case watchlist = "Watchlist"
     case squadrons = "Squadrons"
     case performance = "Performance"
+    case geoIntelligence = "Geo Intel"
     case settings = "Settings"
 
     public var id: String { rawValue }
@@ -49,6 +50,7 @@ public enum AppTab: String, CaseIterable, Identifiable {
         case .watchlist: return "eye.circle.fill"
         case .squadrons: return "person.3.sequence.fill"
         case .performance: return "chart.bar.xaxis"
+        case .geoIntelligence: return "globe.americas.fill"
         case .settings: return "gearshape.2.fill"
         }
     }
@@ -63,6 +65,7 @@ public enum AppTab: String, CaseIterable, Identifiable {
         case .watchlist: return "6"
         case .squadrons: return "7"
         case .performance: return "8"
+        case .geoIntelligence: return "0"
         case .settings: return "9"
         }
     }
@@ -134,6 +137,14 @@ public enum AppTab: String, CaseIterable, Identifiable {
                 ("chart.line.uptrend.xyaxis", "Equity Curve"),
                 ("list.number", "Trade Log"),
                 ("doc.text", "Tax Report"),
+            ]
+        case .geoIntelligence:
+            return [
+                ("globe.americas.fill", "Live Globe"),
+                ("ferry.fill", "Tanker Tracking"),
+                ("arrow.triangle.merge", "Chokepoints"),
+                ("bolt.horizontal.circle", "Physical Alpha"),
+                ("waveform.path.ecg", "Seismic Risk"),
             ]
         case .settings:
             return [
