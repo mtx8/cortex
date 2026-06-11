@@ -39,6 +39,16 @@ class CortexConfig(BaseSettings):
     eia_api_key: str = ""          # EIA petroleum status / chokepoint volumes
     fred_api_key: str = ""         # FRED yield curve / econ series
 
+    # Local-first LLM stack — router tries providers in order, falling back.
+    # Claude stays strategic-cycle only (rule #5/#7); no LLM in the hot path.
+    llm_provider_order: str = "local,claude,gemini"
+    llm_offline_only: bool = False          # hard-disable ALL cloud LLM egress
+    local_llm_base_url: str = "http://127.0.0.1:11434/v1"   # Ollama OpenAI-compatible
+    local_llm_model: str = "qwen2.5:7b-instruct"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.5-flash"
+    embedding_model: str = "nomic-embed-text"
+
     # Risk defaults
     max_position_pct: float = 5.0
     max_single_trade_loss_usd: float = 500.0

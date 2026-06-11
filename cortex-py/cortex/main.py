@@ -641,6 +641,7 @@ def create_app_components() -> dict:
     from cortex.connectors.polygon.rest_client import PolygonRESTClient
     from cortex.feeds.market_data import MarketDataFeed
     from cortex.intelligence.chat import CortexChat
+    from cortex.intelligence.providers import build_router
     from cortex.feeds.status_broadcaster import StatusBroadcaster
     from cortex.connectors.geo.client import GeoEgressClient
     from cortex.feeds.geo_feed import GeoIntelligenceFeed
@@ -787,6 +788,9 @@ def create_app_components() -> dict:
         bus=bus,
     )
 
+    # Local-first LLM router (local Ollama/MLX -> Claude -> Gemini, offline_only aware)
+    llm_router = build_router(config)
+
     # SEC EDGAR client (free, no API key needed)
     edgar_client = EDGARClient()
 
@@ -880,6 +884,7 @@ def create_app_components() -> dict:
         "geo_feed": geo_feed,
         "maritime_analyst": maritime_analyst,
         "geo_risk_mapper": geo_risk_mapper,
+        "llm_router": llm_router,
     }
 
 
