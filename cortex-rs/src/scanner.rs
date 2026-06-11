@@ -28,7 +28,7 @@ impl ScanResult {
     }
 
     fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let dict = pyo3::types::PyDict::new_bound(py);
+        let dict = pyo3::types::PyDict::new(py);
         dict.set_item("symbol", &self.symbol)?;
         dict.set_item("composite_score", self.composite_score)?;
         dict.set_item("momentum_score", self.momentum_score)?;

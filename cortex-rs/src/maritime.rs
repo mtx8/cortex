@@ -145,7 +145,7 @@ pub fn floating_storage_index(
     }
     let sat = if saturation <= 0.0 { 1.0 } else { saturation };
     let index_score = ((count as f64 / sat) * 100.0).min(100.0);
-    let d = PyDict::new_bound(py);
+    let d = PyDict::new(py);
     d.set_item("count", count)?;
     d.set_item("total", n)?;
     d.set_item("index_score", index_score)?;
@@ -206,7 +206,7 @@ pub fn chokepoint_congestion(
         let weight = (c.throughput_mbd / 20.5).min(1.0); // Hormuz = 1.0
         let congestion_score = (density * 0.5 + speed_factor * 0.5) * weight * 100.0;
 
-        let d = PyDict::new_bound(py);
+        let d = PyDict::new(py);
         d.set_item("name", c.name)?;
         d.set_item("vessel_count", counts[idx])?;
         d.set_item("tanker_count", tankers[idx])?;

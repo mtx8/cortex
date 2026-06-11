@@ -34,7 +34,7 @@ pub struct GeoEvent {
 #[pymethods]
 impl GeoEvent {
     fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let d = PyDict::new_bound(py);
+        let d = PyDict::new(py);
         d.set_item("source", &self.source)?;
         d.set_item("kind", &self.kind)?;
         d.set_item("id", &self.id)?;

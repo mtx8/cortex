@@ -263,7 +263,9 @@ pub fn geo_fetch(
     timeout_ms: u64,
     max_bytes: usize,
 ) -> PyResult<FetchResult> {
-    let outcome = py.allow_threads(|| {
+    // pyo3 0.29: detach from the interpreter (formerly allow_threads) so the
+    // asyncio thread-pool executor isn't blocked while the request is in flight.
+    let outcome = py.detach(|| {
         RUNTIME.block_on(async { guarded_get(&CLIENT, &url, headers, timeout_ms, max_bytes).await })
     })?;
     Ok(FetchResult {

@@ -82,7 +82,7 @@ pub fn chokepoint_at(lat: f64, lon: f64) -> Option<String> {
 pub fn chokepoints(py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
     let mut out = Vec::with_capacity(CHOKEPOINTS.len());
     for c in CHOKEPOINTS {
-        let d = PyDict::new_bound(py);
+        let d = PyDict::new(py);
         d.set_item("name", c.name)?;
         d.set_item("lat", c.lat)?;
         d.set_item("lon", c.lon)?;
