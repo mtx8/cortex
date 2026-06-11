@@ -4,7 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "cortex-scanner"
+version = "0.2.0"
 requires-python = ">=3.12"
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+# Crate feature (maps to pyo3/extension-module). Keeping it as the crate feature
+# — not pyo3/extension-module directly — lets `cargo build`/`cargo test` link
+# libpython normally while maturin builds the libpython-less extension.
+features = ["extension-module"]

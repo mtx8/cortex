@@ -1,15 +1,32 @@
 [package]
 name = "cortex-scanner"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
 name = "cortex_scanner"
-crate-type = ["cdylib"]
+# rlib so `cargo test` can build a test harness without the extension-module
+# (libpython-less) linking path; cdylib is the artifact maturin ships.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# maturin builds with this on (see pyproject.toml) so pyo3 uses macOS
+# `-undefined dynamic_lookup` and does NOT link libpython into the extension.
+# `cargo build` / `cargo test` run WITHOUT it so they link libpython normally.
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22", features = ["macros"] }
 rayon = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "stream"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
 
 [profile.release]
 opt-level = 3
