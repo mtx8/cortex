@@ -35,6 +35,9 @@ USGS_WINDOWS = {
 # Digitraffic Baltic AIS — free, keyless, no bbox required. Our live tanker spine
 # until an AISStream key is provided for global coverage.
 DIGITRAFFIC_AIS_LOCATIONS = "https://meri.digitraffic.fi/api/ais/v1/locations"
+# Static vessel metadata (shipType / draught / name) keyed by MMSI — the locations
+# endpoint omits these, so we enrich with this for real tanker classification.
+DIGITRAFFIC_AIS_VESSELS = "https://meri.digitraffic.fi/api/ais/v1/vessels"
 
 
 class GeoEgressClient:
@@ -103,6 +106,42 @@ class GeoEgressClient:
         except ValueError as e:
             log.warning("geo.ais_parse", error=str(e))
             return []
+
+    async def fetch_ais_metadata(self) -> dict[int, dict]:
+        """Fetch static vessel metadata keyed by MMSI: {mmsi: {ship_type, draught_m,
+        name}}. The locations endpoint omits ship type, so this is what makes tanker
+        classification real. Refreshed infrequently (static data). Returns {} on any
+        failure so the feed degrades to position-only."""
+        if _cs is None:
+            return {}
+        res = await self._fetch(DIGITRAFFIC_AIS_VESSELS, max_bytes=self._AIS_MAX_BYTES)
+        if not res.ok or res.truncated:
+            if res.truncated:
+                log.warning("geo.ais_meta_truncated", bytes=len(res.body))
+            return {}
+        try:
+            import orjson
+            data = orjson.loads(res.body)
+        except Exception as e:
+            log.warning("geo.ais_meta_parse", error=str(e))
+            return {}
+        out: dict[int, dict] = {}
+        if isinstance(data, list):
+            for v in data:
+                if not isinstance(v, dict):
+                    continue
+                mmsi = v.get("mmsi")
+                if mmsi is None:
+                    continue
+                try:
+                    out[int(mmsi)] = {
+                        "ship_type": int(v.get("shipType", 0) or 0),
+                        "draught_m": float(v.get("draught", 0) or 0) / 10.0,  # decimetres -> m
+                        "name": (v.get("name") or "").strip(),
+                    }
+                except (TypeError, ValueError):
+                    continue
+        return out
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
 

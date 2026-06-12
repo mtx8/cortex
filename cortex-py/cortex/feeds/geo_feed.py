@@ -24,22 +24,51 @@ from cortex.orchestrator.signals import SignalTypes
 
 log = structlog.get_logger()
 
+try:
+    import cortex_scanner as _cs  # type: ignore
+except ImportError:  # pragma: no cover
+    _cs = None
+
 # Earthquakes below this magnitude are ignored for trading-risk purposes.
 _MIN_SEISMIC_MAG = 4.5
+# Static vessel metadata is refreshed every N polls (it changes rarely).
+_META_REFRESH_EVERY = 30
 
 
-def _vessel_to_dict(v) -> dict:
+def _category(ship_type: int) -> str:
+    if _cs is not None:
+        return _cs.ship_type_category(ship_type)
+    return "tanker" if 80 <= ship_type <= 89 else "unknown"
+
+
+def _vessel_to_dict(v, meta: dict | None = None) -> dict:
+    ship_type = v.ship_type
+    is_tanker = v.is_tanker
+    category = v.category
+    draught = v.draught
+    name = v.name
+    # Enrich position-only locations with static metadata (real ship type).
+    if meta:
+        m = meta.get(v.mmsi)
+        if m and m.get("ship_type"):
+            ship_type = m["ship_type"]
+            is_tanker = 80 <= ship_type <= 89
+            category = _category(ship_type)
+            if m.get("draught_m"):
+                draught = m["draught_m"]
+            if m.get("name"):
+                name = m["name"]
     return {
         "mmsi": v.mmsi,
         "lat": v.lat,
         "lon": v.lon,
         "speed_knots": v.speed_knots,
         "heading": v.heading,
-        "ship_type": v.ship_type,
-        "category": v.category,
-        "is_tanker": v.is_tanker,
-        "name": v.name,
-        "draught": v.draught,
+        "ship_type": ship_type,
+        "category": category,
+        "is_tanker": is_tanker,
+        "name": name,
+        "draught": draught,
         "chokepoint": v.chokepoint,
         "timestamp_ms": v.timestamp_ms,
     }
@@ -79,6 +108,7 @@ class GeoIntelligenceFeed:
         self._poll_count = 0
         self._last_vessels: list[dict] = []
         self._last_events: list[dict] = []
+        self._ais_meta: dict[int, dict] = {}
         self._warned_unavailable = False
 
     @property
@@ -94,6 +124,15 @@ class GeoIntelligenceFeed:
         return list(self._last_vessels)
 
     async def _poll_once(self) -> None:
+        # Refresh static vessel metadata periodically (gives real ship types).
+        if not self._ais_meta or self._poll_count % _META_REFRESH_EVERY == 0:
+            try:
+                meta = await self._geo.fetch_ais_metadata()
+                if meta:
+                    self._ais_meta = meta
+            except Exception as e:
+                log.warning("geo_feed.ais_meta_error", error=str(e))
+
         # Maritime AIS → batch signal + Swift positions.
         try:
             vessels = await self._geo.fetch_ais_vessels()
@@ -102,7 +141,7 @@ class GeoIntelligenceFeed:
             vessels = []
 
         if vessels:
-            vdicts = [_vessel_to_dict(v) for v in vessels]
+            vdicts = [_vessel_to_dict(v, self._ais_meta) for v in vessels]
             self._last_vessels = vdicts
             tankers = sum(1 for d in vdicts if d["is_tanker"])
 
