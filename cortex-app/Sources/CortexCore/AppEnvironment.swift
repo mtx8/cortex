@@ -24,6 +24,7 @@ public final class AppEnvironment {
     public let simulation = SimulationStore()
     public let alerts = AlertStore()
     public let geoIntelligence = GeoIntelligenceStore()
+    public let macroRates = MacroRatesStore()
 
     public init() {
         // Stores populate from WebSocket when backend is connected.

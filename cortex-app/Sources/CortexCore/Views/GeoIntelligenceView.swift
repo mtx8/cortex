@@ -6,9 +6,11 @@ import SwiftUI
 /// signal feed (the alpha Bloomberg cannot natively produce).
 public struct GeoIntelligenceView: View {
     let store: GeoIntelligenceStore
+    let rates: MacroRatesStore?
 
-    public init(store: GeoIntelligenceStore) {
+    public init(store: GeoIntelligenceStore, rates: MacroRatesStore? = nil) {
         self.store = store
+        self.rates = rates
     }
 
     public var body: some View {
@@ -60,6 +62,7 @@ public struct GeoIntelligenceView: View {
     private var panel: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: CortexDesign.sectionSpacing) {
+                if let rates { ratesCard(rates) }
                 floatingStorageCard
                 congestionSection
                 alphaSection
@@ -147,6 +150,40 @@ public struct GeoIntelligenceView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.vertical, 5)
                     Divider().overlay(CortexDesign.border)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(CortexDesign.cardPadding)
+        .background(CortexDesign.cardBackground())
+    }
+
+    private func ratesCard(_ r: MacroRatesStore) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("U.S. TREASURY RATES").font(CortexDesign.sectionFont)
+                    .foregroundStyle(CortexDesign.neutral)
+                Spacer()
+                if let s = r.spreadBps {
+                    Text(r.inverted ? "INVERTED \(Int(s))bp" : "\(Int(s))bp")
+                        .font(CortexDesign.badgeFont)
+                        .foregroundStyle(r.inverted ? CortexDesign.loss : CortexDesign.neutral)
+                }
+            }
+            if r.rates.isEmpty {
+                Text("Awaiting rates…").font(CortexDesign.labelFont)
+                    .foregroundStyle(CortexDesign.neutral)
+            } else {
+                ForEach(r.rates, id: \.name) { row in
+                    HStack {
+                        Text(row.name).font(CortexDesign.dataFont).foregroundStyle(Color(white: 0.85))
+                        Spacer()
+                        Text(String(format: "%.2f%%", row.pct)).font(CortexDesign.dataFont)
+                            .foregroundStyle(CortexDesign.accentPrimary)
+                    }
+                }
+                if !r.date.isEmpty {
+                    Text(r.date).font(CortexDesign.badgeFont).foregroundStyle(CortexDesign.neutral)
                 }
             }
         }

@@ -79,6 +79,9 @@ public final class MessageRouter {
         case "geo_signal":
             environment.geoIntelligence.applyEvents(payload)
 
+        case "macro_rates":
+            environment.macroRates.apply(payload)
+
         case "kill_switch_status":
             let active = payload["active"] as? Bool ?? false
             if active {

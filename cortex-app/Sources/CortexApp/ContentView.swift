@@ -10,6 +10,7 @@ struct ContentView: View {
     @State private var isAIPaneVisible: Bool = false
     @State private var isAIPaneFullscreen: Bool = false
     @State private var isHoveringDivider: Bool = false
+    @State private var showCommandPalette: Bool = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -99,6 +100,11 @@ struct ContentView: View {
         }
         .background(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
         .background { keyboardShortcuts }
+        .overlay {
+            if showCommandPalette {
+                CommandPalette(isPresented: $showCommandPalette) { tab in selectedTab = tab }
+            }
+        }
         .onChange(of: selectedTab) { _, newTab in
             selectedSection = newTab.defaultSection
             // Clear selected symbol when leaving stock-specific tabs
@@ -134,7 +140,7 @@ struct ContentView: View {
         case .performance:
             PerformanceDashboardView(store: environment.performance)
         case .geoIntelligence:
-            GeoIntelligenceView(store: environment.geoIntelligence)
+            GeoIntelligenceView(store: environment.geoIntelligence, rates: environment.macroRates)
         case .settings:
             SettingsView(settings: environment.settings)
         }
@@ -186,6 +192,12 @@ struct ContentView: View {
         }
         .keyboardShortcut("/", modifiers: .command)
         .hidden()
+
+        // Cmd+Shift+P: Command palette (Bloomberg-style mnemonic line; ⌘K is the
+        // kill switch, so the palette uses ⌘⇧P).
+        Button("") { showCommandPalette = true }
+            .keyboardShortcut("p", modifiers: [.command, .shift])
+            .hidden()
 
         // Cmd+1 through Cmd+9: Switch tabs
         ForEach(AppTab.allCases) { tab in
