@@ -210,6 +210,78 @@ async def test_pipeline_notional_cap_rejects_expensive():
     assert any("hard cap" in r for r in order.rejections)
 
 
+def make_pipeline_with_geo(geo_context):
+    bus = SignalBus()
+    guardian = RiskGuardian(
+        bus=bus,
+        kill_switch_check=lambda: False,
+        pre_trade=PreTradeCheck(max_position_pct=5.0, max_concurrent=15, max_daily_trades=50),
+        position_sizer=PositionSizer(max_position_pct=5.0, max_single_loss_usd=500.0),
+        drawdown_shield=DrawdownShield(),
+        geo_context=geo_context,
+    )
+    return TradePipeline(bus=bus, risk_guardian=guardian)
+
+
+@pytest.mark.asyncio
+async def test_pipeline_geo_caution_flags_and_shrinks():
+    """A geo-caution symbol gets a smaller pipeline order and a review flag, but
+    geo never loosens risk or bypasses the hard $500 notional cap."""
+    from cortex.squadrons.echo.geo_risk_context import GeoRiskContext
+
+    geo = GeoRiskContext()
+
+    # Baseline order (no geo) for comparison.
+    base_pipeline = make_pipeline_with_geo(geo)
+    base = await base_pipeline.process_entry_signal(
+        symbol="CL", asset_class="equity", side="buy",
+        entry_price=10.0, stop_loss=9.0,
+        source_signal_id="g0", source_agent="test", nav=500_000.0,
+    )
+    assert base.stage == PipelineStage.SUBMITTED
+    assert base.flags == []
+
+    # Now inject extreme geo caution for CL and re-run.
+    geo.ingest_signal("india.geo_physical_alpha", {
+        "signal": "floating_storage", "severity": 0.95,
+        "tickers": [{"symbol": "CL", "direction": "short", "rationale": "storage"}],
+    })
+    geo_pipeline = make_pipeline_with_geo(geo)
+    order = await geo_pipeline.process_entry_signal(
+        symbol="CL", asset_class="equity", side="buy",
+        entry_price=10.0, stop_loss=9.0,
+        source_signal_id="g1", source_agent="test", nav=500_000.0,
+    )
+    assert order.stage == PipelineStage.SUBMITTED        # still a valid order
+    assert order.quantity <= base.quantity               # geo only shrinks
+    assert any("geo_caution" in f for f in order.flags)  # flagged for review
+    assert order.quantity * 10.0 <= TradePipeline.HARD_MAX_NOTIONAL  # cap intact
+
+
+@pytest.mark.asyncio
+async def test_pipeline_geo_does_not_rescue_halted():
+    """Even extreme geo caution can't push an order through when halted."""
+    from cortex.squadrons.echo.geo_risk_context import GeoRiskContext
+
+    geo = GeoRiskContext()
+    geo.ingest_signal("india.geo_physical_alpha", {
+        "signal": "floating_storage", "severity": 0.99,
+        "tickers": [{"symbol": "CL", "direction": "short", "rationale": "storage"}],
+    })
+    bus = SignalBus()
+    guardian = RiskGuardian(
+        bus=bus, kill_switch_check=lambda: True,  # halted
+        geo_context=geo,
+    )
+    pipeline = TradePipeline(bus=bus, risk_guardian=guardian)
+    order = await pipeline.process_entry_signal(
+        symbol="CL", asset_class="equity", side="buy",
+        entry_price=10.0, stop_loss=9.0,
+        source_signal_id="g2", source_agent="test", nav=500_000.0,
+    )
+    assert order.stage == PipelineStage.REJECTED
+
+
 @pytest.mark.asyncio
 async def test_pipeline_to_dict():
     pipeline = make_pipeline()

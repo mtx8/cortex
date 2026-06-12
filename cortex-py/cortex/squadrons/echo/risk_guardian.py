@@ -16,6 +16,7 @@ from cortex.squadrons.base import BaseAgent
 from cortex.squadrons.echo.risk_checks import PreTradeCheck, OrderRequest, PortfolioState, CheckResult
 from cortex.squadrons.echo.position_sizer import PositionSizer, SizingRequest, SizingResult
 from cortex.squadrons.echo.drawdown_shield import DrawdownShield, DrawdownState, DrawdownLevel
+from cortex.squadrons.echo.geo_risk_context import GeoRiskContext
 
 log = structlog.get_logger()
 
@@ -27,6 +28,9 @@ class RiskDecision:
     pre_trade: CheckResult | None = None
     drawdown: DrawdownState | None = None
     throttle_factor: float = 1.0
+    geo_caution: float = 0.0
+    geo_reasons: list[str] = field(default_factory=list)
+    geo_veto: bool = False
     rejections: list[str] = field(default_factory=list)
     decision_time_ms: float = 0.0
 
@@ -37,6 +41,12 @@ class RiskGuardian(BaseAgent):
     subscriptions = [
         SignalTypes.ENTRY_SIGNAL,
         SignalTypes.ORDER_FILLED,
+        # INDIA geospatial physical-alpha — context only, consumed via the
+        # GeoRiskContext to TIGHTEN sizing. Never an order trigger (rule #6).
+        SignalTypes.GEO_PHYSICAL_ALPHA,
+        SignalTypes.GEO_CHOKEPOINT_CONGESTION,
+        SignalTypes.GEO_SEISMIC_PROXIMITY,
+        SignalTypes.GEO_FLOATING_STORAGE,
     ]
 
     def __init__(
@@ -46,20 +56,32 @@ class RiskGuardian(BaseAgent):
         pre_trade: PreTradeCheck | None = None,
         position_sizer: PositionSizer | None = None,
         drawdown_shield: DrawdownShield | None = None,
+        geo_context: GeoRiskContext | None = None,
     ):
         super().__init__(bus)
         self._is_kill_switch_engaged = kill_switch_check
         self._pre_trade = pre_trade or PreTradeCheck()
         self._sizer = position_sizer or PositionSizer()
         self._drawdown = drawdown_shield or DrawdownShield()
+        # Geo caution is a one-directional tightener. Default-safe: with no live
+        # geo signal it returns caution 0.0 and a 1.0 multiplier (no-op).
+        self._geo = geo_context or GeoRiskContext()
         self._decisions_approved = 0
         self._decisions_rejected = 0
+
+    @property
+    def geo_context(self) -> GeoRiskContext:
+        return self._geo
 
     async def handle_signal(self, signal: Signal) -> None:
         if signal.signal_type == SignalTypes.ENTRY_SIGNAL:
             await self._handle_entry_signal(signal)
         elif signal.signal_type == SignalTypes.ORDER_FILLED:
             await self._handle_fill(signal)
+        elif signal.signal_type in self._geo.GEO_SIGNAL_TYPES:
+            # Forward INDIA geo payloads into the caution map. Echo never imports
+            # the INDIA squadron — it only reads the dict payload off the bus.
+            self._geo.ingest_signal(signal.signal_type, signal.payload)
 
     async def _handle_fill(self, signal: Signal) -> None:
         """Track fills for drawdown calculation (Phase 2 will add P&L tracking)."""
@@ -99,6 +121,9 @@ class RiskGuardian(BaseAgent):
                     "dollar_amount": decision.sizing.recommended_dollar_amount if decision.sizing else 0,
                     "method": decision.sizing.method_used if decision.sizing else "none",
                     "throttle_factor": decision.throttle_factor,
+                    "geo_caution": decision.geo_caution,
+                    "geo_veto": decision.geo_veto,
+                    "geo_reasons": decision.geo_reasons,
                     "source_signal_id": signal.signal_id,
                 },
                 priority=SignalPriority.HIGH,
@@ -221,6 +246,29 @@ class RiskGuardian(BaseAgent):
                 factor=throttle,
             )
 
+        # 6. Apply INDIA geo caution — TIGHTEN ONLY. The geo multiplier is always
+        #    in (0, 1], so this can only shrink the already-sized quantity, never
+        #    grow it. A symbol with no live geo signal yields a 1.0 multiplier and
+        #    leaves sizing byte-for-byte unchanged (default-safe).
+        geo_caution = self._geo.caution_for(symbol)
+        geo_reasons = self._geo.reasons_for(symbol)
+        geo_veto = self._geo.should_veto(symbol)
+        geo_mult = self._geo.size_multiplier(symbol)
+        if geo_mult < 1.0:
+            pre_geo_qty = sizing.recommended_quantity
+            sizing.recommended_quantity = max(1, int(sizing.recommended_quantity * geo_mult))
+            sizing.recommended_dollar_amount = sizing.recommended_quantity * entry_price
+            sizing.position_pct_of_nav = (sizing.recommended_dollar_amount / nav) * 100 if nav > 0 else 0
+            log.info(
+                "risk.geo_caution_applied",
+                symbol=symbol,
+                pre_geo_qty=pre_geo_qty,
+                geo_qty=sizing.recommended_quantity,
+                caution=round(geo_caution, 3),
+                multiplier=round(geo_mult, 3),
+                veto=geo_veto,
+            )
+
         self._decisions_approved += 1
         duration = (time.perf_counter() - start) * 1000
 
@@ -229,6 +277,8 @@ class RiskGuardian(BaseAgent):
             symbol=symbol,
             quantity=sizing.recommended_quantity,
             method=sizing.method_used,
+            geo_caution=round(geo_caution, 3),
+            geo_veto=geo_veto,
             duration_ms=f"{duration:.2f}",
         )
 
@@ -238,6 +288,9 @@ class RiskGuardian(BaseAgent):
             pre_trade=pre_trade_result,
             drawdown=drawdown_state,
             throttle_factor=throttle,
+            geo_caution=geo_caution,
+            geo_reasons=geo_reasons,
+            geo_veto=geo_veto,
             decision_time_ms=duration,
         )
 

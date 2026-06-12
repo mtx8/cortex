@@ -633,6 +633,7 @@ def create_app_components() -> dict:
     from cortex.squadrons.echo.risk_checks import PreTradeCheck
     from cortex.squadrons.echo.position_sizer import PositionSizer
     from cortex.squadrons.echo.drawdown_shield import DrawdownShield
+    from cortex.squadrons.echo.geo_risk_context import GeoRiskContext
     from cortex.squadrons.alpha.signal_hunter import SignalHunter
     from cortex.squadrons.alpha.gap_scanner import GapScanner
     from cortex.squadrons.alpha.volume_profiler import VolumeProfiler
@@ -701,12 +702,15 @@ def create_app_components() -> dict:
     # ECHO squadron
     kill_switch = KillSwitchCommander(bus=bus)
     drawdown_shield = DrawdownShield()
+    # Geo caution layer — fed by INDIA geo signals via the bus, tightens sizing only.
+    geo_risk_context = GeoRiskContext()
     guardian = RiskGuardian(
         bus=bus,
         kill_switch_check=lambda: kill_switch.is_halted,
         pre_trade=PreTradeCheck(max_position_pct=5.0, max_concurrent=15, max_daily_trades=50),
         position_sizer=PositionSizer(max_position_pct=5.0, max_single_loss_usd=500.0),
         drawdown_shield=drawdown_shield,
+        geo_context=geo_risk_context,
     )
 
     # TradePipeline
@@ -912,6 +916,7 @@ def create_app_components() -> dict:
         "autonomy": autonomy,
         "kill_switch": kill_switch,
         "guardian": guardian,
+        "geo_risk_context": geo_risk_context,
         "pipeline": pipeline,
         "orchestrator": orchestrator,
         "broadcaster": broadcaster,

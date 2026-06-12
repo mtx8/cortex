@@ -45,6 +45,7 @@ class PipelineOrder:
     sizing_method: str = ""
     risk_decision: RiskDecision | None = None
     rejections: list[str] = field(default_factory=list)
+    flags: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     completed_at: float | None = None
 
@@ -149,6 +150,21 @@ class TradePipeline:
         if decision.sizing:
             order.quantity = decision.sizing.recommended_quantity
             order.sizing_method = decision.sizing.method_used
+
+        # Geo caution is advisory CONTEXT that has already TIGHTENED the size
+        # upstream (in RiskGuardian.evaluate). Record it as a flag so the order is
+        # marked for review — it never loosens risk or bypasses any check below.
+        if getattr(decision, "geo_caution", 0.0) > 0.0:
+            order.flags.append(
+                f"geo_caution={decision.geo_caution:.2f}"
+                + ("; geo_veto" if getattr(decision, "geo_veto", False) else "")
+            )
+            log.info(
+                "pipeline.geo_caution",
+                order_id=order_id, symbol=symbol,
+                geo_caution=round(decision.geo_caution, 3),
+                geo_veto=getattr(decision, "geo_veto", False),
+            )
 
         # Stage 2b: Hard notional cap — $500 max per trade (non-negotiable)
         notional = order.quantity * entry_price
