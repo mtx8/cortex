@@ -53,6 +53,13 @@ class MacroFeed:
             rates = {}
         if not rates:
             return
+        # Reference FX (keyless, quarterly) rides along on the macro message.
+        try:
+            fx = await self._macro.fetch_fx_rates()
+            if fx:
+                rates = {**rates, "fx": fx}
+        except Exception as e:
+            log.warning("macro_feed.fx_error", error=str(e))
         self._last_rates = rates
         self._poll_count += 1
 

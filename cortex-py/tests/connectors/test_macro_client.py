@@ -55,3 +55,22 @@ async def test_treasury_empty_on_no_data(monkeypatch):
 async def test_fred_none_without_key():
     # No FRED key -> graceful None (no network).
     assert await MacroEgressClient(fred_api_key="").fetch_fred_latest("DGS10") is None
+
+
+_FX_BODY = orjson.dumps({
+    "data": [
+        {"record_date": "2026-03-31", "country_currency_desc": "Euro Zone-Euro", "exchange_rate": "0.92"},
+        {"record_date": "2026-03-31", "country_currency_desc": "Japan-Yen", "exchange_rate": "150.0"},
+        {"record_date": "2026-03-31", "country_currency_desc": "Narnia-Gold", "exchange_rate": "1.0"},
+        {"record_date": "2025-12-31", "country_currency_desc": "Euro Zone-Euro", "exchange_rate": "0.90"},
+    ]
+}).decode()
+
+
+async def test_fx_parse_majors_latest_only(monkeypatch):
+    monkeypatch.setattr(macro_mod, "_cs", _FakeCS(_FX_BODY))
+    out = await MacroEgressClient().fetch_fx_rates()
+    assert out["date"] == "2026-03-31"
+    assert out["rates"]["EUR"] == 0.92 and out["rates"]["JPY"] == 150.0
+    assert "Narnia-Gold" not in out["rates"]  # non-major excluded
+    assert len(out["rates"]) == 2            # old date row excluded

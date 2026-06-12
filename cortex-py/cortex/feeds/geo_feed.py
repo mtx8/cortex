@@ -98,12 +98,14 @@ class GeoIntelligenceFeed:
         bus: SignalBus,
         poll_interval: float = 60.0,
         enabled: bool = True,
+        aisstream=None,
     ):
         self._geo = geo_client
         self._broadcaster = broadcaster
         self._bus = bus
         self._poll_interval = poll_interval
         self._enabled = enabled
+        self._aisstream = aisstream
         self._running = False
         self._poll_count = 0
         self._last_vessels: list[dict] = []
@@ -125,24 +127,28 @@ class GeoIntelligenceFeed:
         return list(self._last_vessels)
 
     async def _poll_once(self) -> None:
-        # Refresh static vessel metadata periodically (gives real ship types).
-        if not self._ais_meta or self._poll_count % _META_REFRESH_EVERY == 0:
+        # Source: AISStream GLOBAL snapshot when a key is configured (worldwide
+        # tankers, ship types from ShipStaticData); else Digitraffic Baltic positions
+        # enriched with the static-metadata endpoint for real ship types.
+        vdicts: list[dict] = []
+        if self._aisstream is not None and self._aisstream.available:
+            vdicts = self._aisstream.snapshot()
+        else:
+            if not self._ais_meta or self._poll_count % _META_REFRESH_EVERY == 0:
+                try:
+                    meta = await self._geo.fetch_ais_metadata()
+                    if meta:
+                        self._ais_meta = meta
+                except Exception as e:
+                    log.warning("geo_feed.ais_meta_error", error=str(e))
             try:
-                meta = await self._geo.fetch_ais_metadata()
-                if meta:
-                    self._ais_meta = meta
+                vessels = await self._geo.fetch_ais_vessels()
             except Exception as e:
-                log.warning("geo_feed.ais_meta_error", error=str(e))
+                log.warning("geo_feed.ais_error", error=str(e))
+                vessels = []
+            vdicts = [_vessel_to_dict(v, self._ais_meta) for v in vessels] if vessels else []
 
-        # Maritime AIS → batch signal + Swift positions.
-        try:
-            vessels = await self._geo.fetch_ais_vessels()
-        except Exception as e:
-            log.warning("geo_feed.ais_error", error=str(e))
-            vessels = []
-
-        if vessels:
-            vdicts = [_vessel_to_dict(v, self._ais_meta) for v in vessels]
+        if vdicts:
             self._last_vessels = vdicts
             tankers = sum(1 for d in vdicts if d["is_tanker"])
 

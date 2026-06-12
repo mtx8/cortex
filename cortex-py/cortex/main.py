@@ -44,6 +44,12 @@ async def lifespan(app: FastAPI):
     if geo_feed is not None:
         geo_task = asyncio.create_task(geo_feed.start())
 
+    # Start the AISStream global WS spine if a key is configured (feeds geo_feed).
+    ais_task = None
+    aisstream_client = components.get("aisstream_client")
+    if aisstream_client is not None and aisstream_client.available:
+        ais_task = asyncio.create_task(aisstream_client.start())
+
     # Start macro / fixed-income feed if available (Treasury rates)
     macro_task = None
     macro_feed = components.get("macro_feed")
@@ -83,6 +89,15 @@ async def lifespan(app: FastAPI):
         geo_task.cancel()
         try:
             await geo_task
+        except asyncio.CancelledError:
+            pass
+
+    if aisstream_client is not None:
+        await aisstream_client.stop()
+    if ais_task is not None:
+        ais_task.cancel()
+        try:
+            await ais_task
         except asyncio.CancelledError:
             pass
 
@@ -660,6 +675,7 @@ def create_app_components() -> dict:
     from cortex.intelligence.providers import build_router
     from cortex.feeds.status_broadcaster import StatusBroadcaster
     from cortex.connectors.geo.client import GeoEgressClient
+    from cortex.connectors.geo.aisstream import AISStreamClient
     from cortex.feeds.geo_feed import GeoIntelligenceFeed
     from cortex.squadrons.india.maritime_analyst import MaritimeAnalyst
     from cortex.squadrons.india.geo_risk_mapper import GeoRiskMapper
@@ -848,12 +864,16 @@ def create_app_components() -> dict:
 
     # Geo-intelligence feed (maritime AIS + seismic through the hardened Rust egress)
     geo_client = GeoEgressClient()
+    # Global tanker spine — active only when an AISStream key is set, else the feed
+    # uses the keyless Digitraffic Baltic source.
+    aisstream_client = AISStreamClient(api_key=config.aisstream_api_key)
     geo_feed = GeoIntelligenceFeed(
         geo_client=geo_client,
         broadcaster=broadcaster,
         bus=bus,
         poll_interval=config.geo_poll_interval,
         enabled=config.geo_enabled,
+        aisstream=aisstream_client,
     )
 
     # Macro / fixed-income feed (Treasury rates through the same hardened egress)
@@ -919,6 +939,7 @@ def create_app_components() -> dict:
         "level2_feed": level2_feed,
         "options_feed": options_feed,
         "geo_client": geo_client,
+        "aisstream_client": aisstream_client,
         "geo_feed": geo_feed,
         "maritime_analyst": maritime_analyst,
         "geo_risk_mapper": geo_risk_mapper,

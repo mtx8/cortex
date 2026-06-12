@@ -25,6 +25,17 @@ TREASURY_AVG_RATES = (
     "accounting/od/avg_interest_rates?sort=-record_date&page%5Bsize%5D=40"
 )
 FRED_OBSERVATIONS = "https://api.stlouisfed.org/fred/series/observations"
+# Treasury "Rates of Exchange" — keyless USD reference FX (units of currency per USD).
+FX_RATES = (
+    "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/"
+    "accounting/od/rates_of_exchange?fields=record_date,country_currency_desc,exchange_rate"
+    "&sort=-record_date&page%5Bsize%5D=200"
+)
+_FX_MAJORS = {
+    "Euro Zone-Euro": "EUR", "Japan-Yen": "JPY", "China-Yuan Renminbi": "CNY",
+    "United Kingdom-Pound": "GBP", "Canada-Dollar": "CAD", "Switzerland-Franc": "CHF",
+    "Australia-Dollar": "AUD", "Mexico-Peso": "MXN", "India-Rupee": "INR", "Brazil-Real": "BRL",
+}
 
 # Map a Treasury security_desc -> a short tenor bucket for spread/curve logic.
 _SHORT_DESCS = {"Treasury Bills"}
@@ -91,6 +102,42 @@ class MacroEgressClient:
             "long_pct": long,
             "spread_bps": spread_bps,   # long minus short; negative ≈ inverted
         }
+
+    async def fetch_fx_rates(self) -> dict:
+        """Latest USD reference FX for major currencies (keyless). Returns
+        {date, rates: {EUR: units_per_USD, ...}} or {}. These are quarterly Treasury
+        reporting rates — reference levels, not a real-time bid/ask feed."""
+        if _cs is None:
+            return {}
+        try:
+            res = await self._fetch(FX_RATES)
+        except Exception as e:
+            log.warning("macro.fx_error", error=str(e))
+            return {}
+        if not res.ok:
+            return {}
+        try:
+            import orjson
+            data = orjson.loads(res.body)
+        except Exception as e:
+            log.warning("macro.fx_parse", error=str(e))
+            return {}
+        rows = data.get("data", []) if isinstance(data, dict) else []
+        if not rows:
+            return {}
+        latest = rows[0].get("record_date")
+        out: dict[str, float] = {}
+        for r in rows:
+            if r.get("record_date") != latest:
+                continue
+            code = _FX_MAJORS.get(r.get("country_currency_desc", ""))
+            if not code:
+                continue
+            try:
+                out[code] = float(r.get("exchange_rate"))
+            except (TypeError, ValueError):
+                continue
+        return {"date": latest, "rates": out}
 
     async def fetch_fred_latest(self, series_id: str) -> float | None:
         """Latest observation for a FRED series (e.g. DGS10). Needs a free key;
