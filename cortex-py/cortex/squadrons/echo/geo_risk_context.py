@@ -210,6 +210,14 @@ class GeoRiskContext:
 
 
 def _clamp01(x: float) -> float:
+    # NaN is the one float that compares False against every bound, so the naive
+    # `x < 0 / x > 1` guards would let it slip through and poison the caution map
+    # (caution=NaN surfaces on RiskDecision/the bus, suppresses the review flag on
+    # an order whose size WAS silently shrunk, and is one refactor away from
+    # `int(qty * NaN)` raising inside the synchronous risk hot path). Treat any
+    # non-finite-low / NaN value as the SAFE no-caution floor of 0.0.
+    if not x == x:  # NaN
+        return 0.0
     if x < 0.0:
         return 0.0
     if x > 1.0:

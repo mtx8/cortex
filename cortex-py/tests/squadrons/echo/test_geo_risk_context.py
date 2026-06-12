@@ -113,6 +113,75 @@ def test_context_ignores_non_geo_and_malformed():
     assert ctx.caution_for("CL") == 0.0
 
 
+@pytest.mark.parametrize("field", ["severity", "confidence", "score"])
+def test_context_nan_strength_is_safe_no_caution(field):
+    """REGRESSION: a NaN strength field must be treated as the SAFE no-caution
+    floor (0.0), never propagated. NaN compares False against every bound, so a
+    naive clamp would let it poison the caution map — surfacing caution=NaN on the
+    RiskDecision/bus, suppressing the review flag on an order whose size WAS
+    silently shrunk, and risking ``int(qty * NaN)`` raising in the sync risk path.
+    """
+    ctx = GeoRiskContext()
+    ctx.ingest_signal(
+        SignalTypes.GEO_PHYSICAL_ALPHA,
+        {field: float("nan"), "tickers": [{"symbol": "CL", "direction": "short"}]},
+    )
+    # NaN must not even create a phantom map entry, and every query is default-safe.
+    assert ctx.tracked_symbols == 0
+    assert ctx.caution_for("CL") == 0.0
+    assert ctx.size_multiplier("CL") == 1.0   # exactly 1.0 — byte-for-byte no-op
+    assert ctx.should_veto("CL") is False
+    assert ctx.reasons_for("CL") == []
+
+
+@pytest.mark.parametrize("strength", [float("inf"), 1.5, 150.0, 1e9])
+def test_context_overlarge_strength_clamps_to_max_tighten(strength):
+    """Inf / out-of-range / >100 score must clamp to caution 1.0 — the MOST
+    tightening (smallest multiplier), never an oversize or a multiplier > 1.0."""
+    ctx = GeoRiskContext()
+    field = "score" if strength > 1.0 and strength != float("inf") and strength >= 100 else "severity"
+    ctx.ingest_signal(
+        SignalTypes.GEO_PHYSICAL_ALPHA,
+        {field: strength, "tickers": [{"symbol": "CL", "direction": "short"}]},
+    )
+    assert ctx.caution_for("CL") == pytest.approx(1.0, abs=1e-9)
+    mult = ctx.size_multiplier("CL")
+    assert 0.0 < mult <= 1.0          # tightens, never grows, never zeroes
+    assert mult < 1.0                  # at max caution it actually shrinks
+
+
+def test_context_negative_strength_is_no_op():
+    """A negative / -inf strength is meaningless caution — clamp to 0.0 (no-op),
+    never a multiplier > 1.0 or a size increase."""
+    ctx = GeoRiskContext()
+    for bad in (-3.0, float("-inf")):
+        ctx.ingest_signal(
+            SignalTypes.GEO_PHYSICAL_ALPHA,
+            {"severity": bad, "tickers": [{"symbol": "CL"}]},
+        )
+        assert ctx.caution_for("CL") == 0.0
+        assert ctx.size_multiplier("CL") == 1.0
+
+
+def test_guardian_nan_geo_does_not_shrink_or_flag():
+    """End-to-end: a NaN-strength geo signal leaves sizing byte-for-byte unchanged
+    (no silent shrink) and surfaces a clean geo_caution of 0.0 onto the decision —
+    no NaN leaks onto RiskDecision/the bus."""
+    ctx = GeoRiskContext()
+    guardian = make_guardian(geo_context=ctx)
+    base_qty = _evaluate(guardian, symbol="CL").sizing.recommended_quantity
+
+    ctx.ingest_signal(
+        SignalTypes.GEO_PHYSICAL_ALPHA,
+        {"severity": float("nan"), "tickers": [{"symbol": "CL"}]},
+    )
+    d = _evaluate(guardian, symbol="CL")
+    assert d.geo_caution == 0.0
+    assert d.geo_veto is False
+    assert d.geo_reasons == []
+    assert d.sizing.recommended_quantity == base_qty  # no silent shrink
+
+
 def test_context_severity_from_score_when_no_severity():
     ctx = GeoRiskContext()
     payload = {"signal": "chokepoint_congestion", "score": 60.0,
