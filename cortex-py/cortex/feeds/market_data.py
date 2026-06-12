@@ -8,6 +8,7 @@ Runs as a background asyncio task. Every poll_interval seconds it:
 
 import asyncio
 import random
+from collections import deque
 import structlog
 
 from cortex.api.protocol import MessageType, CortexMessage
@@ -152,6 +153,7 @@ class MarketDataFeed:
         watchlist: list[str] | None = None,
         poll_interval: float = 15.0,
         status_broadcaster=None,
+        scanner_engine=None,
     ):
         self._polygon = polygon_client
         self._broadcaster = broadcaster
@@ -166,6 +168,10 @@ class MarketDataFeed:
         # Scanner opportunity state — seeded per-ticker so scores drift slowly
         self._rng = random.Random(42)
         self._scanner_scores: dict[str, dict] = {}
+        # Rolling close-price history per ticker → real Rust composite scoring once
+        # enough bars accumulate (demo drift is the fallback until then).
+        self._scanner_engine = scanner_engine
+        self._price_history: dict[str, deque] = {}
 
     @property
     def watchlist(self) -> list[str]:
@@ -212,6 +218,9 @@ class MarketDataFeed:
         for quote in snapshots:
             ticker = quote.get("ticker", "")
             self._last_quotes[ticker] = quote
+            price = quote.get("price", 0) or 0
+            if price > 0:
+                self._price_history.setdefault(ticker, deque(maxlen=80)).append(float(price))
 
             # Broadcast to Swift clients
             msg = CortexMessage(
@@ -305,11 +314,28 @@ class MarketDataFeed:
         opps.sort(key=lambda x: x["score"], reverse=True)
         return opps
 
+    def _real_scanner_scores(self) -> dict[str, float]:
+        """Rust-computed composite scores for tickers with enough price history.
+        Empty until ≥30 bars accumulate or if the engine isn't wired."""
+        if self._scanner_engine is None or not self._scanner_engine.available:
+            return {}
+        hist = {t: list(h) for t, h in self._price_history.items() if len(h) >= 30}
+        if not hist:
+            return {}
+        try:
+            results = self._scanner_engine.scan(hist)
+        except Exception as e:
+            log.warning("feed.real_scanner_error", error=str(e))
+            return {}
+        return {r["symbol"]: r["composite_score"] for r in results}
+
     async def _broadcast_scanner_opportunities(self) -> None:
-        """Generate and broadcast scanner opportunity data for watchlist symbols."""
+        """Generate and broadcast scanner opportunity data for watchlist symbols.
+        Uses real Rust composite scores where available, demo drift otherwise."""
         if self._broadcaster.client_count == 0:
             return
 
+        real = self._real_scanner_scores()
         for ticker in self._watchlist:
             meta = TICKER_METADATA.get(ticker, {"sector": "Unknown", "market_cap": "Unknown"})
             sector = meta["sector"]
@@ -330,6 +356,11 @@ class MarketDataFeed:
 
             opp_type = state["type"]
             score = round(state["score"], 1)
+            engine = "demo"
+            # Override with the real Rust composite score once history is sufficient.
+            if ticker in real:
+                score = round(real[ticker], 1)
+                engine = "rust"
             direction = "short" if opp_type == "Flow" else "long"
 
             msg = CortexMessage(
@@ -346,7 +377,9 @@ class MarketDataFeed:
                     "market": "US Stocks",
                     "market_cap": meta["market_cap"],
                     "short_interest": 0.0,
-                    "ai_insight": f"High momentum score ({score}) with {opp_type.lower()} pattern",
+                    "engine": engine,
+                    "ai_insight": (f"Rust composite {score}" if engine == "rust"
+                                   else f"High momentum score ({score}) with {opp_type.lower()} pattern"),
                 },
             )
             await self._broadcaster.broadcast(msg)

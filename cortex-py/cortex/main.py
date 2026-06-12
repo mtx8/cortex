@@ -843,6 +843,7 @@ def create_app_components() -> dict:
         broadcaster=broadcaster,
         bus=bus,
         status_broadcaster=status_broadcaster,
+        scanner_engine=scanner_engine,
     )
 
     # Geo-intelligence feed (maritime AIS + seismic through the hardened Rust egress)
