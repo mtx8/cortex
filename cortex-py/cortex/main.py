@@ -18,7 +18,7 @@ config = CortexConfig()
 async def lifespan(app: FastAPI):
     log.info("cortex.starting", ws_port=config.ws_port)
 
-    # Create and wire all components
+    # Create and wire all components (if this raises, nothing has started yet)
     components = create_app_components()
     app.state.components = components
 
@@ -26,123 +26,113 @@ async def lifespan(app: FastAPI):
     broadcaster = components["broadcaster"]
     orchestrator = components["orchestrator"]
 
-    # Subscribe broadcaster to every signal on the bus
-    bus.subscribe_all(broadcaster.handle_bus_signal)
-
-    # Start the orchestrator (runs the signal bus) as a background task
-    orch_task = asyncio.create_task(orchestrator.start())
-
-    # Start market data feed if available
-    feed_task = None
     market_feed = components.get("market_feed")
-    if market_feed is not None:
-        feed_task = asyncio.create_task(market_feed.start())
-
-    # Start geo-intelligence feed if available (maritime AIS + seismic)
-    geo_task = None
     geo_feed = components.get("geo_feed")
-    if geo_feed is not None:
-        geo_task = asyncio.create_task(geo_feed.start())
-
-    # Start the AISStream global WS spine if a key is configured (feeds geo_feed).
-    ais_task = None
     aisstream_client = components.get("aisstream_client")
-    if aisstream_client is not None and aisstream_client.available:
-        ais_task = asyncio.create_task(aisstream_client.start())
-
-    # Start macro / fixed-income feed if available (Treasury rates)
-    macro_task = None
     macro_feed = components.get("macro_feed")
-    if macro_feed is not None:
-        macro_task = asyncio.create_task(macro_feed.start())
-
-    # Start status broadcaster if available
-    status_task = None
     status_broadcaster = components.get("status_broadcaster")
-    if status_broadcaster is not None:
-        status_task = asyncio.create_task(status_broadcaster.start())
+    # Pre-init all task handles so the finally can clean up partial startup.
+    orch_task = feed_task = geo_task = ais_task = macro_task = status_task = None
 
-    yield
-
-    # Graceful shutdown
-    if status_broadcaster is not None:
-        await status_broadcaster.stop()
-    if status_task is not None:
-        status_task.cancel()
-        try:
-            await status_task
-        except asyncio.CancelledError:
-            pass
-
-    if market_feed is not None:
-        await market_feed.stop()
-    if feed_task is not None:
-        feed_task.cancel()
-        try:
-            await feed_task
-        except asyncio.CancelledError:
-            pass
-
-    if geo_feed is not None:
-        await geo_feed.stop()
-    if geo_task is not None:
-        geo_task.cancel()
-        try:
-            await geo_task
-        except asyncio.CancelledError:
-            pass
-
-    if aisstream_client is not None:
-        await aisstream_client.stop()
-    if ais_task is not None:
-        ais_task.cancel()
-        try:
-            await ais_task
-        except asyncio.CancelledError:
-            pass
-
-    if macro_feed is not None:
-        await macro_feed.stop()
-    if macro_task is not None:
-        macro_task.cancel()
-        try:
-            await macro_task
-        except asyncio.CancelledError:
-            pass
-
-    # Unsubscribe Level 2 feed if active
-    level2_feed = components.get("level2_feed")
-    if level2_feed is not None and level2_feed.active_symbol:
-        await level2_feed.unsubscribe()
-
-    # Stop simulation engine if running
-    simulation_engine = components.get("simulation_engine")
-    if simulation_engine is not None and simulation_engine.running:
-        await simulation_engine.stop()
-
-    await orchestrator.stop()
-    orch_task.cancel()
     try:
-        await orch_task
-    except asyncio.CancelledError:
-        pass
+        # Subscribe broadcaster to every signal on the bus
+        bus.subscribe_all(broadcaster.handle_bus_signal)
 
-    # Close polygon client if present
-    polygon_client = components.get("polygon_client")
-    if polygon_client is not None:
-        await polygon_client.close()
+        # Start background tasks
+        orch_task = asyncio.create_task(orchestrator.start())
+        if market_feed is not None:
+            feed_task = asyncio.create_task(market_feed.start())
+        if geo_feed is not None:
+            geo_task = asyncio.create_task(geo_feed.start())
+        if aisstream_client is not None and aisstream_client.available:
+            ais_task = asyncio.create_task(aisstream_client.start())
+        if macro_feed is not None:
+            macro_task = asyncio.create_task(macro_feed.start())
+        if status_broadcaster is not None:
+            status_task = asyncio.create_task(status_broadcaster.start())
 
-    # Close EDGAR client if present
-    edgar_client = components.get("edgar_client")
-    if edgar_client is not None:
-        await edgar_client.close()
+        yield
+    finally:
+        # Graceful shutdown — always runs, even if startup raised before yield.
+        if status_broadcaster is not None:
+            await status_broadcaster.stop()
+        if status_task is not None:
+            status_task.cancel()
+            try:
+                await status_task
+            except asyncio.CancelledError:
+                pass
 
-    # Disconnect IBKR if connected
-    ibkr_manager = components.get("ibkr_manager")
-    if ibkr_manager is not None and ibkr_manager.is_connected:
-        await ibkr_manager.disconnect()
+        if market_feed is not None:
+            await market_feed.stop()
+        if feed_task is not None:
+            feed_task.cancel()
+            try:
+                await feed_task
+            except asyncio.CancelledError:
+                pass
 
-    log.info("cortex.shutdown")
+        if geo_feed is not None:
+            await geo_feed.stop()
+        if geo_task is not None:
+            geo_task.cancel()
+            try:
+                await geo_task
+            except asyncio.CancelledError:
+                pass
+
+        if aisstream_client is not None:
+            await aisstream_client.stop()
+        if ais_task is not None:
+            ais_task.cancel()
+            try:
+                await ais_task
+            except asyncio.CancelledError:
+                pass
+
+        if macro_feed is not None:
+            await macro_feed.stop()
+        if macro_task is not None:
+            macro_task.cancel()
+            try:
+                await macro_task
+            except asyncio.CancelledError:
+                pass
+
+        # Unsubscribe Level 2 feed if active
+        level2_feed = components.get("level2_feed")
+        if level2_feed is not None and level2_feed.active_symbol:
+            await level2_feed.unsubscribe()
+
+        # Stop simulation engine if running
+        simulation_engine = components.get("simulation_engine")
+        if simulation_engine is not None and simulation_engine.running:
+            await simulation_engine.stop()
+
+        await orchestrator.stop()
+        if orch_task is not None:
+            orch_task.cancel()
+            try:
+                await orch_task
+            except asyncio.CancelledError:
+                pass
+
+        # Close polygon client if present
+        polygon_client = components.get("polygon_client")
+        if polygon_client is not None:
+            await polygon_client.close()
+
+        # Close EDGAR client if present
+        edgar_client = components.get("edgar_client")
+        if edgar_client is not None:
+            await edgar_client.close()
+
+        # Disconnect IBKR if connected
+        ibkr_manager = components.get("ibkr_manager")
+        if ibkr_manager is not None and ibkr_manager.is_connected:
+            await ibkr_manager.disconnect()
+
+        log.info("cortex.shutdown")
 
 
 app = FastAPI(title="CORTEX", lifespan=lifespan)

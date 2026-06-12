@@ -295,11 +295,14 @@ class MarketDataFeed:
 
     @property
     def scanner_opportunities(self) -> list[dict]:
-        """Return current scanner scores as a list of opportunity dicts (sorted by score desc)."""
+        """Return current scanner scores as a list of opportunity dicts (sorted by score desc).
+        Uses the real Rust composite score where available (same as the live broadcast),
+        so the initial snapshot + chat context agree with what clients see streamed."""
+        real = self._real_scanner_scores()
         opps = []
         for ticker, state in self._scanner_scores.items():
             opp_type = state.get("type", "Momentum")
-            score = round(state.get("score", 50), 1)
+            score = round(real.get(ticker, state.get("score", 50)), 1)
             meta = TICKER_METADATA.get(ticker, {"sector": "Unknown", "market_cap": "Unknown"})
             opps.append({
                 "ticker": ticker,

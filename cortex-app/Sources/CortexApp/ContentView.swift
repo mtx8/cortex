@@ -99,7 +99,9 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.25), value: isAIPaneVisible)
         }
         .background(Color(nsColor: NSColor(red: 0.08, green: 0.08, blue: 0.12, alpha: 1.0)))
-        .background { keyboardShortcuts }
+        // Disable global ⌘ shortcuts (incl. the ⌘K kill switch and ⌘1-9 tab jumps)
+        // while the command palette is capturing keystrokes.
+        .background { keyboardShortcuts.disabled(showCommandPalette) }
         .overlay {
             if showCommandPalette {
                 CommandPalette(isPresented: $showCommandPalette) { tab in selectedTab = tab }

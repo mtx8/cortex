@@ -15,13 +15,27 @@ sent upstream is the subscription (key + bounding boxes + message-type filter).
 from __future__ import annotations
 
 import asyncio
+import datetime
+import time
 import structlog
 
 log = structlog.get_logger()
 
 AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
-# Default: whole world. Override with oil-corridor boxes to cut volume.
-_WORLD_BBOX = [[[-90.0, -180.0], [90.0, 180.0]]]
+# Default to the oil-flow corridors (focused signal + bounded volume) rather than
+# the whole world, which would exceed any cache cap in minutes. Each box is
+# [[lat1, lon1], [lat2, lon2]].
+_OIL_CORRIDORS = [
+    [[24.0, 54.0], [28.0, 58.0]],    # Strait of Hormuz
+    [[10.0, 32.0], [32.0, 44.0]],    # Red Sea / Suez / Bab-el-Mandeb
+    [[-2.0, 99.0], [7.0, 105.0]],    # Malacca / Singapore
+    [[40.0, 26.0], [42.5, 30.0]],    # Turkish Straits / Bosphorus
+    [[26.0, -98.0], [31.0, -88.0]],  # US Gulf export terminals
+    [[35.0, -7.0], [37.0, -4.0]],    # Strait of Gibraltar
+    [[7.0, -81.0], [10.0, -78.0]],   # Panama
+]
+# Drop vessels not heard from in this long (stale = position-frozen phantom).
+_STALE_TTL_S = 1800.0  # 30 min
 
 
 def parse_aisstream_message(msg: dict) -> dict | None:
@@ -38,6 +52,16 @@ def parse_aisstream_message(msg: dict) -> dict | None:
     name = meta.get("ShipName")
     if isinstance(name, str) and name.strip():
         out["name"] = name.strip()
+    # Best-effort frame time for recency ordering (AISStream MetaData.time_utc looks
+    # like "2026-06-12 12:00:00.0 +0000 UTC").
+    tu = meta.get("time_utc")
+    if isinstance(tu, str) and len(tu) >= 19:
+        try:
+            dt = datetime.datetime.strptime(tu[:19], "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=datetime.timezone.utc)
+            out["frame_ms"] = int(dt.timestamp() * 1000)
+        except (ValueError, OverflowError):
+            pass
 
     mtype = msg.get("MessageType")
     body = (msg.get("Message") or {}).get(mtype) or {}
@@ -67,9 +91,9 @@ def parse_aisstream_message(msg: dict) -> dict | None:
 class AISStreamClient:
     """Maintains a live per-MMSI vessel snapshot from the AISStream WebSocket."""
 
-    def __init__(self, api_key: str, bboxes: list | None = None, max_vessels: int = 30000):
+    def __init__(self, api_key: str, bboxes: list | None = None, max_vessels: int = 60000):
         self._key = api_key
-        self._bboxes = bboxes or _WORLD_BBOX
+        self._bboxes = bboxes or _OIL_CORRIDORS
         self._max = max_vessels
         self._cache: dict[int, dict] = {}
         self._running = False
@@ -80,25 +104,54 @@ class AISStreamClient:
         return bool(self._key)
 
     def _apply(self, msg: dict) -> None:
-        """Merge one parsed frame into the cache (position updates lat/lon/speed,
-        static updates ship_type/draught). Public-ish for tests."""
+        """Merge one parsed frame into the cache: position frames update
+        lat/lon/speed/heading, static frames update ship_type/draught/name. Tracks a
+        last-seen time per entry (for TTL + capacity eviction) and guards position
+        overwrites by frame time so an out-of-order stale frame can't regress a fresh
+        one. Public-ish for tests."""
         p = parse_aisstream_message(msg)
         if not p:
             return
         self._messages += 1
         mmsi = p["mmsi"]
+        now = time.monotonic()
+        is_position = "lat" in p
         cur = self._cache.get(mmsi)
         if cur is None:
             if len(self._cache) >= self._max:
-                return  # bounded
+                # Evict the oldest entry rather than dropping the newcomer forever.
+                oldest = min(self._cache, key=lambda k: self._cache[k].get("_ts", 0.0))
+                del self._cache[oldest]
+            p["_ts"] = now
+            p["_ts_wall"] = time.time()
+            if is_position and "frame_ms" in p:
+                p["_pos_frame_ms"] = p["frame_ms"]
             self._cache[mmsi] = p
+            return
+
+        # Existing entry: guard the position overwrite against stale frames.
+        if is_position and "frame_ms" in p and cur.get("_pos_frame_ms") is not None \
+                and p["frame_ms"] < cur["_pos_frame_ms"]:
+            for k in ("ship_type", "draught", "name"):   # static identity only
+                if k in p:
+                    cur[k] = p[k]
         else:
             cur.update(p)
+            if is_position and "frame_ms" in p:
+                cur["_pos_frame_ms"] = p["frame_ms"]
+        cur["_ts"] = now
+        cur["_ts_wall"] = time.time()
 
     def snapshot(self) -> list[dict]:
-        """Current vessels with a known position, normalized to the geo-feed shape."""
+        """Current, non-stale vessels with a known position (geo-feed shape).
+        Entries unheard from for > _STALE_TTL_S are dropped (no frozen phantoms)."""
         out = []
-        for v in self._cache.values():
+        now = time.monotonic()
+        stale = []
+        for mmsi, v in self._cache.items():
+            if now - v.get("_ts", 0.0) > _STALE_TTL_S:
+                stale.append(mmsi)
+                continue
             if "lat" not in v or "lon" not in v:
                 continue
             st = int(v.get("ship_type", 0))
@@ -108,8 +161,11 @@ class AISStreamClient:
                 "ship_type": st, "is_tanker": 80 <= st <= 89,
                 "category": "tanker" if 80 <= st <= 89 else ("cargo" if 70 <= st <= 79 else "other"),
                 "name": v.get("name", ""), "draught": v.get("draught", 0.0),
-                "chokepoint": None, "timestamp_ms": 0,
+                "chokepoint": None,
+                "timestamp_ms": int(v.get("frame_ms") or v.get("_ts_wall", 0.0) * 1000),
             })
+        for mmsi in stale:   # actually evict stale entries so the cache can't grow
+            self._cache.pop(mmsi, None)
         return out
 
     async def start(self) -> None:
