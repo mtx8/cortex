@@ -39,6 +39,9 @@ class MessageType(str, Enum):
     GEO_CHOKEPOINT = "geo_chokepoint"
     GEO_HEATMAP = "geo_heatmap"
 
+    # Macro / fixed income
+    MACRO_RATES = "macro_rates"
+
     # Trade View
     L2_UPDATE = "l2_update"
     TIME_SALES = "time_sales"

@@ -44,6 +44,12 @@ async def lifespan(app: FastAPI):
     if geo_feed is not None:
         geo_task = asyncio.create_task(geo_feed.start())
 
+    # Start macro / fixed-income feed if available (Treasury rates)
+    macro_task = None
+    macro_feed = components.get("macro_feed")
+    if macro_feed is not None:
+        macro_task = asyncio.create_task(macro_feed.start())
+
     # Start status broadcaster if available
     status_task = None
     status_broadcaster = components.get("status_broadcaster")
@@ -77,6 +83,15 @@ async def lifespan(app: FastAPI):
         geo_task.cancel()
         try:
             await geo_task
+        except asyncio.CancelledError:
+            pass
+
+    if macro_feed is not None:
+        await macro_feed.stop()
+    if macro_task is not None:
+        macro_task.cancel()
+        try:
+            await macro_task
         except asyncio.CancelledError:
             pass
 
@@ -648,6 +663,9 @@ def create_app_components() -> dict:
     from cortex.feeds.geo_feed import GeoIntelligenceFeed
     from cortex.squadrons.india.maritime_analyst import MaritimeAnalyst
     from cortex.squadrons.india.geo_risk_mapper import GeoRiskMapper
+    from cortex.connectors.macro.client import MacroEgressClient
+    from cortex.feeds.macro_feed import MacroFeed
+    from cortex.squadrons.juliett.rates_analyst import RatesAnalyst
     from cortex.connectors.ibkr.client import IBKRConnectionManager, IBKRConfig
     from cortex.connectors.ibkr.rate_limiter import IBKRRateLimiter
     from cortex.connectors.sec.edgar_client import EDGARClient
@@ -783,6 +801,10 @@ def create_app_components() -> dict:
     geo_risk_mapper = GeoRiskMapper(bus=bus)
     orchestrator.register_agent(geo_risk_mapper)
 
+    # JULIETT squadron — Macro / fixed income
+    rates_analyst = RatesAnalyst(bus=bus)
+    orchestrator.register_agent(rates_analyst)
+
     # WebSocket broadcaster
     broadcaster = WSBroadcaster(bus=bus)
 
@@ -831,6 +853,16 @@ def create_app_components() -> dict:
         bus=bus,
         poll_interval=config.geo_poll_interval,
         enabled=config.geo_enabled,
+    )
+
+    # Macro / fixed-income feed (Treasury rates through the same hardened egress)
+    macro_client = MacroEgressClient(fred_api_key=config.fred_api_key)
+    macro_feed = MacroFeed(
+        macro_client=macro_client,
+        broadcaster=broadcaster,
+        bus=bus,
+        poll_interval=config.macro_poll_interval,
+        enabled=config.macro_enabled,
     )
 
     # IBKR (optional — only if TWS/Gateway is running)
@@ -891,6 +923,9 @@ def create_app_components() -> dict:
         "geo_risk_mapper": geo_risk_mapper,
         "llm_router": llm_router,
         "scanner_engine": scanner_engine,
+        "macro_client": macro_client,
+        "macro_feed": macro_feed,
+        "rates_analyst": rates_analyst,
     }
 
 

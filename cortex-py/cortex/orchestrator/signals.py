@@ -69,6 +69,11 @@ class SignalTypes:
     GEO_SEISMIC_PROXIMITY = "india.geo_seismic_proximity" # quake near an energy asset
     EGRESS_VALIDATION_FAILED = "india.egress_failed"
 
+    # JULIETT -> ECHO, GOLF, intelligence (macro / fixed income)
+    MACRO_RATES = "juliett.macro_rates"                   # feed -> rates analyst
+    YIELD_CURVE_INVERSION = "juliett.yield_curve_inversion"
+    RATES_REGIME = "juliett.rates_regime"
+
     # System
     AGENT_HEALTH = "system.agent_health"
     STRATEGY_UPDATE = "intelligence.strategy_update"

@@ -39,6 +39,10 @@ class CortexConfig(BaseSettings):
     eia_api_key: str = ""          # EIA petroleum status / chokepoint volumes
     fred_api_key: str = ""         # FRED yield curve / econ series
 
+    # Macro / fixed income (Treasury rates are keyless; FRED needs fred_api_key)
+    macro_enabled: bool = True
+    macro_poll_interval: float = 3600.0   # Treasury avg rates update monthly
+
     # Local-first LLM stack — router tries providers in order, falling back.
     # Claude stays strategic-cycle only (rule #5/#7); no LLM in the hot path.
     llm_provider_order: str = "local,claude,gemini"
