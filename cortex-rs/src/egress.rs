@@ -109,7 +109,9 @@ fn build_client() -> reqwest::Client {
                 ALLOWED_HOSTS.iter().any(|a| *a == h)
             })
             .unwrap_or(false);
-        if url.scheme() == "https" && host_ok {
+        // https + allowlisted host + default port only (no redirect to a non-443
+        // port on an allowlisted host).
+        if url.scheme() == "https" && host_ok && url.port().is_none() {
             attempt.follow()
         } else {
             attempt.stop()
@@ -161,6 +163,13 @@ pub async fn guarded_get(
     }
     let host = parsed.host_str().ok_or(GeoError::InvalidUrl)?.to_string();
     validate_host_str(&host)?;
+    // Port must be the default https port. `url` normalizes :443 to None, so any
+    // Some(port) is an explicit non-default port — reject it. Otherwise an
+    // allowlisted host on a co-hosted non-443 service could be reached AND a bound
+    // credential header forwarded there (the allowlist would be host-only).
+    if let Some(p) = parsed.port() {
+        return Err(GeoError::HostNotAllowed(format!("{host}:{p}")));
+    }
 
     let mut req = client
         .get(parsed)
@@ -333,6 +342,15 @@ mod tests {
     async fn rejects_disallowed_host_before_request() {
         let c = reqwest::Client::new();
         let r = guarded_get(&c, "https://attacker.example/secret", None, 3000, MAX_BYTES).await;
+        assert!(matches!(r, Err(GeoError::HostNotAllowed(_))));
+    }
+
+    #[tokio::test]
+    async fn rejects_non_default_port_on_allowlisted_host() {
+        // Allowlisted host but an explicit non-443 port — must be rejected before
+        // any byte leaves (host-only allowlist would otherwise forward credentials).
+        let c = reqwest::Client::new();
+        let r = guarded_get(&c, "https://api.x.com:1337/x", None, 3000, MAX_BYTES).await;
         assert!(matches!(r, Err(GeoError::HostNotAllowed(_))));
     }
 }

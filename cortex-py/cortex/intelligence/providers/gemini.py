@@ -42,4 +42,12 @@ class GeminiProvider(LLMProvider):
             r = await client.post(url, json=body)
             r.raise_for_status()
             data = r.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        # Gemini can block (safety) or return no parts — fail loudly so the router
+        # falls through instead of raising an opaque KeyError/IndexError.
+        cands = data.get("candidates") or []
+        if not cands:
+            raise RuntimeError(f"gemini blocked/empty: {data.get('promptFeedback')}")
+        parts = (cands[0].get("content") or {}).get("parts") or []
+        if not parts or "text" not in parts[0]:
+            raise RuntimeError(f"gemini no text (finishReason={cands[0].get('finishReason')})")
+        return parts[0]["text"]

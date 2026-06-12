@@ -5,7 +5,7 @@
 //! are *leading indicators* that feed the strategic cycle; they never trigger
 //! naked execution (that stays behind the kill switch + autonomy dial in Python).
 
-use crate::geo::{chokepoint_at_inner, CHOKEPOINTS};
+use crate::geo::{chokepoint_at_inner, chokepoint_index_inner, CHOKEPOINTS};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -178,12 +178,7 @@ pub fn chokepoint_congestion(
     let mut speed_sum = vec![0.0f64; CHOKEPOINTS.len()];
 
     for i in 0..n {
-        if let Some(c) = chokepoint_at_inner(lats[i], lons[i]) {
-            // Index by pointer identity within the static slice.
-            let idx = CHOKEPOINTS
-                .iter()
-                .position(|x| std::ptr::eq(x, c))
-                .unwrap_or(0);
+        if let Some(idx) = chokepoint_index_inner(lats[i], lons[i]) {
             counts[idx] += 1;
             speed_sum[idx] += speeds_knots[i];
             if is_tanker_inner(ship_types[i]) {

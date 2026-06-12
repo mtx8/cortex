@@ -49,6 +49,15 @@ pub fn chokepoint_at_inner(lat: f64, lon: f64) -> Option<&'static Chokepoint> {
         .find(|c| haversine_km_inner(lat, lon, c.lat, c.lon) <= c.radius_km)
 }
 
+/// Index into CHOKEPOINTS of the first geofence containing the point, if any.
+/// Returned directly (not recovered via pointer identity) so callers never risk
+/// a silent misattribution.
+pub fn chokepoint_index_inner(lat: f64, lon: f64) -> Option<usize> {
+    CHOKEPOINTS
+        .iter()
+        .position(|c| haversine_km_inner(lat, lon, c.lat, c.lon) <= c.radius_km)
+}
+
 // ---------------------------------------------------------------------------
 // PyO3 surface
 // ---------------------------------------------------------------------------
@@ -128,5 +137,13 @@ mod tests {
     fn open_ocean_is_no_chokepoint() {
         // Mid-Pacific.
         assert!(chokepoint_at_inner(0.0, -140.0).is_none());
+    }
+
+    #[test]
+    fn chokepoint_index_attributes_correctly_not_hormuz() {
+        // Malacca is index 1 — must NOT silently resolve to Hormuz (index 0).
+        assert_eq!(chokepoint_index_inner(2.5, 101.5), Some(1));
+        assert_eq!(chokepoint_index_inner(26.6, 56.3), Some(0)); // Hormuz
+        assert_eq!(chokepoint_index_inner(0.0, -140.0), None);
     }
 }

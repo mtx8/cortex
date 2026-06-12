@@ -87,6 +87,22 @@ async def test_floating_storage_alpha():
     assert syms.get("FRO") == "long"          # bullish tanker rates
 
 
+async def test_idle_tracker_is_bounded_to_current_batch():
+    """_idle_since must not grow unbounded — it's pruned to the present snapshot."""
+    bus = SignalBus()
+    agent = MaritimeAnalyst(bus)
+    _capture(agent)
+    batch1 = [{"mmsi": 1000 + i, "lat": 0.0, "lon": -140.0, "speed_knots": 0.1,
+               "ship_type": 80, "is_tanker": True, "draught": 0.0} for i in range(5)]
+    await agent.handle_signal(_batch_signal(batch1))
+    assert set(agent._idle_since.keys()) == {1000 + i for i in range(5)}
+    # A fresh batch with different MMSIs evicts the old ones.
+    batch2 = [{"mmsi": 2000 + i, "lat": 0.0, "lon": -140.0, "speed_knots": 0.1,
+               "ship_type": 80, "is_tanker": True, "draught": 0.0} for i in range(3)]
+    await agent.handle_signal(_batch_signal(batch2))
+    assert set(agent._idle_since.keys()) == {2000 + i for i in range(3)}
+
+
 async def test_no_alpha_when_quiet():
     """A handful of fast-moving cargo ships nowhere near a chokepoint = no alpha."""
     bus = SignalBus()

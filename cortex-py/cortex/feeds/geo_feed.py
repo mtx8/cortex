@@ -109,6 +109,7 @@ class GeoIntelligenceFeed:
         self._last_vessels: list[dict] = []
         self._last_events: list[dict] = []
         self._ais_meta: dict[int, dict] = {}
+        self._seen_quake_ids: set[str] = set()
         self._warned_unavailable = False
 
     @property
@@ -168,19 +169,26 @@ class GeoIntelligenceFeed:
         sig_events = [_event_to_dict(e) for e in events if e.magnitude >= _MIN_SEISMIC_MAG]
         if sig_events:
             self._last_events = sig_events
+            # The globe shows the full current set each poll.
             await self._broadcaster.broadcast(CortexMessage(
                 type=MessageType.GEO_SIGNAL,
                 payload={"events": sig_events, "count": len(sig_events)},
             ))
-            for ev in sig_events:
+            # Bus alerts fire only for NEW quakes — USGS ids are stable across polls,
+            # so without dedup the same quake re-alerts every cycle.
+            new_events = [ev for ev in sig_events if ev["id"] not in self._seen_quake_ids]
+            for ev in new_events:
+                self._seen_quake_ids.add(ev["id"])
                 await self._bus.publish(Signal(
-                    signal_id=f"geo_seismic_{ev['id']}_{self._poll_count}",
+                    signal_id=f"geo_seismic_{ev['id']}",
                     source_agent="geo_feed",
                     source_squadron="feeds",
                     signal_type=SignalTypes.GEO_SEISMIC,
                     payload=ev,
                     priority=SignalPriority.NORMAL,
                 ))
+            if len(self._seen_quake_ids) > 5000:  # bound the dedup set
+                self._seen_quake_ids = {ev["id"] for ev in sig_events}
 
         self._poll_count += 1
         log.debug("geo_feed.poll", poll=self._poll_count,

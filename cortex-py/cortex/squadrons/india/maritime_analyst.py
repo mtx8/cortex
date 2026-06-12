@@ -117,6 +117,11 @@ class MaritimeAnalyst(BaseAgent):
                                        c["congestion_score"],
                                        extra={"chokepoint": c["name"], "detail": c})
 
+        # Bound the idle tracker to vessels in the current snapshot so it can't grow
+        # without limit as vessels enter/leave AIS coverage.
+        present = {int(v.get("mmsi", 0)) for v in vessels}
+        self._idle_since = {m: ts for m, ts in self._idle_since.items() if m in present}
+
     async def _emit_alpha(self, kind: str, tickers: list[dict], score: float,
                           extra: dict | None = None) -> None:
         confidence = round(min(1.0, score / 100.0), 3)

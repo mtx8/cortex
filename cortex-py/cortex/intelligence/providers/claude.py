@@ -47,4 +47,8 @@ class ClaudeProvider(LLMProvider):
         if system:
             kwargs["system"] = system
         resp = await client.messages.create(**kwargs)
-        return resp.content[0].text
+        # Don't assume content[0] is a text block (could be tool_use / empty).
+        parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
+        if not parts:
+            raise RuntimeError(f"claude returned no text (stop_reason={getattr(resp, 'stop_reason', None)})")
+        return "".join(parts)

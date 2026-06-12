@@ -151,10 +151,18 @@ public final class GeoIntelligenceStore {
     /// Compact JSON for the WKWebView globe: vessels [lat,lon,tankerFlag],
     /// events [lat,lon,mag]. Kept small for fast evaluateJavaScript pushes.
     public func globePayloadJSON() -> String {
-        let v = vessels.prefix(maxRenderVessels).map { [$0.lat, $0.lon, $0.isTanker ? 1.0 : 0.0] }
-        let e = events.map { [$0.lat, $0.lon, $0.magnitude] }
-        let obj: [String: Any] = ["vessels": v, "events": e]
-        guard let data = try? JSONSerialization.data(withJSONObject: obj),
+        // NaN/Infinity make JSONSerialization throw an NSException that `try?` does
+        // NOT catch (it's not a Swift error) — that would crash the app. Filter to
+        // finite values and validate before serializing.
+        let v = vessels.prefix(maxRenderVessels)
+            .filter { $0.lat.isFinite && $0.lon.isFinite }
+            .map { [$0.lat, $0.lon, $0.isTanker ? 1.0 : 0.0] }
+        let e = events
+            .filter { $0.lat.isFinite && $0.lon.isFinite && $0.magnitude.isFinite }
+            .map { [$0.lat, $0.lon, $0.magnitude] }
+        let obj: [String: Any] = ["vessels": Array(v), "events": e]
+        guard JSONSerialization.isValidJSONObject(obj),
+              let data = try? JSONSerialization.data(withJSONObject: obj),
               let s = String(data: data, encoding: .utf8) else { return "{\"vessels\":[],\"events\":[]}" }
         return s
     }

@@ -17,10 +17,20 @@ echo "== CORTEX preflight security gate =="
 # 1) Rust lockfile committed (reproducible supply chain)
 if [ -f cortex-rs/Cargo.lock ]; then ok "cortex-rs/Cargo.lock present"; else bad "cortex-rs/Cargo.lock missing"; fi
 
-# 2) No hardcoded secrets in source (exclude tests, .env, examples)
-SECRET_HITS=$(grep -rEn "(sk-ant-[A-Za-z0-9]|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)" \
-  cortex-py/cortex cortex-rs/src cortex-app/Sources 2>/dev/null | grep -vE "\.env|test_|/tests/" || true)
-if [ -z "$SECRET_HITS" ]; then ok "no hardcoded secrets in source"; else bad "hardcoded secret(s):"; echo "$SECRET_HITS"; fi
+# 2) No hardcoded secrets. Prefer gitleaks (authoritative; the repo CI uses it);
+#    otherwise a broadened regex pre-filter with an ANCHORED test-path skip (the
+#    old substring skip wrongly excluded files like 'latest_*').
+if command -v gitleaks >/dev/null 2>&1; then
+  if gitleaks detect --no-banner --redact -s . >/dev/null 2>&1; then ok "gitleaks: no leaks";
+  else bad "gitleaks detected secrets (run: gitleaks detect --redact)"; fi
+else
+  SECRET_HITS=$(grep -rEnI \
+    "(sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(api[_-]?key|secret|token|passwd|password)[\"' ]*[:=][\"' ]*[A-Za-z0-9/+_=-]{16,})" \
+    cortex-py/cortex cortex-rs/src cortex-app/Sources 2>/dev/null \
+    | grep -vE "^[^:]*/(tests?/|test_)" || true)
+  if [ -z "$SECRET_HITS" ]; then ok "no hardcoded secrets (regex pre-filter; install gitleaks for full scan)";
+  else bad "possible hardcoded secret(s):"; echo "$SECRET_HITS"; fi
+fi
 
 # 3) No iCloud path references (HARD RULE #1)
 ICLOUD_HITS=$(grep -rEn "Mobile Documents|com~apple~CloudDocs" \
