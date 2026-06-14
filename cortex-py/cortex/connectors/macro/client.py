@@ -9,6 +9,9 @@ never touch the WebView, and a compromised caller still can't reach arbitrary ho
 from __future__ import annotations
 
 import asyncio
+import datetime
+import xml.etree.ElementTree as ET
+
 import structlog
 
 log = structlog.get_logger()
@@ -25,6 +28,34 @@ TREASURY_AVG_RATES = (
     "accounting/od/avg_interest_rates?sort=-record_date&page%5Bsize%5D=40"
 )
 FRED_OBSERVATIONS = "https://api.stlouisfed.org/fred/series/observations"
+# Treasury "Daily Treasury Par Yield Curve Rates" — keyless Atom/XML, one entry
+# per business day for the requested month. This is the canonical par-yield curve
+# used to compute 2s10s / 3m10s, a real upgrade over the average-rate proxy.
+PAR_YIELD_CURVE = (
+    "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+    "pages/xml?data=daily_treasury_yield_curve&field_tdr_date_value_month={ym}"
+)
+# Atom / ADO.NET dataservices namespaces used by the Treasury XML feed.
+_ATOM_NS = "{http://www.w3.org/2005/Atom}"
+_D_NS = "{http://schemas.microsoft.com/ado/2007/08/dataservices}"
+# The <m:properties> wrapper is in the METADATA namespace; the fields inside are d:.
+_M_NS = "{http://schemas.microsoft.com/ado/2007/08/dataservices/metadata}"
+# Treasury BC_* property name -> short tenor label used in the curve dict.
+_PAR_TENORS = {
+    "BC_1MONTH": "1Mo", "BC_2MONTH": "2Mo", "BC_3MONTH": "3Mo", "BC_4MONTH": "4Mo",
+    "BC_6MONTH": "6Mo", "BC_1YEAR": "1Yr", "BC_2YEAR": "2Yr", "BC_3YEAR": "3Yr",
+    "BC_5YEAR": "5Yr", "BC_7YEAR": "7Yr", "BC_10YEAR": "10Yr", "BC_20YEAR": "20Yr",
+    "BC_30YEAR": "30Yr",
+}
+# home.treasury.gov sits behind bot-mitigation that rejects non-browser clients.
+# This is a PUBLIC gov data feed, so we present a browser UA for THIS host only.
+# The Rust egress still enforces the exact-host allowlist + https + port-443 + byte
+# cap + redirect containment, so this is a per-feed header, not a security relaxation.
+_BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17 Safari/605.1.15"),
+    "Accept": "application/atom+xml,application/xml,text/xml,*/*",
+}
 # Treasury "Rates of Exchange" — keyless USD reference FX (units of currency per USD).
 FX_RATES = (
     "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v1/"
@@ -51,12 +82,12 @@ class MacroEgressClient:
     def available(self) -> bool:
         return _cs is not None
 
-    async def _fetch(self, url: str, timeout_ms: int | None = None):
+    async def _fetch(self, url: str, timeout_ms: int | None = None, headers: dict | None = None):
         if _cs is None:
             raise RuntimeError("cortex_scanner egress core not installed")
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, _cs.geo_fetch, url, None, timeout_ms or self._timeout_ms, 5 * 1024 * 1024
+            None, _cs.geo_fetch, url, headers, timeout_ms or self._timeout_ms, 5 * 1024 * 1024
         )
 
     async def fetch_treasury_rates(self) -> dict:
@@ -102,6 +133,80 @@ class MacroEgressClient:
             "long_pct": long,
             "spread_bps": spread_bps,   # long minus short; negative ≈ inverted
         }
+
+    def _parse_par_yield_xml(self, body: str) -> dict:
+        """Parse the Treasury daily par-yield Atom/XML into the LATEST day's curve.
+        Returns {} on any malformed/empty input (never raises). Tolerant of
+        missing tenors. Entries are ascending by date, so the latest is the last
+        well-dated entry we can parse."""
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as e:
+            log.warning("macro.par_curve_parse", error=str(e))
+            return {}
+        best: dict | None = None
+        best_date = ""
+        for entry in root.iter(f"{_ATOM_NS}entry"):
+            props = entry.find(f"{_ATOM_NS}content/{_M_NS}properties")
+            if props is None:
+                continue
+            raw_date = props.findtext(f"{_D_NS}NEW_DATE")
+            if not raw_date:
+                continue
+            # "2026-06-12T00:00:00" -> "2026-06-12"
+            date = raw_date.split("T", 1)[0]
+            tenors: dict[str, float] = {}
+            for field, label in _PAR_TENORS.items():
+                txt = props.findtext(f"{_D_NS}{field}")
+                if txt is None or txt == "":
+                    continue
+                try:
+                    tenors[label] = float(txt)
+                except (TypeError, ValueError):
+                    continue
+            if not tenors:
+                continue
+            # Keep the chronologically latest dated entry (ISO dates sort lexically).
+            if date >= best_date:
+                best_date = date
+                best = {"date": date, "tenors": tenors}
+        if best is None:
+            return {}
+        tenors = best["tenors"]
+
+        def _spread(long_label: str, short_label: str) -> float | None:
+            lo, sh = tenors.get(long_label), tenors.get(short_label)
+            if lo is None or sh is None:
+                return None
+            return round((lo - sh) * 100, 1)  # pct points -> bps
+
+        best["spread_2s10s_bps"] = _spread("10Yr", "2Yr")
+        best["spread_3m10s_bps"] = _spread("10Yr", "3Mo")
+        return best
+
+    async def fetch_par_yield_curve(self) -> dict:
+        """Latest Treasury daily PAR-yield curve (canonical 2s10s / 3m10s). Returns
+        {date, tenors:{1Mo:.., 3Mo:.., 2Yr:.., 10Yr:.., 30Yr:..},
+         spread_2s10s_bps, spread_3m10s_bps} or {} on any failure (never raises).
+        2s10s = 10Yr - 2Yr; 3m10s = 10Yr - 3Mo (bps); negative = inverted."""
+        if _cs is None:
+            return {}
+        ym = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m")
+        url = PAR_YIELD_CURVE.format(ym=ym)
+        try:
+            # Treasury is slow + bot-gated: longer timeout + browser UA for this host.
+            res = await self._fetch(url, timeout_ms=30000, headers=_BROWSER_HEADERS)
+        except Exception as e:
+            log.warning("macro.par_curve_error", error=str(e))
+            return {}
+        if not res.ok:
+            log.warning("macro.par_curve_http", status=res.status)
+            return {}
+        if res.truncated:
+            # A truncated Atom feed can split an entry; refuse partial curve data.
+            log.warning("macro.par_curve_truncated")
+            return {}
+        return self._parse_par_yield_xml(res.body)
 
     async def fetch_fx_rates(self) -> dict:
         """Latest USD reference FX for major currencies (keyless). Returns

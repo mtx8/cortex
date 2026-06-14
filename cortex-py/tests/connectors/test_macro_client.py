@@ -67,6 +67,40 @@ _FX_BODY = orjson.dumps({
 }).decode()
 
 
+_PAR_XML = """<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" \
+xmlns:d="http://schemas.microsoft.com/ado/2007/08/dataservices" \
+xmlns:m="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata">
+ <entry><content type="application/xml"><m:properties>
+   <d:NEW_DATE m:type="Edm.DateTime">2026-06-01T00:00:00</d:NEW_DATE>
+   <d:BC_3MONTH m:type="Edm.Double">3.70</d:BC_3MONTH>
+   <d:BC_2YEAR m:type="Edm.Double">3.60</d:BC_2YEAR>
+   <d:BC_10YEAR m:type="Edm.Double">3.20</d:BC_10YEAR>
+ </m:properties></content></entry>
+ <entry><content type="application/xml"><m:properties>
+   <d:NEW_DATE m:type="Edm.DateTime">2026-06-12T00:00:00</d:NEW_DATE>
+   <d:BC_3MONTH m:type="Edm.Double">3.75</d:BC_3MONTH>
+   <d:BC_2YEAR m:type="Edm.Double">3.55</d:BC_2YEAR>
+   <d:BC_10YEAR m:type="Edm.Double">3.30</d:BC_10YEAR>
+ </m:properties></content></entry>
+</feed>"""
+
+
+def test_par_yield_xml_parses_latest_and_spreads():
+    out = MacroEgressClient()._parse_par_yield_xml(_PAR_XML)
+    assert out["date"] == "2026-06-12"  # latest entry wins
+    assert out["tenors"]["10Yr"] == 3.30 and out["tenors"]["2Yr"] == 3.55
+    # 2s10s = (10Yr - 2Yr) * 100 = (3.30 - 3.55)*100 = -25 bps (inverted)
+    assert out["spread_2s10s_bps"] == -25.0
+    # 3m10s = (3.30 - 3.75)*100 = -45 bps
+    assert out["spread_3m10s_bps"] == -45.0
+
+
+def test_par_yield_xml_malformed_is_empty():
+    assert MacroEgressClient()._parse_par_yield_xml("not xml") == {}
+    assert MacroEgressClient()._parse_par_yield_xml("<feed></feed>") == {}
+
+
 async def test_fx_parse_majors_latest_only(monkeypatch):
     monkeypatch.setattr(macro_mod, "_cs", _FakeCS(_FX_BODY))
     out = await MacroEgressClient().fetch_fx_rates()

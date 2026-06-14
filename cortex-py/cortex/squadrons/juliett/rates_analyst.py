@@ -37,26 +37,45 @@ class RatesAnalyst(BaseAgent):
 
     async def handle_signal(self, signal: Signal) -> None:
         p = signal.payload
-        spread = p.get("spread_bps")
         long_pct = p.get("long_pct")
+
+        # PREFER the real par-yield curve (canonical 2s10s / 3m10s) when present;
+        # fall back to the average-rate short-vs-long proxy when it's absent.
+        par = p.get("par_curve") or {}
+        s2s10s = par.get("spread_2s10s_bps")
+        s3m10s = par.get("spread_3m10s_bps")
+        if s2s10s is not None or s3m10s is not None:
+            # Use 2s10s as the headline spread, 3m10s as the secondary trigger.
+            spread = s2s10s if s2s10s is not None else s3m10s
+            inverted = (s2s10s is not None and s2s10s < 0) or (s3m10s is not None and s3m10s < 0)
+            curve_source = "treasury_par_curve"
+            curve_date = par.get("date") or p.get("date")
+        else:
+            spread = p.get("spread_bps")
+            inverted = spread is not None and spread < 0
+            curve_source = "treasury_avg_rates"
+            curve_date = p.get("date")
         self._last_spread_bps = spread
 
-        # Curve inversion (short > long => negative long-minus-short spread).
-        if spread is not None and spread < 0:
+        # Curve inversion (short > long => negative spread).
+        if inverted:
             self._inversions += 1
             await self.emit(SignalTypes.YIELD_CURVE_INVERSION, payload={
                 "signal": "yield_curve_inversion",
                 "spread_bps": spread,
-                "date": p.get("date"),
+                "spread_2s10s_bps": s2s10s,
+                "spread_3m10s_bps": s3m10s,
+                "date": curve_date,
                 "tickers": [
                     {"symbol": "TLT", "direction": "long", "rationale": "inversion → duration bid / risk-off"},
                     {"symbol": "XLF", "direction": "short", "rationale": "inversion pressures bank NIM / cyclicals"},
                     {"symbol": "XLU", "direction": "long", "rationale": "defensives outperform into slowdown"},
                 ],
-                "source": "treasury",
+                "source": curve_source,
                 "ts": time.time(),
             }, priority=SignalPriority.NORMAL)
-            log.info("rates.inversion", spread_bps=spread, date=p.get("date"))
+            log.info("rates.inversion", spread_bps=spread, s2s10s=s2s10s,
+                     s3m10s=s3m10s, source=curve_source, date=curve_date)
 
         # Rate-level regime → risk appetite hint for the strategic cycle.
         regime = None

@@ -54,6 +54,7 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "api.eia.gov",               // EIA petroleum status + chokepoint volumes
     "api.stlouisfed.org",        // FRED yield curve + economic series
     "api.fiscaldata.treasury.gov", // US Treasury daily yield curve
+    "home.treasury.gov",         // daily par-yield curve XML (gov HTTPS, same posture as fiscaldata.treasury.gov)
     // ---- social (keyed-only; falls back to GDELT without a token) ----------
     "api.x.com",
     "api.twitter.com",

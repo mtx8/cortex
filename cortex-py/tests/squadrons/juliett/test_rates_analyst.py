@@ -54,6 +54,30 @@ async def test_regime_levels():
     assert [p["regime"] for t, p in em2 if t == SignalTypes.RATES_REGIME][-1] == "accommodative"
 
 
+async def test_par_curve_preferred_over_avg_rate_proxy():
+    agent = RatesAnalyst(SignalBus())
+    emitted = _capture(agent)
+    # Proxy says NOT inverted (+50bp), but the real par curve 2s10s is -25bp.
+    await agent.handle_signal(_sig({
+        "long_pct": 3.3, "spread_bps": 50.0,
+        "par_curve": {"date": "2026-06-12", "spread_2s10s_bps": -25.0,
+                      "spread_3m10s_bps": -45.0,
+                      "tenors": {"2Yr": 3.55, "10Yr": 3.30, "3Mo": 3.75}},
+    }))
+    inv = [p for t, p in emitted if t == SignalTypes.YIELD_CURVE_INVERSION]
+    assert inv, "real par-curve 2s10s<0 must fire inversion even when the proxy is positive"
+    assert inv[0]["source"] == "treasury_par_curve"
+    assert inv[0]["spread_2s10s_bps"] == -25.0
+
+
+async def test_avg_rate_proxy_still_used_without_par_curve():
+    agent = RatesAnalyst(SignalBus())
+    emitted = _capture(agent)
+    await agent.handle_signal(_sig({"long_pct": 4.0, "spread_bps": -80.0}))  # no par_curve
+    inv = [p for t, p in emitted if t == SignalTypes.YIELD_CURVE_INVERSION]
+    assert inv and inv[0]["source"] == "treasury_avg_rates"
+
+
 async def test_regime_emits_only_on_change():
     agent = RatesAnalyst(SignalBus())
     emitted = _capture(agent)

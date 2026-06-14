@@ -60,6 +60,13 @@ class MacroFeed:
                 rates = {**rates, "fx": fx}
         except Exception as e:
             log.warning("macro_feed.fx_error", error=str(e))
+        # Canonical daily par-yield curve (keyless XML) — real 2s10s / 3m10s.
+        try:
+            par = await self._macro.fetch_par_yield_curve()
+            if par:
+                rates = {**rates, "par_curve": par}
+        except Exception as e:
+            log.warning("macro_feed.par_curve_error", error=str(e))
         self._last_rates = rates
         self._poll_count += 1
 
