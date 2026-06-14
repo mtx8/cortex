@@ -101,6 +101,20 @@ def test_par_yield_xml_malformed_is_empty():
     assert MacroEgressClient()._parse_par_yield_xml("<feed></feed>") == {}
 
 
+_FX_DAILY_BODY = orjson.dumps({
+    "amount": 1.0, "base": "USD", "date": "2026-06-12",
+    "rates": {"EUR": 0.87, "JPY": 159.41, "CAD": 1.3988},
+}).decode()
+
+
+async def test_fx_daily_parse(monkeypatch):
+    monkeypatch.setattr(macro_mod, "_cs", _FakeCS(_FX_DAILY_BODY))
+    out = await MacroEgressClient().fetch_fx_daily()
+    assert out["base"] == "USD" and out["date"] == "2026-06-12"
+    assert out["rates"]["EUR"] == 0.87 and out["rates"]["JPY"] == 159.41
+    assert out["source"] == "ecb_frankfurter" and len(out["rates"]) == 3
+
+
 async def test_fx_parse_majors_latest_only(monkeypatch):
     monkeypatch.setattr(macro_mod, "_cs", _FakeCS(_FX_BODY))
     out = await MacroEgressClient().fetch_fx_rates()

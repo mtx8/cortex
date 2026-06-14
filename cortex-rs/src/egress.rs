@@ -55,6 +55,7 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "api.stlouisfed.org",        // FRED yield curve + economic series
     "api.fiscaldata.treasury.gov", // US Treasury daily yield curve
     "home.treasury.gov",         // daily par-yield curve XML (gov HTTPS, same posture as fiscaldata.treasury.gov)
+    "api.frankfurter.dev",       // daily ECB reference FX — free, keyless
     // ---- social (keyed-only; falls back to GDELT without a token) ----------
     "api.x.com",
     "api.twitter.com",

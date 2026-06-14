@@ -67,6 +67,9 @@ _FX_MAJORS = {
     "United Kingdom-Pound": "GBP", "Canada-Dollar": "CAD", "Switzerland-Franc": "CHF",
     "Australia-Dollar": "AUD", "Mexico-Peso": "MXN", "India-Rupee": "INR", "Brazil-Real": "BRL",
 }
+# Frankfurter — free, keyless DAILY ECB reference FX (USD base, ~29 currencies).
+# Preferred over the quarterly Treasury FX; the latter is the fallback.
+FRANKFURTER_FX = "https://api.frankfurter.dev/v1/latest?base=USD"
 
 # Map a Treasury security_desc -> a short tenor bucket for spread/curve logic.
 _SHORT_DESCS = {"Treasury Bills"}
@@ -243,6 +246,37 @@ class MacroEgressClient:
             except (TypeError, ValueError):
                 continue
         return {"date": latest, "rates": out}
+
+    async def fetch_fx_daily(self) -> dict:
+        """Daily ECB reference FX (keyless, USD base, ~29 currencies via Frankfurter).
+        Returns {date, base, rates:{EUR:.., ...}, source:'ecb_frankfurter'} or {}.
+        Preferred over the quarterly Treasury FX (fetch_fx_rates)."""
+        if _cs is None:
+            return {}
+        try:
+            res = await self._fetch(FRANKFURTER_FX)
+        except Exception as e:
+            log.warning("macro.fx_daily_error", error=str(e))
+            return {}
+        if not res.ok:
+            return {}
+        try:
+            import orjson
+            data = orjson.loads(res.body)
+        except Exception as e:
+            log.warning("macro.fx_daily_parse", error=str(e))
+            return {}
+        raw = data.get("rates")
+        if not isinstance(raw, dict) or not raw:
+            return {}
+        rates: dict[str, float] = {}
+        for k, v in raw.items():
+            try:
+                rates[k] = float(v)
+            except (TypeError, ValueError):
+                continue
+        return {"date": data.get("date"), "base": data.get("base", "USD"),
+                "rates": rates, "source": "ecb_frankfurter"}
 
     async def fetch_fred_latest(self, series_id: str) -> float | None:
         """Latest observation for a FRED series (e.g. DGS10). Needs a free key;

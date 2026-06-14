@@ -53,9 +53,10 @@ class MacroFeed:
             rates = {}
         if not rates:
             return
-        # Reference FX (keyless, quarterly) rides along on the macro message.
+        # Reference FX: prefer daily ECB (Frankfurter, keyless); fall back to the
+        # quarterly Treasury rates. Rides along on the macro message.
         try:
-            fx = await self._macro.fetch_fx_rates()
+            fx = await self._macro.fetch_fx_daily() or await self._macro.fetch_fx_rates()
             if fx:
                 rates = {**rates, "fx": fx}
         except Exception as e:
