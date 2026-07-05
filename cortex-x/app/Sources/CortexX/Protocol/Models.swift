@@ -405,8 +405,22 @@ struct SimProjection: Codable, Equatable, Identifiable {
     var id: String { "\(basis)-\(horizon_trades)" }
 }
 
+struct SimTrade: Codable, Equatable, Identifiable {
+    var strategy: String
+    var symbol: String
+    var side: Side
+    var entry_ts: Int64
+    var exit_ts: Int64
+    var entry_px: Double
+    var exit_px: Double
+    var ret: Double
+    var id: String { "\(strategy)-\(symbol)-\(entry_ts)" }
+    var key: String { "\(strategy)/\(symbol)" }
+}
+
 struct SimReport: Codable, Equatable {
     var stats: [StrategyStats]
+    var trades: [SimTrade]
     var projections: [SimProjection]
     var best: String?
     var note: String

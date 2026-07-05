@@ -6,17 +6,21 @@ import SwiftUI
 
 struct FoundryView: View {
     @Environment(AppModel.self) private var model
+    @State private var selectedKey: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider().overlay(Theme.line)
             if let report = model.simReport {
+                let key = selectedKey ?? report.best
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
-                        leaderboard(report)
-                        if !report.projections.isEmpty {
-                            projections(report)
+                        leaderboard(report, selected: key)
+                        if let key {
+                            let proj = report.projections.filter { $0.basis == key }
+                            if !proj.isEmpty { projections(proj, basis: key) }
+                            tradeLog(report, key: key)
                         }
                         Text(report.note)
                             .font(.system(size: 10))
@@ -63,7 +67,7 @@ struct FoundryView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func leaderboard(_ report: SimReport) -> some View {
+    private func leaderboard(_ report: SimReport, selected: String?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             SectionLabel(text: "leaderboard")
                 .padding(.horizontal, 12)
@@ -72,21 +76,27 @@ struct FoundryView: View {
                     header: true, highlight: false)
                 Divider().overlay(Theme.line)
                 ForEach(sorted(report.stats)) { s in
-                    row([
-                        s.strategy, s.symbol, s.interval.label, "\(s.trades)",
-                        s.win_rate.map { Fmt.signedPct($0 * 100).replacingOccurrences(of: "+", with: "") } ?? "—",
-                        s.profit_factor.map { String(format: "%.2f", $0) } ?? "—",
-                        s.sharpe.map { String(format: "%.2f", $0) } ?? "—",
-                        s.max_drawdown.map { String(format: "%.1f%%", $0 * 100) } ?? "—",
-                        s.expectancy.map { String(format: "%+.3f%%", $0 * 100) } ?? "—",
-                        s.equity_multiple.map { String(format: "%.3f", $0) } ?? "—",
-                    ], header: false, highlight: report.best == "\(s.strategy)/\(s.symbol)",
-                       tint: s.expectancy.map { Theme.pnlColor($0) })
+                    leaderRow(s, selected: selected)
                 }
             }
             .panel()
             .padding(.horizontal, 12)
         }
+    }
+
+    private func leaderRow(_ s: StrategyStats, selected: String?) -> some View {
+        let key = "\(s.strategy)/\(s.symbol)"
+        var cells: [String] = [s.strategy, s.symbol, s.interval.label, "\(s.trades)"]
+        cells.append(s.win_rate.map { String(format: "%.0f%%", $0 * 100) } ?? "—")
+        cells.append(s.profit_factor.map { String(format: "%.2f", $0) } ?? "—")
+        cells.append(s.sharpe.map { String(format: "%.2f", $0) } ?? "—")
+        cells.append(s.max_drawdown.map { String(format: "%.1f%%", $0 * 100) } ?? "—")
+        cells.append(s.expectancy.map { String(format: "%+.3f%%", $0 * 100) } ?? "—")
+        cells.append(s.equity_multiple.map { String(format: "%.3f", $0) } ?? "—")
+        let tint: Color? = s.expectancy.map { Theme.pnlColor($0) }
+        return row(cells, header: false, highlight: selected == key, tint: tint)
+            .contentShape(Rectangle())
+            .onTapGesture { selectedKey = key }
     }
 
     private func sorted(_ stats: [StrategyStats]) -> [StrategyStats] {
@@ -109,12 +119,12 @@ struct FoundryView: View {
         .background(highlight ? Theme.panelHi : .clear)
     }
 
-    private func projections(_ report: SimReport) -> some View {
+    private func projections(_ projections: [SimProjection], basis: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            SectionLabel(text: "projections — \(report.projections.first?.basis ?? "")")
+            SectionLabel(text: "projections — \(basis)")
                 .padding(.horizontal, 12)
             HStack(spacing: 12) {
-                ForEach(report.projections) { p in
+                ForEach(projections) { p in
                     VStack(alignment: .leading, spacing: 6) {
                         Text("\(p.horizon_trades) trades ahead")
                             .font(.system(size: 10, weight: .semibold))
@@ -138,6 +148,70 @@ struct FoundryView: View {
             }
             .padding(.horizontal, 12)
         }
+    }
+
+    /// The auditable grain: each row is a replayed trade whose timestamps
+    /// and prices exist in the stored market history shown on the chart.
+    private func tradeLog(_ report: SimReport, key: String) -> some View {
+        let trades = report.trades.filter { $0.key == key }.sorted { $0.entry_ts > $1.entry_ts }
+        return VStack(alignment: .leading, spacing: 6) {
+            SectionLabel(text: "trade log \u{2014} \(key) (\(trades.count))")
+                .padding(.horizontal, 12)
+            if trades.isEmpty {
+                Text("No closed trades in the sample")
+                    .font(.system(size: 10)).foregroundStyle(Theme.dim)
+                    .padding(.horizontal, 12)
+            } else {
+                VStack(spacing: 0) {
+                    row(["side", "entry", "exit", "entry px", "exit px", "hold", "return"],
+                        header: true, highlight: false)
+                    Divider().overlay(Theme.line)
+                    ForEach(trades.prefix(60)) { t in
+                        HStack(spacing: 0) {
+                            Text(t.side == .buy ? "Long" : "Short")
+                                .font(.system(size: 10, weight: .medium))
+                                .foregroundStyle(t.side == .buy ? Theme.up : Theme.down)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Text(Self.ts(t.entry_ts)).frame(maxWidth: .infinity, alignment: .trailing)
+                            Text(Self.ts(t.exit_ts)).frame(maxWidth: .infinity, alignment: .trailing)
+                            Text(Fmt.price(t.entry_px)).frame(maxWidth: .infinity, alignment: .trailing)
+                            Text(Fmt.price(t.exit_px)).frame(maxWidth: .infinity, alignment: .trailing)
+                            Text(Self.hold(t.exit_ts - t.entry_ts)).frame(maxWidth: .infinity, alignment: .trailing)
+                            Text(String(format: "%+.2f%%", t.ret * 100))
+                                .foregroundStyle(Theme.pnlColor(t.ret))
+                                .frame(maxWidth: .infinity, alignment: .trailing)
+                        }
+                        .font(.system(size: 10))
+                        .monospacedDigit()
+                        .foregroundStyle(Theme.bone)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 4)
+                    }
+                    if trades.count > 60 {
+                        Text("showing newest 60 of \(trades.count)")
+                            .font(.system(size: 9)).foregroundStyle(Theme.dim)
+                            .padding(6)
+                    }
+                }
+                .panel()
+                .padding(.horizontal, 12)
+            }
+        }
+    }
+
+    private static func ts(_ ms: Int64) -> String {
+        let d = Date(timeIntervalSince1970: Double(ms) / 1000)
+        let f = DateFormatter()
+        let cal = Calendar.current
+        f.dateFormat = cal.isDateInToday(d) ? "HH:mm" : "dd MMM HH:mm"
+        return f.string(from: d)
+    }
+
+    private static func hold(_ ms: Int64) -> String {
+        let mins = ms / 60_000
+        if mins < 60 { return "\(mins)m" }
+        if mins < 48 * 60 { return "\(mins / 60)h" }
+        return "\(mins / 1440)d"
     }
 
     private func band(_ label: String, _ multiple: Double, _ color: Color) -> some View {

@@ -4,7 +4,8 @@
 //! the measured trade statistics. Pure and synchronous: statistics, not
 //! promises — small samples are labeled, never hidden.
 
-use cx_core::events::{SimProjection, SimReport, StrategyStats};
+use cx_core::events::{SimProjection, SimReport, SimTrade, StrategyStats};
+use cx_core::types::Side;
 use cx_core::store::BarStore;
 use cx_core::time::now_ms;
 use cx_core::types::{asset_class_of, AssetClass, Interval};
@@ -20,6 +21,7 @@ const STRATEGIES: [&str; 3] = ["momentum_x", "meanrev_z", "breakout_d"];
 pub fn empty_report(note: &str) -> SimReport {
     SimReport {
         stats: vec![],
+        trades: vec![],
         projections: vec![],
         best: None,
         note: note.into(),
@@ -31,6 +33,7 @@ pub fn empty_report(note: &str) -> SimReport {
 pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
     let mut stats: Vec<StrategyStats> = Vec::new();
     let mut all_trades: Vec<(String, Vec<f64>)> = Vec::new();
+    let mut trade_log: Vec<SimTrade> = Vec::new();
 
     for symbol in symbols {
         let interval = match asset_class_of(symbol) {
@@ -43,11 +46,13 @@ pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
             continue;
         }
         for strat in STRATEGIES {
-            let trades = backtest(strat, &bars);
+            let recs = backtest(strat, symbol, &bars);
+            let rets: Vec<f64> = recs.iter().map(|t| t.ret).collect();
             let key = format!("{strat}/{symbol}");
-            stats.push(stat_row(strat, symbol, interval, bars.len() as u32, &trades));
-            if trades.len() >= 5 {
-                all_trades.push((key, trades));
+            stats.push(stat_row(strat, symbol, interval, bars.len() as u32, &rets));
+            trade_log.extend(recs);
+            if rets.len() >= 5 {
+                all_trades.push((key, rets));
             }
         }
     }
@@ -63,14 +68,22 @@ pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
         })
         .map(|s| format!("{}/{}", s.strategy, s.symbol));
 
-    let projections = best
-        .as_deref()
-        .and_then(|key| all_trades.iter().find(|(k, _)| k == key))
-        .map(|(key, trades)| project(key, trades))
-        .unwrap_or_default();
+    // Projections for EVERY row with a usable sample, so any leaderboard
+    // row can be inspected — not just the winner.
+    let projections: Vec<SimProjection> = all_trades
+        .iter()
+        .flat_map(|(key, trades)| project(key, trades))
+        .collect();
+
+    // Cap the shipped audit log; newest kept per stable order.
+    if trade_log.len() > 600 {
+        let excess = trade_log.len() - 600;
+        trade_log.drain(..excess);
+    }
 
     SimReport {
         stats,
+        trades: trade_log,
         projections,
         best,
         note: format!(
@@ -84,41 +97,59 @@ pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
     }
 }
 
-/// Replay one strategy's rules; returns per-trade returns (fractions, net of
-/// cost). Signals evaluate on bar N's features and fill at bar N+1's open.
-pub(crate) fn backtest(strategy: &str, bars: &[cx_core::events::Bar]) -> Vec<f64> {
-    let mut trades: Vec<f64> = Vec::new();
+/// Replay one strategy's rules; returns the full per-trade audit log (net of
+/// cost). Signals evaluate on bar N's features and fill at bar N+1's open —
+/// every timestamp and price below exists in stored market history.
+pub(crate) fn backtest(
+    strategy: &str,
+    symbol: &str,
+    bars: &[cx_core::events::Bar],
+) -> Vec<SimTrade> {
+    let mut trades: Vec<SimTrade> = Vec::new();
     let mut pos: i8 = 0; // -1 short, 0 flat, 1 long
     let mut entry_px = 0.0_f64;
+    let mut entry_ts = 0_i64;
+
+    let mut close_at = |pos: i8, entry_px: f64, entry_ts: i64, px: f64, ts: i64,
+                        trades: &mut Vec<SimTrade>| {
+        let raw = (px / entry_px - 1.0) * pos as f64;
+        if raw.is_finite() && entry_px > 0.0 {
+            trades.push(SimTrade {
+                strategy: strategy.into(),
+                symbol: symbol.into(),
+                side: if pos > 0 { Side::Buy } else { Side::Sell },
+                entry_ts,
+                exit_ts: ts,
+                entry_px,
+                exit_px: px,
+                ret: raw - COST_PER_TRADE,
+            });
+        }
+    };
 
     for i in WARMUP..bars.len().saturating_sub(1) {
         let window = &bars[..=i];
         let feats = cx_ta::compute_features(window);
-        let next_open = bars[i + 1].open;
-        if !(next_open.is_finite() && next_open > 0.0) {
+        let next = &bars[i + 1];
+        if !(next.open.is_finite() && next.open > 0.0) {
             continue;
         }
         let (want, exit_now) = decide(strategy, &feats, window, pos);
 
         if pos != 0 && (exit_now || (want != 0 && want != pos)) {
-            let raw = (next_open / entry_px - 1.0) * pos as f64;
-            if raw.is_finite() {
-                trades.push(raw - COST_PER_TRADE);
-            }
+            close_at(pos, entry_px, entry_ts, next.open, next.ts_open_ms, &mut trades);
             pos = 0;
         }
         if pos == 0 && want != 0 {
             pos = want;
-            entry_px = next_open;
+            entry_px = next.open;
+            entry_ts = next.ts_open_ms;
         }
     }
     // Mark any open position at the last close.
     if pos != 0 {
-        if let (Some(last), true) = (bars.last(), entry_px > 0.0) {
-            let raw = (last.close / entry_px - 1.0) * pos as f64;
-            if raw.is_finite() {
-                trades.push(raw - COST_PER_TRADE);
-            }
+        if let Some(last) = bars.last() {
+            close_at(pos, entry_px, entry_ts, last.close, last.ts_open_ms, &mut trades);
         }
     }
     trades
@@ -300,9 +331,12 @@ mod tests {
             px *= 1.004;
             closes.push(px);
         }
-        let trades = backtest("momentum_x", &mk_bars(&closes));
+        let trades = backtest("momentum_x", "T", &mk_bars(&closes));
         assert!(!trades.is_empty(), "no trades on a strong trend");
-        assert!(trades.iter().sum::<f64>() > 0.0, "trend trades net negative");
+        assert!(trades.iter().map(|t| t.ret).sum::<f64>() > 0.0, "trend trades net negative");
+        let t = &trades[0];
+        assert!(t.exit_ts > t.entry_ts && t.entry_px > 0.0 && t.exit_px > 0.0);
+        assert_eq!(t.side, Side::Buy);
     }
 
     #[test]
@@ -319,9 +353,9 @@ mod tests {
                 px
             })
             .collect();
-        let trades = backtest("meanrev_z", &mk_bars(&closes));
+        let trades = backtest("meanrev_z", "T", &mk_bars(&closes));
         assert!(trades.len() >= 3, "too few fades: {}", trades.len());
-        assert!(trades.iter().sum::<f64>() > 0.0, "fades net negative");
+        assert!(trades.iter().map(|t| t.ret).sum::<f64>() > 0.0, "fades net negative");
     }
 
     #[test]

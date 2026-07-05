@@ -326,11 +326,29 @@ pub struct SimProjection {
     pub risk_of_ruin: f64,
 }
 
+/// One replayed trade — the auditable grain behind every statistic:
+/// timestamps and prices are the stored market history itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimTrade {
+    pub strategy: String,
+    pub symbol: String,
+    /// Buy = long trade, Sell = short trade.
+    pub side: Side,
+    pub entry_ts: i64,
+    pub exit_ts: i64,
+    pub entry_px: f64,
+    pub exit_px: f64,
+    /// Net return fraction (costs included).
+    pub ret: f64,
+}
+
 /// Foundry output: strategy rules replayed over stored real history with
 /// fees and slippage, plus projections. Statistics, not promises.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SimReport {
     pub stats: Vec<StrategyStats>,
+    /// Per-trade audit log (capped), newest last.
+    pub trades: Vec<SimTrade>,
     pub projections: Vec<SimProjection>,
     pub best: Option<String>,
     pub note: String,
