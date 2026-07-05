@@ -46,10 +46,12 @@ final class AppModel {
     private(set) var feeds: [String: FeedStatus] = [:]
 
     // MARK: Options
-    enum CenterMode: String, CaseIterable { case chart, options }
+    enum CenterMode: String, CaseIterable { case chart, options, foundry }
     var centerMode: CenterMode = .chart
     private(set) var optionsChain: OptionsChain?
     private(set) var chainLoading = false
+    private(set) var simReport: SimReport?
+    private(set) var simRunning = false
 
     // MARK: Copilot
     private(set) var copilot: [CopilotMessage] = []
@@ -95,6 +97,11 @@ final class AppModel {
         guard Self.isEquity(underlying) else { return }
         chainLoading = true
         send(.getOptionsChain(underlying: underlying, expiry: expiry))
+    }
+
+    func runSimulation() {
+        simRunning = true
+        send(.runSimulation)
     }
 
     func askCopilot(_ question: String) {
@@ -162,6 +169,9 @@ final class AppModel {
         case .optionsChain(let chain):
             optionsChain = chain
             chainLoading = false
+        case .sim(let report):
+            simReport = report
+            simRunning = false
         case .aiAnswer(let a):
             if let idx = copilot.firstIndex(where: { $0.id == a.request_id }) {
                 copilot[idx].text = a.answer

@@ -187,6 +187,7 @@ dependencies = [
  "cx-oms",
  "cx-risk",
  "cx-server",
+ "cx-sim",
  "cx-strategy",
  "cx-ta",
  "futures-util",
@@ -326,6 +327,14 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+]
+
+[[package]]
+name = "cx-sim"
+version = "0.1.0"
+dependencies = [
+ "cx-core",
+ "cx-ta",
 ]
 
 [[package]]

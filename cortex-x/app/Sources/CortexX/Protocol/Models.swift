@@ -380,6 +380,39 @@ struct OptionsChain: Codable, Equatable {
     var ts_ms: Int64
 }
 
+struct StrategyStats: Codable, Equatable, Identifiable {
+    var strategy: String
+    var symbol: String
+    var interval: Interval
+    var bars: UInt32
+    var trades: UInt32
+    var win_rate: Double?
+    var profit_factor: Double?
+    var sharpe: Double?
+    var max_drawdown: Double?
+    var expectancy: Double?
+    var equity_multiple: Double?
+    var id: String { "\(strategy)/\(symbol)" }
+}
+
+struct SimProjection: Codable, Equatable, Identifiable {
+    var basis: String
+    var horizon_trades: UInt32
+    var p05: Double
+    var p50: Double
+    var p95: Double
+    var risk_of_ruin: Double
+    var id: String { "\(basis)-\(horizon_trades)" }
+}
+
+struct SimReport: Codable, Equatable {
+    var stats: [StrategyStats]
+    var projections: [SimProjection]
+    var best: String?
+    var note: String
+    var ts_ms: Int64
+}
+
 struct CautionUpdate: Codable, Equatable {
     var scope: String?
     var value: Double
@@ -431,6 +464,7 @@ enum ServerFrame {
     case feedStatus(FeedStatus)
     case caution(CautionUpdate)
     case optionsChain(OptionsChain)
+    case sim(SimReport)
     case aiAnswer(AiAnswer)
     case gap(dropped: Int)
     case error(detail: String)
@@ -463,6 +497,7 @@ enum ServerFrame {
         case "feed_status": return .feedStatus(try dec.decode(FeedStatus.self, from: data))
         case "caution": return .caution(try dec.decode(CautionUpdate.self, from: data))
         case "options_chain": return .optionsChain(try dec.decode(OptionsChain.self, from: data))
+        case "sim": return .sim(try dec.decode(SimReport.self, from: data))
         case "ai_answer": return .aiAnswer(try dec.decode(AiAnswer.self, from: data))
         case "gap":
             struct Gap: Codable { var dropped: Int }
@@ -488,6 +523,7 @@ enum Command {
     case askAi(requestId: String, question: String)
     case sync(barsPerSymbol: Int)
     case getOptionsChain(underlying: String, expiry: String?)
+    case runSimulation
 
     func encoded() throws -> Data {
         var obj: [String: Any]
@@ -515,6 +551,8 @@ enum Command {
         case let .getOptionsChain(underlying, expiry):
             obj = ["cmd": "get_options_chain", "underlying": underlying]
             if let expiry { obj["expiry"] = expiry }
+        case .runSimulation:
+            obj = ["cmd": "run_simulation"]
         }
         return try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
     }

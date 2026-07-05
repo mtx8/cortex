@@ -294,6 +294,49 @@ pub struct OptionsChain {
     pub ts_ms: i64,
 }
 
+/// Per-strategy backtest statistics over stored history (Foundry).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StrategyStats {
+    pub strategy: String,
+    pub symbol: String,
+    pub interval: Interval,
+    pub bars: u32,
+    pub trades: u32,
+    /// Fractions in [0,1]; None until at least one closed trade.
+    pub win_rate: Option<f64>,
+    pub profit_factor: Option<f64>,
+    pub sharpe: Option<f64>,
+    pub max_drawdown: Option<f64>,
+    /// Mean per-trade return (fraction, fees included).
+    pub expectancy: Option<f64>,
+    /// Equity multiple risking 10% of equity per trade over the sample.
+    pub equity_multiple: Option<f64>,
+}
+
+/// Monte Carlo forward projection from measured trade statistics.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimProjection {
+    pub basis: String,
+    pub horizon_trades: u32,
+    /// Equity multiples at the 5th/50th/95th percentile.
+    pub p05: f64,
+    pub p50: f64,
+    pub p95: f64,
+    /// Probability of losing half of equity within the horizon.
+    pub risk_of_ruin: f64,
+}
+
+/// Foundry output: strategy rules replayed over stored real history with
+/// fees and slippage, plus projections. Statistics, not promises.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SimReport {
+    pub stats: Vec<StrategyStats>,
+    pub projections: Vec<SimProjection>,
+    pub best: Option<String>,
+    pub note: String,
+    pub ts_ms: i64,
+}
+
 /// Answer to an `AskAi` command — the copilot channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiAnswer {
@@ -324,6 +367,7 @@ pub enum EngineEvent {
     FeedStatus(FeedStatus),
     Caution(CautionUpdate),
     OptionsChain(OptionsChain),
+    Sim(SimReport),
     AiAnswer(AiAnswer),
 }
 
@@ -357,6 +401,7 @@ impl EngineEvent {
             EngineEvent::FeedStatus(_) => "feed_status",
             EngineEvent::Caution(_) => "caution",
             EngineEvent::OptionsChain(_) => "options_chain",
+            EngineEvent::Sim(_) => "sim",
             EngineEvent::AiAnswer(_) => "ai_answer",
         }
     }

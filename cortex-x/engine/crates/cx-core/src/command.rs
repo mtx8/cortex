@@ -43,6 +43,9 @@ pub enum Command {
     Sync {
         bars_per_symbol: u32,
     },
+    /// Foundry: replay strategy rules over stored history and project
+    /// outcomes. Answered via `EngineEvent::Sim`.
+    RunSimulation {},
     /// Fetch a full option chain for an equity underlying. Answered via
     /// `EngineEvent::OptionsChain`; expiry None means nearest.
     GetOptionsChain {

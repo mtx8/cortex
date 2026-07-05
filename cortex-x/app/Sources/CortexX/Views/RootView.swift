@@ -18,10 +18,10 @@ struct RootView: View {
                     CenterModeBar()
                     Divider().overlay(Theme.line)
                     Group {
-                        if model.centerMode == .chart {
-                            ChartPanel()
-                        } else {
-                            OptionsChainView()
+                        switch model.centerMode {
+                        case .chart: ChartPanel()
+                        case .options: OptionsChainView()
+                        case .foundry: FoundryView()
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

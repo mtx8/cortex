@@ -15,6 +15,7 @@ cx-ta = { workspace = true }
 cx-md = { workspace = true }
 cx-risk = { workspace = true }
 cx-oms = { workspace = true }
+cx-sim = { workspace = true }
 cx-strategy = { workspace = true }
 cx-agents = { workspace = true }
 cx-server = { workspace = true }

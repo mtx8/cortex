@@ -98,6 +98,18 @@ async fn main() -> anyhow::Result<()> {
                 mesh.ask(request_id, question);
             }
             Command::Sync { .. } => { /* handled by the server per-client */ }
+            Command::RunSimulation {} => {
+                let bus = Arc::clone(&bus);
+                let store = Arc::clone(&store);
+                let symbols = cfg.symbols.clone();
+                tokio::spawn(async move {
+                    let report =
+                        tokio::task::spawn_blocking(move || cx_sim::run(&store, &symbols))
+                            .await
+                            .unwrap_or_else(|_| cx_sim::empty_report("simulation task failed"));
+                    bus.publish(cx_core::EngineEvent::Sim(report));
+                });
+            }
             Command::GetOptionsChain { underlying, expiry } => {
                 let bus = Arc::clone(&bus);
                 let rate = snap.risk_free_rate();

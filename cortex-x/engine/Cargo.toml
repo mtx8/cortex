@@ -6,6 +6,7 @@ members = [
     "crates/cx-md",
     "crates/cx-risk",
     "crates/cx-oms",
+    "crates/cx-sim",
     "crates/cx-strategy",
     "crates/cx-agents",
     "crates/cx-server",
@@ -41,6 +42,7 @@ cx-ta = { path = "crates/cx-ta" }
 cx-md = { path = "crates/cx-md" }
 cx-risk = { path = "crates/cx-risk" }
 cx-oms = { path = "crates/cx-oms" }
+cx-sim = { path = "crates/cx-sim" }
 cx-strategy = { path = "crates/cx-strategy" }
 cx-agents = { path = "crates/cx-agents" }
 cx-server = { path = "crates/cx-server" }
