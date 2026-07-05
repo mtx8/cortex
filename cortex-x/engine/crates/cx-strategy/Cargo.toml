@@ -1,0 +1,14 @@
+[package]
+name = "cx-strategy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+cx-core = { workspace = true }
+cx-ta = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

@@ -1,0 +1,27 @@
+[package]
+name = "cortexd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cortexd"
+path = "src/main.rs"
+
+[dependencies]
+cx-core = { workspace = true }
+cx-ta = { workspace = true }
+cx-md = { workspace = true }
+cx-risk = { workspace = true }
+cx-oms = { workspace = true }
+cx-strategy = { workspace = true }
+cx-agents = { workspace = true }
+cx-server = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }

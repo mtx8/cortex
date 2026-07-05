@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cx-core",
+    "crates/cx-ta",
+    "crates/cx-md",
+    "crates/cx-risk",
+    "crates/cx-oms",
+    "crates/cx-strategy",
+    "crates/cx-agents",
+    "crates/cx-server",
+    "crates/cortexd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["MTX Labs"]
+license = "Proprietary"
+repository = ""
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+toml = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
+async-trait = "0.1"
+dirs = "5"
+
+cx-core = { path = "crates/cx-core" }
+cx-ta = { path = "crates/cx-ta" }
+cx-md = { path = "crates/cx-md" }
+cx-risk = { path = "crates/cx-risk" }
+cx-oms = { path = "crates/cx-oms" }
+cx-strategy = { path = "crates/cx-strategy" }
+cx-agents = { path = "crates/cx-agents" }
+cx-server = { path = "crates/cx-server" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3

@@ -1,0 +1,6 @@
+engine/target/
+app/.build/
+app/.swiftpm/
+*.log
+.DS_Store
+app/CortexX.app/
