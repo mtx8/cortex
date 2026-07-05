@@ -14,7 +14,15 @@ struct CortexXApp: App {
                 .preferredColorScheme(.dark)
                 .background(Theme.ink)
                 .frame(minWidth: 1180, minHeight: 720)
-                .task { model.start() }
+                .task {
+                    model.start()
+                    // Double-click experience: if no engine answers within a
+                    // few seconds, start the one bundled inside this app.
+                    try? await Task.sleep(for: .seconds(3))
+                    if model.connection != .connected {
+                        EngineBootstrap.launchBundledEngineIfNeeded()
+                    }
+                }
         }
         .windowStyle(.hiddenTitleBar)
         .windowToolbarStyle(.unified(showsTitle: false))
