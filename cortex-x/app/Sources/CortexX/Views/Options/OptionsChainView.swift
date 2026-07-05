@@ -29,12 +29,12 @@ struct OptionsChainView: View {
                 VStack(spacing: 8) {
                     if model.chainLoading {
                         ProgressView().controlSize(.small).tint(Theme.ember)
-                        Text("loading chain for \(underlying)")
+                        Text("Loading chain for \(underlying)")
                             .font(.system(size: 12)).foregroundStyle(Theme.dim)
                     } else {
-                        Text("no chain loaded")
+                        Text("No chain loaded")
                             .font(.system(size: 12)).foregroundStyle(Theme.dim)
-                        Button("load \(underlying) chain") {
+                        Button("Load \(underlying) Chain") {
                             model.requestOptionsChain(underlying: underlying)
                         }
                         .buttonStyle(EmberButtonStyle())
@@ -59,15 +59,12 @@ struct OptionsChainView: View {
                 Text(Fmt.price(chain.underlying_px))
                     .numeric(size: 13, weight: .medium)
                     .foregroundStyle(Theme.bone)
-                Text(chain.source)
+                Text(chain.source + (chain.as_of.map { " · as of \($0)" } ?? ""))
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(Theme.warn)
-                    .padding(.horizontal, 6).padding(.vertical, 2)
-                    .background(Theme.warn.opacity(0.10))
-                    .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
             }
             Spacer()
-            Button("refresh") {
+            Button("Refresh") {
                 model.requestOptionsChain(underlying: underlying, expiry: chain?.expiry)
             }
             .buttonStyle(QuietButtonStyle())
@@ -87,14 +84,10 @@ struct OptionsChainView: View {
                         Text(exp)
                             .font(.system(size: 10, weight: active ? .semibold : .regular))
                             .monospacedDigit()
-                            .foregroundStyle(active ? Theme.ember : Theme.dim)
+                            .foregroundStyle(active ? Theme.bone : Theme.dim)
                             .padding(.horizontal, 8).padding(.vertical, 4)
-                            .background(active ? Theme.emberTint : Theme.panel)
+                            .background(active ? Theme.panelHi : Color.clear)
                             .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: Theme.chipRadius)
-                                    .strokeBorder(active ? Theme.emberDown.opacity(0.5) : Theme.line, lineWidth: 1)
-                            )
                     }
                     .buttonStyle(.plain)
                 }
@@ -182,7 +175,7 @@ private struct StrikeRow: View {
         }
         .font(.system(size: 10))
         .padding(.vertical, 3)
-        .background(hovering ? Theme.panelHi : (isNearMoney ? Theme.emberTint : .clear))
+        .background(hovering ? Theme.panelHi : .clear)
         .onHover { hovering = $0 }
         .help(helpText)
     }

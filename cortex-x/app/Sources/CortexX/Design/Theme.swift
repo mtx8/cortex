@@ -91,8 +91,6 @@ struct EmberButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 12, weight: .semibold))
-            .tracking(0.8)
-            .textCase(.uppercase)
             .foregroundStyle(Theme.onEmber)
             .padding(.horizontal, 14)
             .padding(.vertical, 7)

@@ -288,6 +288,9 @@ pub struct OptionsChain {
     pub contracts: Vec<OptionContract>,
     /// Delayed data disclosure, e.g. "cboe delayed 15m".
     pub source: String,
+    /// Venue's last-trade timestamp for the underlying, when provided —
+    /// makes staleness visible (closed markets show the prior session).
+    pub as_of: Option<String>,
     pub ts_ms: i64,
 }
 

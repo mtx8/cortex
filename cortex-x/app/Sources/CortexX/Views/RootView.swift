@@ -50,12 +50,12 @@ private struct CenterModeBar: View {
                 Button {
                     model.centerMode = mode
                 } label: {
-                    Text(mode.rawValue)
+                    Text(mode.rawValue.capitalized)
                         .font(.system(size: 10, weight: active ? .semibold : .regular))
-                        .foregroundStyle(active ? Theme.ember : Theme.dim)
+                        .foregroundStyle(active ? Theme.bone : Theme.dim)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
-                        .background(active ? Theme.emberTint : .clear)
+                        .background(active ? Theme.panelHi : .clear)
                         .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
                 }
                 .buttonStyle(.plain)

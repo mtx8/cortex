@@ -88,13 +88,35 @@ pub async fn serve_on(
     cmd_tx: mpsc::Sender<Command>,
     snap: Arc<dyn SnapshotSource>,
 ) -> anyhow::Result<()> {
+    // Serialize each bus event exactly ONCE for the wire, regardless of how
+    // many clients are connected; client pumps share the encoded Arc<str>.
+    let (wire_tx, _) = broadcast::channel::<(BusEvent, Arc<str>)>(8_192);
+    {
+        let mut bus_rx = bus.subscribe();
+        let wire_tx = wire_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match bus_rx.recv().await {
+                    Ok(ev) => {
+                        if let Ok(text) = serde_json::to_string(ev.as_ref()) {
+                            let _ = wire_tx.send((ev, Arc::from(text.into_boxed_str())));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(lagged = n, "wire serializer lagged the bus");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+    }
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 tracing::debug!(%peer, "client connecting");
                 tokio::spawn(handle_client(
                     stream,
-                    bus.clone(),
+                    wire_tx.subscribe(),
                     cmd_tx.clone(),
                     snap.clone(),
                 ));
@@ -128,7 +150,7 @@ fn gap_frame(dropped: u64) -> Message {
 /// any side of the connection dies.
 async fn handle_client(
     stream: TcpStream,
-    bus: Arc<Bus>,
+    wire_rx: broadcast::Receiver<(BusEvent, Arc<str>)>,
     cmd_tx: mpsc::Sender<Command>,
     snap: Arc<dyn SnapshotSource>,
 ) {
@@ -140,10 +162,6 @@ async fn handle_client(
         }
     };
     let _guard = ClientGuard::new();
-
-    // Subscribe BEFORE snapshotting so no event published between snapshot
-    // and stream start is lost to this client.
-    let bus_rx = bus.subscribe();
 
     let hello = serde_json::json!({
         "type": "hello",
@@ -163,7 +181,7 @@ async fn handle_client(
     let (sink, mut reader) = ws.split();
     let (out_tx, out_rx) = mpsc::channel::<Message>(OUT_QUEUE);
     let mut writer = tokio::spawn(write_out(out_rx, sink));
-    let pump = tokio::spawn(pump_bus(bus_rx, out_tx.clone()));
+    let pump = tokio::spawn(pump_bus(wire_rx, out_tx.clone()));
 
     // Reader loop: client -> engine.
     loop {
@@ -244,21 +262,21 @@ async fn write_out(
 /// use a blocking send and are never dropped here. Bus-side lag (broadcast
 /// overflow) is folded into the same drop count. A `gap` frame reporting the
 /// count is emitted once the burst ends.
-async fn pump_bus(mut bus_rx: broadcast::Receiver<BusEvent>, out_tx: mpsc::Sender<Message>) {
+async fn pump_bus(
+    mut wire_rx: broadcast::Receiver<(BusEvent, Arc<str>)>,
+    out_tx: mpsc::Sender<Message>,
+) {
     let mut dropped: u64 = 0;
     loop {
-        let event = match bus_rx.recv().await {
-            Ok(ev) => ev,
+        let (event, text) = match wire_rx.recv().await {
+            Ok(pair) => pair,
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 dropped = dropped.saturating_add(n);
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => return,
         };
-        let text = match serde_json::to_string(event.as_ref()) {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+        let text = text.to_string();
         if event.is_critical() {
             if dropped > 0 {
                 if out_tx.send(gap_frame(dropped)).await.is_err() {
@@ -295,6 +313,21 @@ mod tests {
     use super::*;
     use cx_core::events::{EngineEvent, FeedHealth, FeedStatus, RiskStatus, Tick};
     use cx_core::types::{AutonomyLevel, Side, Venue};
+
+    
+    /// Test-side mirror of serve_on's wire serializer.
+    fn wire_of(bus: &Bus) -> broadcast::Receiver<(BusEvent, Arc<str>)> {
+        let (wire_tx, wire_rx) = broadcast::channel::<(BusEvent, Arc<str>)>(1_024);
+        let mut bus_rx = bus.subscribe();
+        tokio::spawn(async move {
+            while let Ok(ev) = bus_rx.recv().await {
+                if let Ok(text) = serde_json::to_string(ev.as_ref()) {
+                    let _ = wire_tx.send((ev, Arc::from(text.into_boxed_str())));
+                }
+            }
+        });
+        wire_rx
+    }
 
     fn tick(n: i64) -> EngineEvent {
         EngineEvent::Tick(Tick {
@@ -339,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn pump_forwards_events_as_type_tagged_json() {
         let bus = Bus::new(64);
-        let bus_rx = bus.subscribe();
+        let bus_rx = wire_of(&bus);
         let (out_tx, mut out_rx) = mpsc::channel(8);
         let pump = tokio::spawn(pump_bus(bus_rx, out_tx));
 
@@ -358,7 +391,7 @@ mod tests {
     #[tokio::test]
     async fn full_queue_drops_noncritical_counts_them_and_reports_gap() {
         let bus = Bus::new(1024);
-        let bus_rx = bus.subscribe();
+        let bus_rx = wire_of(&bus);
         // Capacity 1: the second undrained event must drop.
         let (out_tx, mut out_rx) = mpsc::channel(1);
         let pump = tokio::spawn(pump_bus(bus_rx, out_tx));
@@ -389,7 +422,7 @@ mod tests {
     #[tokio::test]
     async fn gap_precedes_next_noncritical_after_burst() {
         let bus = Bus::new(1024);
-        let bus_rx = bus.subscribe();
+        let bus_rx = wire_of(&bus);
         // Capacity 2: room for the gap frame AND the event that ends the
         // burst once the queue has been drained.
         let (out_tx, mut out_rx) = mpsc::channel(2);
@@ -418,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn pump_exits_when_client_queue_closes() {
         let bus = Bus::new(64);
-        let bus_rx = bus.subscribe();
+        let bus_rx = wire_of(&bus);
         let (out_tx, out_rx) = mpsc::channel(1);
         let pump = tokio::spawn(pump_bus(bus_rx, out_tx));
         drop(out_rx);

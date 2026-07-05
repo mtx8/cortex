@@ -98,16 +98,16 @@ struct OrderTicket: View {
 
     private var sideSegment: some View {
         HStack(spacing: 4) {
-            DeckSegment(title: "buy", isOn: side == .buy, tint: Theme.up) { side = .buy }
-            DeckSegment(title: "sell", isOn: side == .sell, tint: Theme.down) { side = .sell }
+            DeckSegment(title: "Buy", isOn: side == .buy, tint: Theme.up) { side = .buy }
+            DeckSegment(title: "Sell", isOn: side == .sell, tint: Theme.down) { side = .sell }
         }
         .frame(width: 112)
     }
 
     private var typeSegment: some View {
         HStack(spacing: 4) {
-            DeckSegment(title: "market", isOn: orderType == .market) { orderType = .market }
-            DeckSegment(title: "limit", isOn: orderType == .limit) { orderType = .limit }
+            DeckSegment(title: "Market", isOn: orderType == .market) { orderType = .market }
+            DeckSegment(title: "Limit", isOn: orderType == .limit) { orderType = .limit }
         }
         .frame(width: 128)
     }
@@ -155,7 +155,7 @@ struct OrderTicket: View {
     @ViewBuilder
     private var submitControl: some View {
         if model.risk.kill_switch {
-            Text("kill switch engaged")
+            Text("Kill switch engaged")
                 .font(.system(size: 11, weight: .semibold))
                 .tracking(0.8)
                 .foregroundStyle(Theme.down)
@@ -169,7 +169,7 @@ struct OrderTicket: View {
             Button {
                 submit()
             } label: {
-                Text("\(side.rawValue) \(symbol)")
+                Text("\(side.rawValue.capitalized) \(symbol)")
                     .lineLimit(1)
                     .frame(maxWidth: .infinity)
             }

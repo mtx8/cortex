@@ -13,7 +13,7 @@ enum OrderType: String, Codable { case market, limit }
 
 enum Tif: String, Codable { case gtc, ioc, day }
 
-enum Venue: String, Codable { case paper, coinbase, binance, synthetic }
+enum Venue: String, Codable { case paper, coinbase, binance, cboe, synthetic }
 
 enum Liquidity: String, Codable { case maker, taker }
 
@@ -376,6 +376,7 @@ struct OptionsChain: Codable, Equatable {
     var expiry: String
     var contracts: [OptionContract]
     var source: String
+    var as_of: String?
     var ts_ms: Int64
 }
 

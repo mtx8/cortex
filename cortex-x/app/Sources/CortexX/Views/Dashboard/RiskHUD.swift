@@ -41,7 +41,7 @@ struct RiskHUD: View {
                         .foregroundStyle(Theme.down.opacity(0.85))
                         .lineLimit(2)
                 }
-                Button("disengage") {
+                Button("Disengage") {
                     model.send(.setKillSwitch(engaged: false, reason: "operator reset"))
                 }
                 .buttonStyle(DeckMiniButtonStyle())
@@ -58,10 +58,10 @@ struct RiskHUD: View {
             Button {
                 model.send(.setKillSwitch(engaged: true, reason: "operator kill"))
             } label: {
-                Text("engage kill switch")
+                Text("Engage Kill Switch")
                     .frame(maxWidth: .infinity)
             }
-            .buttonStyle(DeckTintedButtonStyle(tint: Theme.down, border: Theme.down.opacity(0.55)))
+            .buttonStyle(DeckTintedButtonStyle(tint: Theme.down, border: Theme.line))
         }
     }
 
@@ -86,10 +86,10 @@ struct RiskHUD: View {
 
     private func shortLabel(_ level: AutonomyLevel) -> String {
         switch level {
-        case .manual: "manual"
-        case .suggest_only: "suggest"
-        case .semi_auto: "semi"
-        case .full_auto: "full"
+        case .manual: "Manual"
+        case .suggest_only: "Suggest"
+        case .semi_auto: "Semi"
+        case .full_auto: "Full"
         }
     }
 
@@ -163,12 +163,12 @@ struct RiskHUD: View {
                 flattenArmed = true
             }
         } label: {
-            Text(flattenArmed ? "confirm flatten" : "flatten all")
+            Text(flattenArmed ? "Confirm Flatten" : "Flatten All")
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(DeckTintedButtonStyle(
             tint: flattenArmed ? Theme.down : Theme.bone,
-            border: flattenArmed ? Theme.down.opacity(0.6) : Theme.line
+            border: Theme.line
         ))
         .task(id: flattenArmed) {
             // Arm window: auto-disarm after 3s without the confirming click.

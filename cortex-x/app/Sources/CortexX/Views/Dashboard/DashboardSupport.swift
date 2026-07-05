@@ -222,26 +222,24 @@ struct DeckGaugeBar: View {
 
 /// One cell of a segmented control. Ember tint = selection by default;
 /// buy/sell segments pass up/down.
+/// Calm segmented control: selection is ONE emphasis (raised fill + brighter
+/// text). Semantic tint (buy/sell) colors the text only — never fill+border.
 struct DeckSegment: View {
     let title: String
     let isOn: Bool
-    var tint: Color = Theme.ember
+    var tint: Color = Theme.bone
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 11, weight: isOn ? .semibold : .regular))
                 .foregroundStyle(isOn ? tint : Theme.dim)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 5)
-                .background(isOn ? tint.opacity(0.14) : Color.clear)
+                .background(isOn ? Theme.panelHi : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-                .overlay(
-                    RoundedRectangle(cornerRadius: Theme.chipRadius)
-                        .strokeBorder(isOn ? tint.opacity(0.5) : Theme.line, lineWidth: Theme.hairline)
-                )
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

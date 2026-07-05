@@ -97,7 +97,7 @@ struct OrdersTable: View {
         HStack(spacing: 6) {
             DeckChip(text: u.status.label, color: statusColor(u.status))
             if !u.status.isTerminal {
-                Button("cancel") {
+                Button("Cancel") {
                     model.send(.cancelOrder(orderId: u.order_id))
                 }
                 .buttonStyle(DeckMiniButtonStyle())

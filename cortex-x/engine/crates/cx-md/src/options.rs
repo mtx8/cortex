@@ -130,6 +130,11 @@ pub(crate) fn parse_chain(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    let as_of = data
+        .get("last_trade_time")
+        .and_then(|x| x.as_str())
+        .map(|s| s.replace('T', " "));
+
     Ok(OptionsChain {
         underlying: symbol.to_string(),
         underlying_px: spot,
@@ -137,6 +142,7 @@ pub(crate) fn parse_chain(
         expiry: chosen,
         contracts,
         source: "cboe delayed 15m".into(),
+        as_of,
         ts_ms: now_ms(),
     })
 }

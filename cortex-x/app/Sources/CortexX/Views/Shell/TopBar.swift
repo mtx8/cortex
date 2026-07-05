@@ -28,7 +28,7 @@ struct TopBar: View {
                 .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
                 .help(model.risk.kill_reason ?? "engaged")
             }
-            vital("autonomy", model.risk.autonomy.label.lowercased(), Theme.bone)
+            vital("autonomy", model.risk.autonomy.label, Theme.bone)
             if model.risk.caution > 0.01 {
                 vital("caution", model.risk.caution.formatted(.number.precision(.fractionLength(2))), Theme.warn)
             }

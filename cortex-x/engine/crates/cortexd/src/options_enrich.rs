@@ -74,6 +74,7 @@ mod tests {
                 greeks_source: "cboe".into(),
             }],
             source: "test".into(),
+            as_of: None,
             ts_ms: 0,
         };
         enrich(&mut chain, 0.04);

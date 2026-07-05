@@ -139,10 +139,10 @@ struct ChartPanel: View {
                     Text(iv.label)
                         .font(.system(size: 10, weight: .semibold))
                         .monospacedDigit()
-                        .foregroundStyle(selection.wrappedValue == iv ? Theme.ember : Theme.dim)
+                        .foregroundStyle(selection.wrappedValue == iv ? Theme.bone : Theme.dim)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
-                        .background(selection.wrappedValue == iv ? Theme.emberTint : Color.clear)
+                        .background(selection.wrappedValue == iv ? Theme.panelHi : Color.clear)
                         .clipShape(RoundedRectangle(cornerRadius: 4))
                 }
                 .buttonStyle(.plain)

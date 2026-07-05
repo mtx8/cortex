@@ -40,9 +40,9 @@ private struct CopilotSection: View {
     @FocusState private var inputFocused: Bool
 
     private static let suggestions = [
-        "market read?",
-        "why did risk tighten?",
-        "what are the agents seeing?",
+        "Market read?",
+        "Why did risk tighten?",
+        "What are the agents seeing?",
     ]
 
     private var sendDisabled: Bool {
@@ -130,7 +130,7 @@ private struct CopilotSection: View {
                 .focused($inputFocused)
                 .onSubmit(submit)
 
-            Button("send", action: submit)
+            Button("Send", action: submit)
                 .buttonStyle(EmberButtonStyle())
                 .disabled(sendDisabled)
                 .opacity(sendDisabled ? 0.35 : 1)
@@ -379,18 +379,11 @@ private struct FilterChip: View {
         Button(action: action) {
             Text(label)
                 .font(.system(size: 10, weight: active ? .semibold : .regular))
-                .foregroundStyle(active ? Theme.ember : Theme.dim)
+                .foregroundStyle(active ? Theme.bone : Theme.dim)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
-                .background(active ? Theme.emberTint : Theme.panel)
+                .background(active ? Theme.panelHi : .clear)
                 .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-                .overlay(
-                    RoundedRectangle(cornerRadius: Theme.chipRadius)
-                        .strokeBorder(
-                            active ? Theme.ember.opacity(0.4) : Theme.line,
-                            lineWidth: Theme.hairline
-                        )
-                )
         }
         .buttonStyle(.plain)
     }

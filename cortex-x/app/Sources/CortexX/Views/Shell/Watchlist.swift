@@ -45,7 +45,7 @@ private struct WatchlistRow: View {
                         .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
                         .foregroundStyle(Theme.bone)
                     if let pos = model.positions[symbol], abs(pos.qty) > 1e-12 {
-                        Text(pos.qty > 0 ? "long \(Fmt.qty(abs(pos.qty)))" : "short \(Fmt.qty(abs(pos.qty)))")
+                        Text(pos.qty > 0 ? "Long \(Fmt.qty(abs(pos.qty)))" : "Short \(Fmt.qty(abs(pos.qty)))")
                             .font(.system(size: 9, weight: .medium))
                             .foregroundStyle(pos.qty > 0 ? Theme.up : Theme.down)
                     }
@@ -67,12 +67,8 @@ private struct WatchlistRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(isSelected ? Theme.emberTint : (hovering ? Theme.panelHi : .clear))
+        .background(isSelected || hovering ? Theme.panelHi : .clear)
         .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.chipRadius)
-                .strokeBorder(isSelected ? Theme.emberDown.opacity(0.5) : .clear, lineWidth: 1)
-        )
         .onHover { hovering = $0 }
     }
 }

@@ -66,7 +66,7 @@ struct TradeDeckTables: View {
             tab = t
         } label: {
             HStack(spacing: 5) {
-                Text(t.rawValue)
+                Text(t.rawValue.capitalized)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(tab == t ? Theme.bone : Theme.dim)
                 Text("\(count(for: t))")
@@ -76,7 +76,7 @@ struct TradeDeckTables: View {
             }
             .padding(.horizontal, 9)
             .padding(.vertical, 4)
-            .background(tab == t ? Theme.emberTint : Color.clear)
+            .background(tab == t ? Theme.panelHi : Color.clear)
             .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
             .contentShape(Rectangle())
         }

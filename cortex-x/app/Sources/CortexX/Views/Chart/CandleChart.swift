@@ -133,17 +133,16 @@ struct CandleChart: View {
         Button {
             interaction.resetToLive()
         } label: {
-            Text("live")
+            Text("Live")
                 .font(.system(size: 10, weight: .semibold))
-                .tracking(0.8)
                 .foregroundStyle(Theme.ember)
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
-                .background(Theme.emberTint)
+                .background(Theme.panel)
                 .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
                 .overlay(
                     RoundedRectangle(cornerRadius: Theme.chipRadius)
-                        .strokeBorder(Theme.ember.opacity(0.45), lineWidth: 1)
+                        .strokeBorder(Theme.line, lineWidth: Theme.hairline)
                 )
         }
         .buttonStyle(.plain)

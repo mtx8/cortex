@@ -74,7 +74,7 @@ struct PositionsTable: View {
                 .numeric(size: 11)
                 .foregroundStyle(Theme.dim)
                 .frame(width: 84, alignment: .trailing)
-            Button("close") { closePosition(p) }
+            Button("Close") { closePosition(p) }
                 .buttonStyle(DeckMiniButtonStyle())
                 .disabled(abs(p.qty) < 1e-12)
                 .opacity(abs(p.qty) < 1e-12 ? 0.35 : 1)
