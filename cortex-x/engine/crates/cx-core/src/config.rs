@@ -46,7 +46,7 @@ impl Default for FeedConfig {
         Self {
             primary: "coinbase".into(),
             synthetic_fallback: true,
-            backfill_bars: 300,
+            backfill_bars: 600,
         }
     }
 }

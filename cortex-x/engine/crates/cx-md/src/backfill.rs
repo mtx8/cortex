@@ -13,11 +13,12 @@ use cx_core::time::bucket_start;
 use cx_core::types::Interval;
 
 /// Coinbase candle granularities (seconds) and the intervals they seed.
-const GRANULARITIES: [(u32, Interval); 4] = [
+const GRANULARITIES: [(u32, Interval); 5] = [
     (60, Interval::M1),
     (300, Interval::M5),
     (900, Interval::M15),
     (3_600, Interval::H1),
+    (86_400, Interval::D1),
 ];
 
 /// Spacing between REST calls; the public endpoint rate-limits per IP.

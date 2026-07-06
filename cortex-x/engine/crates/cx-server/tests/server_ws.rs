@@ -63,7 +63,7 @@ async fn websocket_gateway_full_protocol() {
 
     let snapshot = next_json(&mut ws).await;
     assert_eq!(snapshot["type"], "snapshot");
-    assert_eq!(snapshot["data"]["bars_per_symbol"], 300);
+    assert_eq!(snapshot["data"]["bars_per_symbol"], 600);
 
     assert_eq!(client_count(), 1);
 

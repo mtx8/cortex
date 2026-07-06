@@ -34,7 +34,7 @@ use cx_core::{Bus, Command};
 const OUT_QUEUE: usize = 1024;
 
 /// Bars per symbol included in the connect-time snapshot.
-const CONNECT_SNAPSHOT_BARS: u32 = 300;
+const CONNECT_SNAPSHOT_BARS: u32 = 600;
 
 /// Provider of the connect/sync state snapshot. Implementations must be cheap
 /// and non-blocking: this is called inline on client tasks.
