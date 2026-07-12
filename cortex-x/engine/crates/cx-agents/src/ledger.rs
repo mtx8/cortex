@@ -13,13 +13,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use cx_core::events::{
-    AccountSnapshot, AgentThought, EngineEvent, FeedStatus, MacroSnapshot, Position, RiskStatus,
-    StrategySignal,
+    AccountSnapshot, AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, Position,
+    RegimeBoard, RegimeState, RiskStatus, StrategySignal,
 };
 use cx_core::store::BarStore;
 use cx_core::types::{Interval, Severity};
 use cx_core::Bus;
-use cx_ta::{compute_features, detect_regime, Regime};
+use cx_ta::{compute_features, detect_regime_with, Regime};
 
 const MAX_THOUGHTS: usize = 30;
 const MAX_SIGNALS: usize = 20;
@@ -28,6 +28,14 @@ const RENDER_SIGNALS: usize = 10;
 const RENDER_MAX_WORDS: usize = 2_000;
 const FEATURE_LOOKBACK: usize = 120;
 const DAY_MS: i64 = 86_400_000;
+/// MERIDIAN render caps: the five forces (one spare), a handful of fired
+/// chains, and the top asset impacts per chain — the section stays compact
+/// whatever cx-intel publishes.
+const RENDER_FORCES: usize = 6;
+const RENDER_CHAINS: usize = 3;
+const RENDER_CHAIN_ASSETS: usize = 3;
+/// ENSEMBLE render cap: at most this many strategy weights.
+const RENDER_WEIGHTS: usize = 12;
 
 /// Last trade price plus the first price seen this UTC day (session open).
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +59,14 @@ pub(crate) struct LedgerState {
     pub feeds: BTreeMap<String, FeedStatus>,
     pub fills_today: u32,
     fills_day: i64,
+    /// Latest REGIMES board (cx-intel scanner); render shows breadth plus
+    /// configured symbols only.
+    pub regime_board: Option<RegimeBoard>,
+    /// Latest MERIDIAN pulse (cx-intel); render caps forces/chains/assets.
+    pub geo: Option<GeoPulse>,
+    /// Latest fusion Hedge weights keyed by strategy name, from the "w_*"
+    /// features of the most recent "fusion" signal. Finite values only.
+    pub ensemble: BTreeMap<String, f64>,
 }
 
 pub(crate) struct ContextLedger {
@@ -104,12 +120,25 @@ impl ContextLedger {
                 }
             }
             EngineEvent::Signal(s) => {
+                if s.strategy == "fusion" {
+                    let weights: BTreeMap<String, f64> = s
+                        .features
+                        .iter()
+                        .filter(|(k, v)| k.starts_with("w_") && v.is_finite())
+                        .map(|(k, v)| (k["w_".len()..].to_string(), *v))
+                        .collect();
+                    if !weights.is_empty() {
+                        st.ensemble = weights;
+                    }
+                }
                 st.signals.push_back(s.clone());
                 while st.signals.len() > MAX_SIGNALS {
                     st.signals.pop_front();
                 }
             }
             EngineEvent::Macro(m) => st.macro_snap = Some(m.clone()),
+            EngineEvent::RegimeMap(b) => st.regime_board = Some(b.clone()),
+            EngineEvent::Geo(g) => st.geo = Some(g.clone()),
             EngineEvent::FeedStatus(f) => {
                 st.feeds.insert(f.feed.clone(), f.clone());
             }
@@ -167,7 +196,7 @@ impl ContextLedger {
                 line.push_str(" | no bar history yet");
             } else {
                 let feats = compute_features(&bars);
-                let (regime, conf) = detect_regime(&bars);
+                let (regime, conf) = detect_regime_with(&feats, &bars);
                 line.push_str(&format!(
                     " | regime {} conf {:.2}",
                     regime_label(regime),
@@ -337,6 +366,86 @@ impl ContextLedger {
             None => out.push_str("no macro snapshot yet\n"),
         }
 
+        // REGIMES / MERIDIAN / ENSEMBLE only render when data exists: an
+        // absent feed costs zero tokens and never shows a stale placeholder.
+        if let Some(b) = &st.regime_board {
+            out.push_str("\n=== REGIMES ===\n");
+            let br = &b.breadth;
+            out.push_str("breadth:");
+            if let Some(p) = br.pct_above_200d {
+                out.push_str(&format!(" {:.0}% above 200d", fin(p)));
+            }
+            if let Some(p) = br.pct_above_50d {
+                out.push_str(&format!(" {:.0}% above 50d", fin(p)));
+            }
+            out.push_str(&format!(
+                " | bulls {} bears {} entering_bull {} entering_bear {} (universe {})\n",
+                br.bulls, br.bears, br.entering_bull, br.entering_bear, br.universe_size,
+            ));
+            for sym in symbols {
+                if let Some(row) = b.rows.iter().find(|r| &r.symbol == sym) {
+                    out.push_str(&format!(
+                        "- {} {} dd {:.1}%\n",
+                        row.symbol,
+                        regime_state_label(row.state),
+                        fin(row.drawdown_pct) * 100.0,
+                    ));
+                }
+            }
+        }
+
+        if let Some(g) = &st.geo {
+            if !g.forces.is_empty() || !g.chains.is_empty() {
+                out.push_str("\n=== MERIDIAN ===\n");
+                for f in g.forces.iter().take(RENDER_FORCES) {
+                    out.push_str(&format!(
+                        "- force {} {:.0} (7d {:+.1}) proxy: {}\n",
+                        snip(&f.force, 32),
+                        fin(f.value),
+                        fin(f.trend_7d),
+                        snip(&f.proxy, 60),
+                    ));
+                }
+                for c in g.chains.iter().take(RENDER_CHAINS) {
+                    let assets = c
+                        .assets
+                        .iter()
+                        .take(RENDER_CHAIN_ASSETS)
+                        .map(|a| {
+                            format!(
+                                "{}{}",
+                                snip(&a.target, 24),
+                                if a.direction >= 0 { "+" } else { "-" }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!(
+                        "FIRED: {} (intensity {:.1}){}\n",
+                        snip(&c.title, 100),
+                        fin(c.intensity),
+                        if assets.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" -> {assets}")
+                        },
+                    ));
+                }
+            }
+        }
+
+        if !st.ensemble.is_empty() {
+            out.push_str("\n=== ENSEMBLE ===\n");
+            let weights = st
+                .ensemble
+                .iter()
+                .take(RENDER_WEIGHTS)
+                .map(|(name, w)| format!("{} {:.2}", snip(name, 32), fin(*w)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("strategy weights: {weights}\n"));
+        }
+
         out.push_str("\n=== RECENT AGENT NOTES ===\n");
         if st.thoughts.is_empty() {
             out.push_str("none yet\n");
@@ -452,6 +561,19 @@ pub(crate) fn regime_label(r: Regime) -> &'static str {
     }
 }
 
+/// Snake-case label for a REGIMES-board secular state (matches the wire
+/// serde rename, so LLM text and UI payloads use one vocabulary).
+pub(crate) fn regime_state_label(s: RegimeState) -> &'static str {
+    match s {
+        RegimeState::Bull => "bull",
+        RegimeState::EnteringBull => "entering_bull",
+        RegimeState::Correction => "correction",
+        RegimeState::EnteringBear => "entering_bear",
+        RegimeState::Bear => "bear",
+        RegimeState::Recovery => "recovery",
+    }
+}
+
 /// Char-bounded snippet; appends an ellipsis when cut.
 pub(crate) fn snip(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
@@ -483,8 +605,164 @@ pub(crate) fn cap_words(s: &str, max_words: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cx_core::events::{Bar, Tick};
+    use cx_core::events::{
+        AssetImpact, Bar, Breadth, CausalChain, ForceGauge, RegimeRow, Tick,
+    };
     use cx_core::types::Venue;
+
+    fn regime_map() -> EngineEvent {
+        EngineEvent::RegimeMap(RegimeBoard {
+            rows: vec![
+                RegimeRow {
+                    symbol: "BTC-USD".into(),
+                    state: RegimeState::Correction,
+                    drawdown_pct: 0.125,
+                    runup_pct: 0.03,
+                    days_in_state: 4,
+                    dist_50_200_pct: Some(-0.01),
+                    last_close: 104.0,
+                },
+                RegimeRow {
+                    symbol: "DOGE-USD".into(), // not configured: must not render
+                    state: RegimeState::Bear,
+                    drawdown_pct: 0.4,
+                    runup_pct: 0.0,
+                    days_in_state: 30,
+                    dist_50_200_pct: None,
+                    last_close: 0.05,
+                },
+            ],
+            breadth: Breadth {
+                pct_above_200d: Some(62.0),
+                pct_above_50d: Some(48.0),
+                bulls: 120,
+                bears: 40,
+                entering_bull: 8,
+                entering_bear: 5,
+                universe_size: 200,
+            },
+            source: "test".into(),
+            ts_ms: 1_000_000,
+        })
+    }
+
+    fn geo_pulse() -> EngineEvent {
+        EngineEvent::Geo(GeoPulse {
+            forces: vec![
+                ForceGauge {
+                    force: "debt".into(),
+                    value: 62.0,
+                    trend_7d: 3.1,
+                    proxy: "2s10s inversion depth".into(),
+                },
+                ForceGauge {
+                    force: "external_order".into(),
+                    value: 71.0,
+                    trend_7d: -1.4,
+                    proxy: "conflict article z-score".into(),
+                },
+            ],
+            chains: vec![CausalChain {
+                rule_id: "oil-shock".into(),
+                title: "Gulf escalation squeezes crude supply".into(),
+                steps: vec!["escalation".into(), "supply risk".into()],
+                assets: vec![
+                    AssetImpact {
+                        target: "crude oil".into(),
+                        direction: 1,
+                        note: "supply premium".into(),
+                    },
+                    AssetImpact {
+                        target: "airlines".into(),
+                        direction: -1,
+                        note: "fuel cost".into(),
+                    },
+                ],
+                intensity: 2.4,
+                evidence: vec![],
+            }],
+            events: vec![],
+            source: "test".into(),
+            ts_ms: 1_000_000,
+        })
+    }
+
+    fn fusion_signal() -> EngineEvent {
+        let mut features = BTreeMap::new();
+        features.insert("w_momentum_x".to_string(), 1.4);
+        features.insert("w_meanrev_z".to_string(), 0.3);
+        features.insert("w_bad".to_string(), f64::NAN); // must be dropped
+        features.insert("blend_dir".to_string(), 0.5); // non-weight: ignored
+        EngineEvent::Signal(StrategySignal {
+            strategy: "fusion".into(),
+            symbol: "BTC-USD".into(),
+            direction: 0.5,
+            conviction: 0.6,
+            rationale: "blend".into(),
+            features,
+            ts_ms: 1_000_000,
+        })
+    }
+
+    #[test]
+    fn intel_sections_render_from_synthetic_events() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        ledger.apply(&regime_map());
+        ledger.apply(&geo_pulse());
+        ledger.apply(&fusion_signal());
+
+        let out = ledger.render(&["BTC-USD".to_string()]);
+        // REGIMES: breadth + configured rows only.
+        assert!(out.contains("=== REGIMES ==="), "{out}");
+        assert!(out.contains("62% above 200d 48% above 50d"), "{out}");
+        assert!(
+            out.contains("bulls 120 bears 40 entering_bull 8 entering_bear 5 (universe 200)"),
+            "{out}"
+        );
+        assert!(out.contains("- BTC-USD correction dd 12.5%"), "{out}");
+        assert!(!out.contains("DOGE-USD"), "unconfigured row leaked: {out}");
+        // MERIDIAN: forces + fired chain with top asset impacts.
+        assert!(out.contains("=== MERIDIAN ==="), "{out}");
+        assert!(out.contains("- force debt 62 (7d +3.1) proxy: 2s10s inversion depth"), "{out}");
+        assert!(out.contains("- force external_order 71 (7d -1.4)"), "{out}");
+        assert!(
+            out.contains(
+                "FIRED: Gulf escalation squeezes crude supply (intensity 2.4) -> crude oil+, airlines-"
+            ),
+            "{out}"
+        );
+        // ENSEMBLE: weight names stripped of the w_ prefix, NaN dropped.
+        assert!(out.contains("=== ENSEMBLE ==="), "{out}");
+        assert!(
+            out.contains("strategy weights: meanrev_z 0.30, momentum_x 1.40"),
+            "{out}"
+        );
+        assert!(!out.contains("bad"), "NaN weight leaked: {out}");
+        assert!(!out.contains("blend_dir 0.5,"), "non-weight feature leaked: {out}");
+    }
+
+    #[test]
+    fn intel_sections_omitted_when_absent() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        // A non-fusion signal must not populate the ensemble either.
+        let mut features = BTreeMap::new();
+        features.insert("w_momentum_x".to_string(), 1.0);
+        ledger.apply(&EngineEvent::Signal(StrategySignal {
+            strategy: "momentum_x".into(),
+            symbol: "BTC-USD".into(),
+            direction: 1.0,
+            conviction: 0.5,
+            rationale: "x".into(),
+            features,
+            ts_ms: 1,
+        }));
+        let out = ledger.render(&["BTC-USD".to_string()]);
+        assert!(!out.contains("=== REGIMES ==="), "{out}");
+        assert!(!out.contains("=== MERIDIAN ==="), "{out}");
+        assert!(!out.contains("=== ENSEMBLE ==="), "{out}");
+    }
 
     #[test]
     fn session_open_resets_on_utc_day_roll() {

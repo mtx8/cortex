@@ -125,7 +125,7 @@ impl SnapshotSrc {
 
 impl SnapshotSource for SnapshotSrc {
     fn snapshot(&self, bars_per_symbol: u32) -> serde_json::Value {
-        let n = bars_per_symbol.clamp(10, 1_000) as usize;
+        let n = bars_per_symbol.clamp(10, 3_000) as usize;
         let mut bars = serde_json::Map::new();
         for symbol in &self.symbols {
             let mut per_interval = serde_json::Map::new();

@@ -121,6 +121,39 @@ final class IntelViewsTests: XCTestCase {
         XCTAssertFalse(RegimeBoardLayout.showsRunup(.bear))
     }
 
+    // MARK: - Asset-class split
+
+    func testAssetClassSplitSeparatesEquitiesFromCrypto() {
+        let rows = [
+            row("AAPL", .bull, drawdown: 2),
+            row("BTC-USD", .bull, drawdown: 8),
+            row("NKE", .bear, drawdown: 31),
+            row("ETH-USD", .correction, drawdown: 14),
+            row("SHOP", .entering_bull, drawdown: 5),
+        ]
+        let split = RegimeBoardLayout.assetClassSplit(rows)
+        // Bare tickers are equities; dashed pairs are crypto. Arrival order
+        // is preserved within each group.
+        XCTAssertEqual(split.equities.map(\.symbol), ["AAPL", "NKE", "SHOP"])
+        XCTAssertEqual(split.crypto.map(\.symbol), ["BTC-USD", "ETH-USD"])
+    }
+
+    func testAssetClassSplitWithNoCrypto() {
+        let rows = [
+            row("AAPL", .bull, drawdown: 2),
+            row("MMM", .correction, drawdown: 12),
+        ]
+        let split = RegimeBoardLayout.assetClassSplit(rows)
+        XCTAssertEqual(split.equities.map(\.symbol), ["AAPL", "MMM"])
+        XCTAssertTrue(split.crypto.isEmpty)
+    }
+
+    func testAssetClassSplitEmptyInput() {
+        let split = RegimeBoardLayout.assetClassSplit([])
+        XCTAssertTrue(split.equities.isEmpty)
+        XCTAssertTrue(split.crypto.isEmpty)
+    }
+
     func testBreadthGaugeFractionNormalizesPercentOrFraction() throws {
         // Contract: breadth is always 0..100 percent. 0.5 means 0.5%, not 50%.
         XCTAssertEqual(try XCTUnwrap(RegimeBoardLayout.gaugeFraction(62.5)), 0.625, accuracy: 1e-9)

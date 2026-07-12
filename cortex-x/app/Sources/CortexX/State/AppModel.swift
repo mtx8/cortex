@@ -54,8 +54,14 @@ final class AppModel {
     private(set) var simRunning = false
 
     // MARK: Intel (COMPANY / REGIMES / MERIDIAN)
+    /// The company being inspected. Independent of `selectedSymbol` so
+    /// supplier/customer graph walking (TSM from NVDA) works even for
+    /// tickers outside the configured watchlist.
+    var companySymbol: String = ""
     private(set) var company: CompanyProfile?
     private(set) var companyLoading = false
+    private var companyRequestSeq = 0
+    private var pendingCompany: String?
     private(set) var regimeBoard: RegimeBoard?
     private(set) var geoPulse: GeoPulse?
 
@@ -64,7 +70,7 @@ final class AppModel {
     private(set) var pendingAsk: String?
 
     private let client: EngineClient
-    private let maxBars = 1_200
+    private let maxBars = 3_000
 
     init(client: EngineClient = EngineClient()) {
         self.client = client
@@ -112,15 +118,42 @@ final class AppModel {
 
     /// Load the COMPANY intelligence card and switch to the company section.
     func openCompany(_ symbol: String) {
+        companySymbol = symbol.uppercased()
         centerMode = .company
-        requestCompany(symbol)
+        requestCompany(companySymbol)
+    }
+
+    /// Select a symbol for the chart/watchlist context. If the current
+    /// interval has almost no bars for it (equities barely tick M1), jump to
+    /// the densest interval so the chart never opens near-empty.
+    func selectSymbol(_ symbol: String) {
+        selectedSymbol = symbol
+        if bars(symbol, selectedInterval).count < 30 {
+            let densest = Interval.allCases
+                .map { ($0, bars(symbol, $0).count) }
+                .max { $0.1 < $1.1 }
+            if let (interval, count) = densest, count >= 30 {
+                selectedInterval = interval
+            }
+        }
     }
 
     func requestCompany(_ symbol: String) {
-        // Re-request even when a profile is showing: the board follows the
-        // selected symbol, and stale cards must never masquerade as current.
+        // Re-request on every navigation: stale cards must never masquerade
+        // as current. A watchdog clears the spinner if the engine never
+        // answers (e.g. it is an older build without COMPANY support).
+        if companyLoading && pendingCompany == symbol { return }
+        pendingCompany = symbol
         companyLoading = true
+        companyRequestSeq += 1
+        let seq = companyRequestSeq
         send(.getCompany(symbol: symbol))
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(20))
+            guard let self, self.companyRequestSeq == seq, self.companyLoading else { return }
+            self.companyLoading = false
+            self.pendingCompany = nil
+        }
     }
 
     func askCopilot(_ question: String) {
@@ -202,7 +235,10 @@ final class AppModel {
             if pendingAsk == a.request_id { pendingAsk = nil }
         case .company(let profile):
             company = profile
-            companyLoading = false
+            if profile.symbol == companySymbol || pendingCompany == profile.symbol {
+                companyLoading = false
+                pendingCompany = nil
+            }
         case .regimeMap(let board):
             regimeBoard = board
         case .geo(let pulse):

@@ -220,22 +220,27 @@ pub fn scan_with_prev(
         let Some(row) = classify(symbol, &bars, prev.get(symbol.as_str())) else {
             continue;
         };
-        let closes: Vec<f64> = bars
-            .iter()
-            .filter(|b| b.complete) // cx-md's live forming D1 bar is not a session
-            .map(|b| b.close)
-            .filter(|c| c.is_finite() && *c > 0.0)
-            .collect();
-        if let Some(s200) = sma_last(&closes, 200) {
-            with_200 += 1;
-            if row.last_close > s200 {
-                above_200 += 1;
+        // Breadth is an EQUITY statistic: crypto trades 24/7 on different
+        // dynamics and would pollute the % -above-MA reading. Crypto rows
+        // still classify and appear on the board.
+        if !symbol.contains('-') {
+            let closes: Vec<f64> = bars
+                .iter()
+                .filter(|b| b.complete) // cx-md's live forming D1 bar is not a session
+                .map(|b| b.close)
+                .filter(|c| c.is_finite() && *c > 0.0)
+                .collect();
+            if let Some(s200) = sma_last(&closes, 200) {
+                with_200 += 1;
+                if row.last_close > s200 {
+                    above_200 += 1;
+                }
             }
-        }
-        if let Some(s50) = sma_last(&closes, 50) {
-            with_50 += 1;
-            if row.last_close > s50 {
-                above_50 += 1;
+            if let Some(s50) = sma_last(&closes, 50) {
+                with_50 += 1;
+                if row.last_close > s50 {
+                    above_50 += 1;
+                }
             }
         }
         rows.push(row);

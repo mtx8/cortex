@@ -214,6 +214,20 @@ pub enum Regime {
 
 /// Classify the slice's current regime with confidence in [0, 1].
 ///
+/// Thin compatibility wrapper: computes the features itself, then defers to
+/// [`detect_regime_with`]. Hot paths that already hold a
+/// [`compute_features`] result for the SAME slice should call
+/// `detect_regime_with` directly and skip the duplicate indicator pass.
+pub fn detect_regime(bars: &[Bar]) -> (Regime, f64) {
+    detect_regime_with(&compute_features(bars), bars)
+}
+
+/// Classify the slice's current regime with confidence in [0, 1], reusing a
+/// precomputed feature map. `features` MUST be the output of
+/// [`compute_features`] over the same `bars` slice — the classifier reads
+/// `cusum_break` and `trend_score` from it. Only the per-bar vol-EWMA
+/// history (returns-only, no indicator stack) is rebuilt from `bars`.
+///
 /// HighVol wins when the latest vol-EWMA sits in the top decile of its own
 /// history within the slice AND clearly above the median (guards the
 /// degenerate constant-vol series). Otherwise `trend_score` decides:
@@ -221,9 +235,8 @@ pub enum Regime {
 ///
 /// A fresh CUSUM change-point (`cusum_break` < 5 bars) halves the
 /// confidence whatever the label: regime uncertainty is itself a signal.
-pub fn detect_regime(bars: &[Bar]) -> (Regime, f64) {
-    let feats = compute_features(bars);
-    let conf_factor = match feats.get("cusum_break") {
+pub fn detect_regime_with(features: &BTreeMap<String, f64>, bars: &[Bar]) -> (Regime, f64) {
+    let conf_factor = match features.get("cusum_break") {
         Some(&b) if b < CUSUM_FRESH_BARS => CUSUM_CONF_FACTOR,
         _ => 1.0,
     };
@@ -242,7 +255,7 @@ pub fn detect_regime(bars: &[Bar]) -> (Regime, f64) {
             }
         }
     }
-    match feats.get("trend_score") {
+    match features.get("trend_score") {
         Some(&t) if t >= TREND_THRESHOLD => {
             (Regime::TrendingUp, t.abs().clamp(0.0, 1.0) * conf_factor)
         }
@@ -497,6 +510,42 @@ mod tests {
         let (_, conf_shift) = detect_regime(&bars_from_closes(&shifted));
         assert!(conf_shift <= 0.5, "conf not halved: {conf_shift}");
         assert!(conf_shift < conf_base);
+    }
+
+    #[test]
+    fn detect_regime_with_matches_detect_regime_on_all_fixtures() {
+        // Both paths must agree exactly: the wrapper and the single-pass
+        // form fed the precomputed features of the SAME slice.
+        let up: Vec<f64> = (0..80).map(|i| 100.0 * 1.01f64.powi(i)).collect();
+        let down: Vec<f64> = (0..80).map(|i| 100.0 * 0.99f64.powi(i)).collect();
+        let chop: Vec<f64> = (0..80)
+            .map(|i| if i % 2 == 0 { 100.0 } else { 101.0 })
+            .collect();
+        let mut spike: Vec<f64> = (0..60)
+            .map(|i| if i % 2 == 0 { 100.0 } else { 100.01 })
+            .collect();
+        let mut px = 100.0;
+        for i in 0..12 {
+            px *= if i % 2 == 0 { 1.05 } else { 0.95 };
+            spike.push(px);
+        }
+        let short = vec![100.0, 101.0, 102.0];
+        let mut dirty: Vec<f64> = (0..80).map(|i| 100.0 * 1.005f64.powi(i)).collect();
+        dirty[10] = f64::NAN;
+        dirty[40] = f64::INFINITY;
+
+        for closes in [&up, &down, &chop, &spike, &short, &dirty, &vec![]] {
+            let bars = bars_from_closes(closes);
+            let feats = compute_features(&bars);
+            let (r1, c1) = detect_regime(&bars);
+            let (r2, c2) = detect_regime_with(&feats, &bars);
+            assert_eq!(r1, r2, "regime diverged on fixture {closes:?}");
+            assert_eq!(
+                c1.to_bits(),
+                c2.to_bits(),
+                "confidence diverged on fixture {closes:?}"
+            );
+        }
     }
 
     #[test]

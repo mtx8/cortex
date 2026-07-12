@@ -135,7 +135,7 @@ pub(crate) async fn run(
     // History first, so charts and analytics have context immediately:
     // a year of dailies, a month of hourlies, five days of 5-minute bars.
     const RANGES: [(Interval, &str, &str); 3] = [
-        (Interval::D1, "2y", "1d"),
+        (Interval::D1, "5y", "1d"),
         (Interval::H1, "3mo", "1h"),
         (Interval::M5, "5d", "5m"),
     ];

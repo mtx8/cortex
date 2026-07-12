@@ -50,9 +50,11 @@ enum CompanyFormat {
 struct CompanyView: View {
     @Environment(AppModel.self) private var model
 
-    /// Stale-card guard: a profile only renders for the symbol it belongs to.
+    /// Stale-card guard: a profile only renders for the company being
+    /// inspected (companySymbol — NOT the watchlist selection, so graph
+    /// walking to off-watchlist tickers like TSM resolves correctly).
     private var profile: CompanyProfile? {
-        guard let c = model.company, c.symbol == model.selectedSymbol else { return nil }
+        guard let c = model.company, c.symbol == model.companySymbol else { return nil }
         return c
     }
 
@@ -68,8 +70,12 @@ struct CompanyView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.ink)
-        .task(id: model.selectedSymbol) {
-            model.requestCompany(model.selectedSymbol)
+        .task(id: model.companySymbol) {
+            if model.companySymbol.isEmpty {
+                model.companySymbol = model.selectedSymbol
+            } else if profile == nil {
+                model.requestCompany(model.companySymbol)
+            }
         }
     }
 
@@ -88,7 +94,7 @@ struct CompanyView: View {
     private var emptyState: some View {
         VStack(spacing: 8) {
             SectionLabel(text: "company")
-            Text("no company intelligence for \(model.selectedSymbol)")
+            Text("no company intelligence for \(model.companySymbol)")
                 .font(.system(size: 12))
                 .foregroundStyle(Theme.dim)
             Text("select a symbol — the board assembles on demand")

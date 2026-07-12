@@ -7,7 +7,7 @@ use std::sync::RwLock;
 use crate::events::Bar;
 use crate::types::Interval;
 
-const MAX_BARS: usize = 1_200;
+const MAX_BARS: usize = 3_000;
 
 #[derive(Default)]
 pub struct BarStore {

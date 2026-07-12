@@ -8,8 +8,8 @@ enum ChartMath {
     // MARK: - Visible window
 
     static let minVisibleBars: Double = 20
-    static let maxVisibleBars: Double = 500
-    static let defaultVisibleBars: Double = 120
+    static let maxVisibleBars: Double = 1_500
+    static let defaultVisibleBars: Double = 160
 
     /// Largest right-edge offset (bars back from the latest bar) that still
     /// keeps the window against the oldest data.
@@ -36,7 +36,7 @@ enum ChartMath {
 
     /// Rescale the window by `factor` (> 1 zooms out) about `anchor`
     /// (0 = left edge, 1 = right edge): the bar under the anchor keeps its
-    /// on-screen fraction. Clamped to 20...500 bars and available history.
+    /// on-screen fraction. Clamped to 20...1500 bars and available history.
     static func zoom(
         barsVisible: Double, rightOffset: Double, factor: Double, anchor: Double, total: Int
     ) -> (barsVisible: Double, rightOffset: Double) {

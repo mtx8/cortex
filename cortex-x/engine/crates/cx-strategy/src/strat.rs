@@ -11,7 +11,7 @@ use cx_core::store::BarStore;
 use cx_core::time::now_ms;
 use cx_core::types::{Interval, Severity};
 use cx_core::{Bus, Config};
-use cx_ta::{compute_features, detect_regime, Regime};
+use cx_ta::{compute_features, detect_regime_with, Regime};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Receiver;
 
@@ -175,8 +175,10 @@ fn on_bar(bus: &Bus, shared: &Shared, st: &mut SymState, bar: &Bar) {
         st.window.drain(..excess);
     }
 
+    // Single indicator pass per (symbol, bar): the feature map is computed
+    // once, shared by all four built-ins, AND reused for regime detection.
     let feats = compute_features(&st.window);
-    let (regime, regime_conf) = detect_regime(&st.window);
+    let (regime, regime_conf) = detect_regime_with(&feats, &st.window);
 
     let opinions = [
         eval_momentum(&feats, regime, regime_conf),

@@ -53,6 +53,23 @@ enum RegimeBoardLayout {
         }
     }
 
+    /// Rows split by asset class (bare ticker = equity, dashed pair = crypto),
+    /// preserving arrival order within each group. Same rule as
+    /// `AppModel.isEquity` (inlined — that helper is MainActor-isolated and
+    /// this layout enum stays pure for tests).
+    static func assetClassSplit(_ rows: [RegimeRow]) -> (equities: [RegimeRow], crypto: [RegimeRow]) {
+        var equities: [RegimeRow] = []
+        var crypto: [RegimeRow] = []
+        for row in rows {
+            if row.symbol.contains("-") {
+                crypto.append(row)
+            } else {
+                equities.append(row)
+            }
+        }
+        return (equities, crypto)
+    }
+
     /// Breadth arrives as 0..100 percent (cx-intel contract); normalize to a
     /// 0..1 gauge fraction. No fraction/percent guessing — 0.5 means 0.5%.
     static func gaugeFraction(_ value: Double?) -> Double? {
@@ -70,10 +87,15 @@ struct RegimesView: View {
         Group {
             if let board = model.regimeBoard, !board.rows.isEmpty {
                 TimelineView(.periodic(from: .now, by: 30)) { context in
+                    let split = RegimeBoardLayout.assetClassSplit(board.rows)
                     VStack(alignment: .leading, spacing: 0) {
                         breadthStrip(board, now: context.date)
                         Divider().overlay(Theme.line)
-                        boardColumns(board)
+                        boardColumns(split.equities, labeled: !split.crypto.isEmpty)
+                        if !split.crypto.isEmpty {
+                            Divider().overlay(Theme.line)
+                            cryptoStrip(split.crypto)
+                        }
                     }
                 }
             } else {
@@ -97,14 +119,17 @@ struct RegimesView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: Breadth strip
+    // MARK: Breadth strip (equities only — crypto is excluded by the engine)
 
     private func breadthStrip(_ board: RegimeBoard, now: Date) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            breadthGauge("% above 200d", board.breadth.pct_above_200d)
-            breadthGauge("% above 50d", board.breadth.pct_above_50d)
-            countsCard(board.breadth)
-            sourceCard(board, now: now)
+        VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(text: "equity breadth")
+            HStack(alignment: .top, spacing: 10) {
+                breadthGauge("% above 200d", board.breadth.pct_above_200d)
+                breadthGauge("% above 50d", board.breadth.pct_above_50d)
+                countsCard(board.breadth)
+                sourceCard(board, now: now)
+            }
         }
         .padding(12)
     }
@@ -165,7 +190,7 @@ struct RegimesView: View {
 
     private func sourceCard(_ board: RegimeBoard, now: Date) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("UNIVERSE")
+            Text("EQUITY UNIVERSE")
                 .font(.system(size: 10, weight: .semibold))
                 .tracking(1.1)
                 .foregroundStyle(Theme.dim)
@@ -183,17 +208,25 @@ struct RegimesView: View {
         .panel()
     }
 
-    // MARK: Board
+    // MARK: Board (equities)
 
-    private func boardColumns(_ board: RegimeBoard) -> some View {
-        let partitioned = RegimeBoardLayout.partition(board.rows)
-        return HStack(alignment: .top, spacing: 10) {
-            ForEach(RegimeColumnKind.allCases, id: \.self) { column in
-                boardColumn(column, rows: partitioned[column] ?? [])
-                    .frame(maxWidth: .infinity)
+    /// `labeled` stamps an EQUITIES header when a crypto group renders below,
+    /// so the two asset classes read as distinct sections.
+    private func boardColumns(_ rows: [RegimeRow], labeled: Bool) -> some View {
+        let partitioned = RegimeBoardLayout.partition(rows)
+        return VStack(alignment: .leading, spacing: 8) {
+            if labeled {
+                SectionLabel(text: "equities")
+            }
+            HStack(alignment: .top, spacing: 10) {
+                ForEach(RegimeColumnKind.allCases, id: \.self) { column in
+                    boardColumn(column, rows: partitioned[column] ?? [])
+                        .frame(maxWidth: .infinity)
+                }
             }
         }
         .padding(12)
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     private func boardColumn(_ column: RegimeColumnKind, rows: [RegimeRow]) -> some View {
@@ -216,7 +249,7 @@ struct RegimesView: View {
                             RegimeRowCard(
                                 row: row,
                                 openChart: {
-                                    model.selectedSymbol = row.symbol
+                                    model.selectSymbol(row.symbol)
                                     model.centerMode = .chart
                                 },
                                 openCompany: {
@@ -228,6 +261,30 @@ struct RegimesView: View {
                 }
             }
         }
+    }
+
+    // MARK: Crypto strip
+    //
+    // Crypto is a handful of pairs, not a universe — a full five-column board
+    // would be mostly "none". A single compact row-strip reads cleaner and
+    // keeps the equity board dominant at typical window heights.
+
+    private func cryptoStrip(_ rows: [RegimeRow]) -> some View {
+        let sorted = rows.sorted { abs($0.drawdown_pct) > abs($1.drawdown_pct) }
+        return VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(text: "crypto")
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 6) {
+                    ForEach(sorted) { row in
+                        CryptoRegimeCard(row: row) {
+                            model.selectSymbol(row.symbol)
+                            model.centerMode = .chart
+                        }
+                    }
+                }
+            }
+        }
+        .padding(12)
     }
 }
 
@@ -294,6 +351,54 @@ private struct RegimeRowCard: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .panel(highlighted: hovering)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(DeckMotion.ease(), value: hovering)
+    }
+}
+
+// MARK: - Crypto strip card
+
+/// Compact fixed-width card for the CRYPTO strip: since crypto rows don't sit
+/// in a state column, the card carries the state name itself. Semantic color
+/// stays in the number only (design law).
+private struct CryptoRegimeCard: View {
+    let row: RegimeRow
+    let openChart: () -> Void
+    @State private var hovering = false
+
+    private var leadMetric: (text: String, color: Color) {
+        if RegimeBoardLayout.showsRunup(row.state) {
+            return (String(format: "%+.1f%%", abs(row.runup_pct) * 100), Theme.up)
+        }
+        return (String(format: "%.1f%%", -abs(row.drawdown_pct) * 100), Theme.down)
+    }
+
+    var body: some View {
+        Button(action: openChart) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(row.symbol)
+                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Theme.bone)
+                        .lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(leadMetric.text)
+                        .numeric(size: 12, weight: .medium)
+                        .foregroundStyle(leadMetric.color)
+                }
+                Text("\(row.state.label) · \(row.days_in_state)d in state")
+                    .font(.system(size: 10))
+                    .monospacedDigit()
+                    .foregroundStyle(Theme.dim)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(width: 200, alignment: .leading)
             .contentShape(Rectangle())
             .panel(highlighted: hovering)
         }

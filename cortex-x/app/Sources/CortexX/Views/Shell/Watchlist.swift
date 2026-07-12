@@ -5,14 +5,23 @@ import SwiftUI
 struct Watchlist: View {
     @Environment(AppModel.self) private var model
 
+    // Asset-class groups (order within each group preserved from the engine).
+    private var cryptoSymbols: [String] {
+        model.symbols.filter { !AppModel.isEquity($0) }
+    }
+    private var equitySymbols: [String] {
+        model.symbols.filter { AppModel.isEquity($0) }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionLabel(text: "watchlist")
                 .padding(.horizontal, 4)
-            VStack(spacing: 4) {
-                ForEach(model.symbols, id: \.self) { symbol in
-                    WatchlistRow(symbol: symbol)
-                }
+            if !cryptoSymbols.isEmpty {
+                symbolGroup(label: "crypto", symbols: cryptoSymbols)
+            }
+            if !equitySymbols.isEmpty {
+                symbolGroup(label: "equities", symbols: equitySymbols)
             }
             if model.symbols.isEmpty {
                 Text("waiting for engine")
@@ -26,6 +35,16 @@ struct Watchlist: View {
         .padding(12)
         .frame(maxHeight: .infinity, alignment: .top)
     }
+
+    private func symbolGroup(label: String, symbols: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            SectionLabel(text: label)
+                .padding(.horizontal, 4)
+            ForEach(symbols, id: \.self) { symbol in
+                WatchlistRow(symbol: symbol)
+            }
+        }
+    }
 }
 
 private struct WatchlistRow: View {
@@ -38,7 +57,7 @@ private struct WatchlistRow: View {
     var body: some View {
         HStack(spacing: 0) {
             Button {
-                model.selectedSymbol = symbol
+                model.selectSymbol(symbol)
             } label: {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 2) {

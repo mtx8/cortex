@@ -8,12 +8,13 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cx_core::events::{EngineEvent, RegimeBoard, RegimeState};
 use cx_core::store::BarStore;
 use cx_core::types::{Interval, Severity};
 use cx_core::Bus;
-use cx_ta::{compute_features, detect_regime, Regime};
+use cx_ta::{compute_features, detect_regime_with, Regime};
 
-use crate::ledger::regime_label;
+use crate::ledger::{fin, regime_label, regime_state_label};
 use crate::publish_thought;
 
 const AGENT: &str = "market_analyst";
@@ -51,6 +52,9 @@ struct SymbolMemory {
     widths: VecDeque<f64>,
     squeeze: bool,
     prev_vol: Option<f64>,
+    /// Last seen REGIMES-board secular state (bus `RegimeMap`); a thought
+    /// fires only when this changes, so repeats are throttled by design.
+    board_state: Option<RegimeState>,
 }
 
 /// Change-detection state; pure so it is directly testable.
@@ -143,6 +147,57 @@ impl AnalystState {
 
         notes
     }
+
+    /// Fold one REGIMES board; returns at most one note per CONFIGURED
+    /// symbol whose secular state CHANGED (bear-side transitions are
+    /// Warnings, bull-side Insights). First sight of a symbol baselines
+    /// silently; an unchanged state re-published by the scanner is silent —
+    /// that is the once-per-state-change throttle.
+    pub fn observe_board(
+        &mut self,
+        board: &RegimeBoard,
+        symbols: &[String],
+    ) -> Vec<(String, Severity, String)> {
+        let mut out = Vec::new();
+        for row in &board.rows {
+            if !symbols.contains(&row.symbol) {
+                continue;
+            }
+            let mem = self.per.entry(row.symbol.clone()).or_default();
+            match mem.board_state {
+                Some(prev) if prev == row.state => {}
+                Some(prev) => {
+                    let severity = if bear_side(row.state) {
+                        Severity::Warning
+                    } else {
+                        Severity::Insight
+                    };
+                    out.push((
+                        row.symbol.clone(),
+                        severity,
+                        format!(
+                            "regime board shift: {} -> {} (drawdown {:.1}%, {} days in prior state)",
+                            regime_state_label(prev),
+                            regime_state_label(row.state),
+                            fin(row.drawdown_pct) * 100.0,
+                            row.days_in_state,
+                        ),
+                    ));
+                }
+                None => {} // baseline silently; only CHANGES are notable
+            }
+            mem.board_state = Some(row.state);
+        }
+        out
+    }
+}
+
+/// Bear-side secular states: transitions INTO these warrant a Warning.
+fn bear_side(s: RegimeState) -> bool {
+    matches!(
+        s,
+        RegimeState::Correction | RegimeState::EnteringBear | RegimeState::Bear
+    )
 }
 
 /// Nearest-rank percentile of a sorted finite slice; 0.0 when empty.
@@ -155,30 +210,56 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
 }
 
 pub(crate) fn spawn(bus: Arc<Bus>, store: Arc<BarStore>, symbols: Vec<String>) {
+    // Subscribe synchronously (same rule as the ledger): no RegimeMap
+    // published after `start` returns can be missed by racing the spawn.
+    let mut rx = bus.subscribe();
     tokio::spawn(async move {
         let mut state = AnalystState::new();
         let mut iv = tokio::time::interval(CYCLE);
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            iv.tick().await;
-            for sym in &symbols {
-                let bars = store.recent(sym, Interval::M1, LOOKBACK);
-                if bars.len() < MIN_BARS {
-                    continue;
+            tokio::select! {
+                _ = iv.tick() => {
+                    for sym in &symbols {
+                        let bars = store.recent(sym, Interval::M1, LOOKBACK);
+                        if bars.len() < MIN_BARS {
+                            continue;
+                        }
+                        // Single indicator pass: regime reuses the features.
+                        let feats = compute_features(&bars);
+                        let (regime, conf) = detect_regime_with(&feats, &bars);
+                        for note in state.observe(sym, &feats, regime) {
+                            publish_thought(
+                                &bus,
+                                AGENT,
+                                SQUADRON,
+                                Severity::Insight,
+                                Some(sym.clone()),
+                                conf,
+                                note,
+                            );
+                        }
+                    }
                 }
-                let feats = compute_features(&bars);
-                let (regime, conf) = detect_regime(&bars);
-                for note in state.observe(sym, &feats, regime) {
-                    publish_thought(
-                        &bus,
-                        AGENT,
-                        SQUADRON,
-                        Severity::Insight,
-                        Some(sym.clone()),
-                        conf,
-                        note,
-                    );
-                }
+                ev = rx.recv() => match ev {
+                    Ok(ev) => {
+                        if let EngineEvent::RegimeMap(board) = ev.as_ref() {
+                            for (sym, severity, note) in state.observe_board(board, &symbols) {
+                                publish_thought(
+                                    &bus,
+                                    AGENT,
+                                    SQUADRON,
+                                    severity,
+                                    Some(sym),
+                                    0.8,
+                                    note,
+                                );
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                },
             }
         }
     });
@@ -235,6 +316,82 @@ mod tests {
         assert!(st
             .observe("X", &feats(&[("bb_width", 0.4)]), Regime::Ranging)
             .is_empty());
+    }
+
+    fn board(rows: &[(&str, RegimeState, f64)]) -> RegimeBoard {
+        use cx_core::events::{Breadth, RegimeRow};
+        RegimeBoard {
+            rows: rows
+                .iter()
+                .map(|(sym, state, dd)| RegimeRow {
+                    symbol: sym.to_string(),
+                    state: *state,
+                    drawdown_pct: *dd,
+                    runup_pct: 0.0,
+                    days_in_state: 3,
+                    dist_50_200_pct: None,
+                    last_close: 100.0,
+                })
+                .collect(),
+            breadth: Breadth {
+                pct_above_200d: Some(50.0),
+                pct_above_50d: Some(50.0),
+                bulls: 1,
+                bears: 1,
+                entering_bull: 0,
+                entering_bear: 0,
+                universe_size: 2,
+            },
+            source: "test".into(),
+            ts_ms: 0,
+        }
+    }
+
+    #[test]
+    fn board_transition_fires_once_and_throttles() {
+        let mut st = AnalystState::new();
+        let syms = vec!["BTC-USD".to_string()];
+        // First sight baselines silently.
+        let b = board(&[("BTC-USD", RegimeState::Correction, 0.11)]);
+        assert!(st.observe_board(&b, &syms).is_empty());
+        // Bear-side transition -> exactly one Warning.
+        let b = board(&[("BTC-USD", RegimeState::EnteringBear, 0.21)]);
+        let notes = st.observe_board(&b, &syms);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].0, "BTC-USD");
+        assert_eq!(notes[0].1, Severity::Warning);
+        assert!(
+            notes[0].2.contains("correction -> entering_bear"),
+            "got {}",
+            notes[0].2
+        );
+        assert!(notes[0].2.contains("21.0%"), "got {}", notes[0].2);
+        // Same state re-published by the scanner: throttled, silent.
+        assert!(st.observe_board(&b, &syms).is_empty());
+        assert!(st.observe_board(&b, &syms).is_empty());
+        // Bull-side transition -> Insight.
+        let b = board(&[("BTC-USD", RegimeState::Recovery, 0.15)]);
+        let notes = st.observe_board(&b, &syms);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].1, Severity::Insight);
+        assert!(
+            notes[0].2.contains("entering_bear -> recovery"),
+            "got {}",
+            notes[0].2
+        );
+    }
+
+    #[test]
+    fn board_ignores_unconfigured_symbols() {
+        let mut st = AnalystState::new();
+        let syms = vec!["BTC-USD".to_string()];
+        let b = board(&[("DOGE-USD", RegimeState::Bull, 0.0)]);
+        assert!(st.observe_board(&b, &syms).is_empty());
+        let b = board(&[("DOGE-USD", RegimeState::Bear, 0.5)]);
+        assert!(
+            st.observe_board(&b, &syms).is_empty(),
+            "unconfigured symbol must never note"
+        );
     }
 
     #[test]

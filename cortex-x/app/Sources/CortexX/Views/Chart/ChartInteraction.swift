@@ -7,7 +7,7 @@ import SwiftUI
 
 @Observable
 final class ChartInteraction {
-    /// Window width in bar slots (20...500).
+    /// Window width in bar slots (20...1500).
     var barsVisible: Double = ChartMath.defaultVisibleBars
     /// Bars the right edge sits behind the latest bar; 0 = live-follow.
     var rightOffset: Double = 0
