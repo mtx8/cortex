@@ -214,6 +214,40 @@ async fn breakout_fires_on_confirmed_channel_break() {
 }
 
 #[tokio::test]
+async fn kalman_trend_goes_long_on_trending_series() {
+    let closes = trending_closes(120);
+    // Setup guards: the cx-ta features this strategy needs must be warm and
+    // must satisfy the entry rule on this series.
+    let feats = cx_ta::compute_features(&bars_from_closes(&closes));
+    let tstat = feats
+        .get("kalman_tstat")
+        .copied()
+        .expect("setup drifted: kalman features missing");
+    let brk = feats
+        .get("cusum_break")
+        .copied()
+        .expect("setup drifted: cusum feature missing");
+    assert!(tstat >= 2.0, "setup drifted: t = {tstat}");
+    assert!(brk > 10.0, "setup drifted: cusum_break = {brk}");
+
+    let bus = Bus::new(8_192);
+    let store = Arc::new(BarStore::new());
+    let _handle = cx_strategy::start(Arc::clone(&bus), store, cfg());
+    let mut rx = bus.subscribe();
+
+    for bar in bars_from_closes(&closes) {
+        bus.publish(EngineEvent::Bar(bar));
+    }
+    let sig = next_signal(&mut rx, "kalman_trend", 5_000)
+        .await
+        .expect("kalman_trend must go long on a steady uptrend");
+    assert!(sig.direction > 0.0, "expected long, got {sig:?}");
+    assert!((0.35..=0.9).contains(&sig.conviction));
+    assert!(sig.features.contains_key("kalman_tstat"));
+    assert!(sig.features.contains_key("cusum_break"));
+}
+
+#[tokio::test]
 async fn fusion_agreement_raises_and_disagreement_lowers_conviction() {
     async fn fused_for(sigs: &[(&str, f64, f64)]) -> StrategySignal {
         let bus = Bus::new(4_096);
@@ -295,22 +329,26 @@ async fn set_enabled_false_silences_and_removes_from_fusion() {
     assert!(fus.rationale.contains("momentum_x"));
 
     // Let the runtime finish the backlog so no pre-disable signal is still
-    // in flight, then silence momentum_x.
+    // in flight, then silence the trend riders (kalman_trend also goes long
+    // on this fixture, so both must be purged for fusion to empty).
     drain_until_quiet(&mut rx, 300).await;
     assert!(handle.set_enabled("momentum_x", false));
+    assert!(handle.set_enabled("kalman_trend", false));
 
     for bar in &bars[105..115] {
         bus.publish(EngineEvent::Bar(bar.clone()));
     }
-    // Fusion loses its only contributor and decays to flat...
+    // Fusion loses its contributors and decays to flat...
     let flat = next_signal(&mut rx, "fusion", 5_000)
         .await
         .expect("fusion must republish after the purge");
     assert!(flat.direction.abs() < 0.15, "{flat:?}");
     assert!(!flat.rationale.contains("momentum_x"));
-    // ...and the disabled strategy stayed silent throughout.
+    // ...and the disabled strategies stayed silent throughout.
     let mom = drain_signals(&mut rx, "momentum_x", 300).await;
     assert!(mom.is_empty(), "disabled strategy must emit nothing: {mom:?}");
+    let kal = drain_signals(&mut rx, "kalman_trend", 300).await;
+    assert!(kal.is_empty(), "disabled strategy must emit nothing: {kal:?}");
 }
 
 #[tokio::test]

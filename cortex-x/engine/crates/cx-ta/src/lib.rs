@@ -5,7 +5,9 @@
 //! all math is NaN-safe — non-finite inputs are skipped, never propagated.
 
 pub mod bs;
+pub mod corr;
 pub mod quant;
+pub mod quant2;
 pub mod ind;
 
 use std::collections::BTreeMap;
@@ -13,6 +15,7 @@ use std::collections::BTreeMap;
 use cx_core::events::Bar;
 
 use ind::{Atr, Bollinger, Donchian, Ema, Macd, RollingZscore, Rsi, VwapSession};
+use quant2::{Cusum, Garch11, KalmanTrend};
 
 /// RiskMetrics-style decay for the EWMA of squared 1-bar returns.
 const VOL_EWMA_LAMBDA: f64 = 0.94;
@@ -23,6 +26,12 @@ const MIN_VOL_HISTORY: usize = 20;
 /// HighVol additionally requires current vol above median * this factor, so
 /// a constant-vol series never reads as HighVol just for tying its own max.
 const HIGH_VOL_MEDIAN_FACTOR: f64 = 1.25;
+/// Signal/noise ratio for the feature-level Kalman trend filter.
+const KALMAN_SNR: f64 = 0.1;
+/// A CUSUM break within this many bars reads as fresh regime uncertainty.
+const CUSUM_FRESH_BARS: f64 = 5.0;
+/// Regime-confidence multiplier applied while a change-point is fresh.
+const CUSUM_CONF_FACTOR: f64 = 0.5;
 
 /// Streaming feature snapshot over a bar slice. Emits a key only when its
 /// indicator is warm — a slice shorter than the window omits the key.
@@ -30,11 +39,16 @@ const HIGH_VOL_MEDIAN_FACTOR: f64 = 1.25;
 /// Keys: "close","ret_1","ema_9","ema_21","ema_50","rsi_14","macd",
 /// "macd_signal","macd_hist","atr_14","bb_upper","bb_mid","bb_lower",
 /// "bb_width","donchian_hi","donchian_lo","zscore_20","vwap","vol_ewma",
-/// "trend_score".
+/// "trend_score","garch_vol","kalman_slope","kalman_tstat","cusum_break".
 ///
 /// - `vol_ewma`: EWMA of squared 1-bar returns, annualization-free.
 /// - `trend_score` in [-1, 1]: half vol-normalized ema_9/ema_21/ema_50
 ///   alignment, half vol-normalized ema_9 slope, tanh-squashed.
+/// - `garch_vol`: GARCH(1,1) 1-step-ahead vol forecast (per-bar stdev).
+/// - `kalman_slope` / `kalman_tstat`: filtered trend slope (price units per
+///   bar) and its significance from the local-level+trend Kalman filter.
+/// - `cusum_break`: bars since the last CUSUM change-point, capped at 500
+///   (500 = no break in recent memory).
 pub fn compute_features(bars: &[Bar]) -> BTreeMap<String, f64> {
     let mut ema9 = Ema::new(9);
     let mut ema21 = Ema::new(21);
@@ -46,6 +60,9 @@ pub fn compute_features(bars: &[Bar]) -> BTreeMap<String, f64> {
     let mut donchian = Donchian::new(20);
     let mut zscore = RollingZscore::new(20);
     let mut vwap = VwapSession::new();
+    let mut garch = Garch11::new();
+    let mut kalman = KalmanTrend::new(KALMAN_SNR);
+    let mut cusum = Cusum::new();
 
     let mut last_close: Option<f64> = None;
     let mut prev_close: Option<f64> = None;
@@ -62,6 +79,9 @@ pub fn compute_features(bars: &[Bar]) -> BTreeMap<String, f64> {
     let mut v_don = None;
     let mut v_z = None;
     let mut v_vwap = None;
+    let mut v_garch = None;
+    let mut v_kalman = None;
+    let mut v_cusum = None;
 
     for b in bars {
         // (high, low)-fed indicators guard their own inputs.
@@ -81,10 +101,13 @@ pub fn compute_features(bars: &[Bar]) -> BTreeMap<String, f64> {
                     Some(v) => VOL_EWMA_LAMBDA * v + (1.0 - VOL_EWMA_LAMBDA) * r2,
                     None => r2,
                 });
+                v_garch = garch.update(r);
+                v_cusum = cusum.update(r);
             }
         }
         prev_close = last_close;
         last_close = Some(c);
+        v_kalman = kalman.update(c);
 
         let prev_e9 = v9;
         v9 = ema9.update(c);
@@ -164,6 +187,16 @@ pub fn compute_features(bars: &[Bar]) -> BTreeMap<String, f64> {
     if let Some(t) = trend {
         out.insert("trend_score".into(), t);
     }
+    if let Some(v) = v_garch {
+        out.insert("garch_vol".into(), v);
+    }
+    if let Some(k) = v_kalman {
+        out.insert("kalman_slope".into(), k.slope);
+        out.insert("kalman_tstat".into(), k.tstat);
+    }
+    if let Some(b) = v_cusum {
+        out.insert("cusum_break".into(), b as f64);
+    }
     out
 }
 
@@ -181,7 +214,15 @@ pub enum Regime {
 /// history within the slice AND clearly above the median (guards the
 /// degenerate constant-vol series). Otherwise `trend_score` decides:
 /// >= 0.3 TrendingUp, <= -0.3 TrendingDown, else Ranging.
+///
+/// A fresh CUSUM change-point (`cusum_break` < 5 bars) halves the
+/// confidence whatever the label: regime uncertainty is itself a signal.
 pub fn detect_regime(bars: &[Bar]) -> (Regime, f64) {
+    let feats = compute_features(bars);
+    let conf_factor = match feats.get("cusum_break") {
+        Some(&b) if b < CUSUM_FRESH_BARS => CUSUM_CONF_FACTOR,
+        _ => 1.0,
+    };
     let vols = vol_series(bars);
     if vols.len() >= MIN_VOL_HISTORY {
         if let Some(&now) = vols.last() {
@@ -193,14 +234,18 @@ pub fn detect_regime(bars: &[Bar]) -> (Regime, f64) {
                 let rank =
                     sorted.iter().filter(|v| **v <= now).count() as f64 / sorted.len() as f64;
                 let conf = ((rank - 0.9) / 0.1).clamp(0.0, 1.0);
-                return (Regime::HighVol, conf);
+                return (Regime::HighVol, conf * conf_factor);
             }
         }
     }
-    match compute_features(bars).get("trend_score") {
-        Some(&t) if t >= TREND_THRESHOLD => (Regime::TrendingUp, t.abs().clamp(0.0, 1.0)),
-        Some(&t) if t <= -TREND_THRESHOLD => (Regime::TrendingDown, t.abs().clamp(0.0, 1.0)),
-        Some(&t) => (Regime::Ranging, (1.0 - t.abs()).clamp(0.0, 1.0)),
+    match feats.get("trend_score") {
+        Some(&t) if t >= TREND_THRESHOLD => {
+            (Regime::TrendingUp, t.abs().clamp(0.0, 1.0) * conf_factor)
+        }
+        Some(&t) if t <= -TREND_THRESHOLD => {
+            (Regime::TrendingDown, t.abs().clamp(0.0, 1.0) * conf_factor)
+        }
+        Some(&t) => (Regime::Ranging, (1.0 - t.abs()).clamp(0.0, 1.0) * conf_factor),
         None => (Regime::Ranging, 0.0),
     }
 }
@@ -273,7 +318,7 @@ mod tests {
             .collect()
     }
 
-    const ALL_KEYS: [&str; 20] = [
+    const ALL_KEYS: [&str; 24] = [
         "close",
         "ret_1",
         "ema_9",
@@ -294,6 +339,10 @@ mod tests {
         "vwap",
         "vol_ewma",
         "trend_score",
+        "garch_vol",
+        "kalman_slope",
+        "kalman_tstat",
+        "cusum_break",
     ];
 
     #[test]
@@ -334,6 +383,10 @@ mod tests {
             "donchian_lo",
             "zscore_20",
             "trend_score",
+            "garch_vol",
+            "kalman_slope",
+            "kalman_tstat",
+            "cusum_break",
         ] {
             assert!(!feats.contains_key(key), "unexpected key {key}");
         }
@@ -410,6 +463,36 @@ mod tests {
         let (regime, conf) = detect_regime(&bars_from_closes(&closes));
         assert_eq!(regime, Regime::Ranging);
         assert_eq!(conf, 0.0);
+    }
+
+    #[test]
+    fn fresh_cusum_break_halves_regime_confidence() {
+        // Base: gentle alternating chop — no change-point, high-confidence
+        // Ranging read, cusum_break parked at the cap.
+        let base: Vec<f64> = (0..100)
+            .map(|i| if i % 2 == 0 { 100.0 } else { 100.1 })
+            .collect();
+        let feats = compute_features(&bars_from_closes(&base));
+        assert_eq!(feats["cusum_break"], 500.0);
+        let (_, conf_base) = detect_regime(&bars_from_closes(&base));
+        assert!(conf_base > 0.5, "base conf {conf_base}");
+
+        // Variant: a hard level break in the last 3 bars — CUSUM must flag
+        // it and the fresh break must halve whatever confidence remains.
+        let mut shifted = base.clone();
+        let last = *shifted.last().unwrap();
+        for (i, c) in shifted.iter_mut().rev().take(3).rev().enumerate() {
+            *c = last + 5.0 + i as f64 * 5.0;
+        }
+        let feats = compute_features(&bars_from_closes(&shifted));
+        assert!(
+            feats["cusum_break"] < CUSUM_FRESH_BARS,
+            "break not fresh: {}",
+            feats["cusum_break"]
+        );
+        let (_, conf_shift) = detect_regime(&bars_from_closes(&shifted));
+        assert!(conf_shift <= 0.5, "conf not halved: {conf_shift}");
+        assert!(conf_shift < conf_base);
     }
 
     #[test]

@@ -36,40 +36,77 @@ private struct WatchlistRow: View {
     private var isSelected: Bool { model.selectedSymbol == symbol }
 
     var body: some View {
-        Button {
-            model.selectedSymbol = symbol
-        } label: {
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(symbol)
-                        .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
-                        .foregroundStyle(Theme.bone)
-                    if let pos = model.positions[symbol], abs(pos.qty) > 1e-12 {
-                        Text(pos.qty > 0 ? "Long \(Fmt.qty(abs(pos.qty)))" : "Short \(Fmt.qty(abs(pos.qty)))")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(pos.qty > 0 ? Theme.up : Theme.down)
+        HStack(spacing: 0) {
+            Button {
+                model.selectedSymbol = symbol
+            } label: {
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(symbol)
+                            .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
+                            .foregroundStyle(Theme.bone)
+                        if let pos = model.positions[symbol], abs(pos.qty) > 1e-12 {
+                            Text(pos.qty > 0 ? "Long \(Fmt.qty(abs(pos.qty)))" : "Short \(Fmt.qty(abs(pos.qty)))")
+                                .font(.system(size: 9, weight: .medium))
+                                .foregroundStyle(pos.qty > 0 ? Theme.up : Theme.down)
+                        }
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(model.lastPrice(symbol).map(Fmt.price) ?? "—")
+                            .numeric(size: 12, weight: .medium)
+                            .foregroundStyle(Theme.bone)
+                        if let pct = model.sessionChangePct(symbol) {
+                            Text(Fmt.signedPct(pct))
+                                .numeric(size: 10)
+                                .foregroundStyle(Theme.pnlColor(pct))
+                        }
                     }
                 }
-                Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(model.lastPrice(symbol).map(Fmt.price) ?? "—")
-                        .numeric(size: 12, weight: .medium)
-                        .foregroundStyle(Theme.bone)
-                    if let pct = model.sessionChangePct(symbol) {
-                        Text(Fmt.signedPct(pct))
-                            .numeric(size: 10)
-                            .foregroundStyle(Theme.pnlColor(pct))
-                    }
+                .padding(.leading, 10)
+                .padding(.vertical, 7)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            // Fixed trailing slot so price columns stay aligned across rows;
+            // equities get the COMPANY affordance in it on hover.
+            Group {
+                if AppModel.isEquity(symbol) {
+                    CompanyGlyphButton(symbol: symbol)
+                        .opacity(hovering ? 1 : 0)
+                } else {
+                    Color.clear
                 }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .contentShape(Rectangle())
+            .frame(width: 20, height: 20)
+            .padding(.trailing, 4)
         }
-        .buttonStyle(.plain)
         .background(isSelected || hovering ? Theme.panelHi : .clear)
         .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
         .onHover { hovering = $0 }
+    }
+}
+
+/// Small building.2 affordance on equity rows: opens the COMPANY board.
+private struct CompanyGlyphButton: View {
+    @Environment(AppModel.self) private var model
+    let symbol: String
+    @State private var hovering = false
+
+    var body: some View {
+        Button {
+            model.openCompany(symbol)
+        } label: {
+            Image(systemName: "building.2")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(hovering ? Theme.ember : Theme.dim)
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help("company")
     }
 }
 

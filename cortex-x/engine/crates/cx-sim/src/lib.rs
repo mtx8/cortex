@@ -16,7 +16,12 @@ const COST_PER_TRADE: f64 = 0.001;
 /// Fraction of equity allocated per trade for the equity-multiple readout.
 const ALLOC: f64 = 0.10;
 const WARMUP: usize = 60;
-const STRATEGIES: [&str; 3] = ["momentum_x", "meanrev_z", "breakout_d"];
+const STRATEGIES: [&str; 4] = ["momentum_x", "meanrev_z", "breakout_d", "kalman_trend"];
+/// Walk-forward split: the first 70% of bars are "train", trades whose ENTRY
+/// falls in the last 30% are the out-of-sample (OOS) set.
+const OOS_SPLIT: f64 = 0.7;
+/// OOS expectancy drives `best` only with at least this many OOS trades.
+const OOS_MIN_TRADES: u32 = 10;
 
 pub fn empty_report(note: &str) -> SimReport {
     SimReport {
@@ -29,11 +34,44 @@ pub fn empty_report(note: &str) -> SimReport {
     }
 }
 
+/// Per-(strategy, symbol) out-of-sample sample: trades whose entry fell in
+/// the last 30% of bars.
+///
+/// NOTE (wire constraint): `cx_core::events::StrategyStats` has no OOS field
+/// yet and cx-core is frozen for this change, so OOS expectancy cannot ride
+/// on the stats rows. It is encoded in the report `note` (summarily) and
+/// drives `best` selection below; the proper wire field can come later.
+struct OosStat {
+    key: String,
+    trades: u32,
+    expectancy: f64,
+}
+
+/// Best-pick with walk-forward honesty: rank by OOS expectancy across rows
+/// with >= [`OOS_MIN_TRADES`] OOS trades; if no row qualifies, fall back to
+/// full-sample expectancy among rows with >= 10 trades (the old behavior).
+fn pick_best(stats: &[StrategyStats], oos: &[OosStat]) -> Option<String> {
+    let qualified = oos.iter().filter(|o| o.trades >= OOS_MIN_TRADES);
+    if let Some(winner) = qualified.max_by(|a, b| a.expectancy.total_cmp(&b.expectancy)) {
+        return Some(winner.key.clone());
+    }
+    stats
+        .iter()
+        .filter(|s| s.trades >= 10)
+        .max_by(|a, b| {
+            a.expectancy
+                .unwrap_or(f64::MIN)
+                .total_cmp(&b.expectancy.unwrap_or(f64::MIN))
+        })
+        .map(|s| format!("{}/{}", s.strategy, s.symbol))
+}
+
 /// Run the full sweep: every strategy x every symbol with enough history.
 pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
     let mut stats: Vec<StrategyStats> = Vec::new();
     let mut all_trades: Vec<(String, Vec<f64>)> = Vec::new();
     let mut trade_log: Vec<SimTrade> = Vec::new();
+    let mut oos_stats: Vec<OosStat> = Vec::new();
 
     for symbol in symbols {
         let interval = match asset_class_of(symbol) {
@@ -45,10 +83,25 @@ pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
         if closes.len() < WARMUP + 20 {
             continue;
         }
+        // Walk-forward boundary: entries at/after this timestamp are OOS.
+        let split_idx = ((bars.len() as f64 * OOS_SPLIT) as usize).min(bars.len() - 1);
+        let split_ts = bars[split_idx].ts_open_ms;
         for strat in STRATEGIES {
             let recs = backtest(strat, symbol, &bars);
             let rets: Vec<f64> = recs.iter().map(|t| t.ret).collect();
+            let oos: Vec<f64> = recs
+                .iter()
+                .filter(|t| t.entry_ts >= split_ts)
+                .map(|t| t.ret)
+                .collect();
             let key = format!("{strat}/{symbol}");
+            if !oos.is_empty() {
+                oos_stats.push(OosStat {
+                    key: key.clone(),
+                    trades: oos.len() as u32,
+                    expectancy: oos.iter().sum::<f64>() / oos.len() as f64,
+                });
+            }
             stats.push(stat_row(strat, symbol, interval, bars.len() as u32, &rets));
             trade_log.extend(recs);
             if rets.len() >= 5 {
@@ -57,16 +110,7 @@ pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
         }
     }
 
-    // Best = highest expectancy among samples with >= 10 trades.
-    let best = stats
-        .iter()
-        .filter(|s| s.trades >= 10)
-        .max_by(|a, b| {
-            a.expectancy
-                .unwrap_or(f64::MIN)
-                .total_cmp(&b.expectancy.unwrap_or(f64::MIN))
-        })
-        .map(|s| format!("{}/{}", s.strategy, s.symbol));
+    let best = pick_best(&stats, &oos_stats);
 
     // Projections for EVERY row with a usable sample, so any leaderboard
     // row can be inspected — not just the winner.
@@ -81,6 +125,26 @@ pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
         trade_log.drain(..excess);
     }
 
+    // OOS summary rides in the note until StrategyStats grows a wire field
+    // (cx-core is frozen for this change).
+    let oos_note = if oos_stats.is_empty() {
+        "no out-of-sample trades".to_string()
+    } else {
+        let rows: Vec<String> = oos_stats
+            .iter()
+            .map(|o| {
+                format!(
+                    "{} {:+.1}bps ({} trades{})",
+                    o.key,
+                    o.expectancy * 10_000.0,
+                    o.trades,
+                    if o.trades < OOS_MIN_TRADES { ", small sample" } else { "" }
+                )
+            })
+            .collect();
+        rows.join(", ")
+    };
+
     SimReport {
         stats,
         trades: trade_log,
@@ -89,7 +153,8 @@ pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
         note: format!(
             "strategy rules replayed over stored history; {:.1}bps round-trip cost; \
              {}% of equity per trade; projections are Monte Carlo from measured \
-             trade stats, not guarantees",
+             trade stats, not guarantees; walk-forward 70/30 OOS expectancy \
+             (drives best-pick at >= {OOS_MIN_TRADES} OOS trades): {oos_note}",
             COST_PER_TRADE * 10_000.0,
             (ALLOC * 100.0) as u32
         ),
@@ -219,8 +284,118 @@ fn decide(
                 && ((pos == 1 && close < mid) || (pos == -1 && close > mid));
             (want, exit)
         }
+        "kalman_trend" => {
+            // Same pure rule as cx-strategy's kalman_trend: enter when
+            // |t-stat| >= 2 with no CUSUM change-point in the last 10 bars,
+            // direction = sign(slope); exit on a t-stat sign flip against
+            // the held side or a fresh change-point (<= 2 bars ago). The
+            // estimators are computed locally (below) on the close window.
+            let closes: Vec<f64> = window.iter().map(|b| b.close).collect();
+            let Some((slope, tstat, brk)) = kalman_cusum(&closes) else {
+                return (0, pos != 0);
+            };
+            let want = if tstat.abs() >= 2.0 && brk > 10.0 {
+                if slope > 0.0 {
+                    1
+                } else if slope < 0.0 {
+                    -1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let flipped = (pos == 1 && tstat < 0.0) || (pos == -1 && tstat > 0.0);
+            (want, pos != 0 && (flipped || brk <= 2.0))
+        }
         _ => (0, true),
     }
+}
+
+/// Local Kalman(level+trend) + two-sided CUSUM over a close window, for the
+/// kalman_trend backtest replication. cx-ta grows equivalent quant2
+/// estimators in a parallel change; this tiny pure re-implementation keeps
+/// cx-sim compile-independent of that work while replicating the same RULE.
+///
+/// Filter: g-h (steady-state Kalman) with level gain G=0.3, slope gain
+/// H=0.05; innovation variance tracked by EWMA (lambda=0.94). The slope
+/// t-stat is slope / (sigma_innov / sqrt(2/H)) — the g-h slope effectively
+/// averages ~2/H bars, so that is its standard error under noise.
+/// CUSUM: two-sided on vol-normalized returns (EWMA vol, lambda=0.94) with
+/// drift allowance k=0.5 and threshold h=5; returns bars since last break,
+/// capped at 250 (a never-broken window reads as long-quiet).
+///
+/// Returns (slope, tstat, bars_since_break); None below 30 bars. NaN-safe:
+/// non-finite closes are skipped, outputs are finite or None.
+fn kalman_cusum(closes: &[f64]) -> Option<(f64, f64, f64)> {
+    const G: f64 = 0.3;
+    const H: f64 = 0.05;
+    const LAMBDA: f64 = 0.94;
+    const CUSUM_K: f64 = 0.5;
+    const CUSUM_H: f64 = 5.0;
+    const BREAK_CAP: f64 = 250.0;
+    if closes.len() < 30 || !closes[0].is_finite() {
+        return None;
+    }
+    let mut level = closes[0];
+    let mut slope = 0.0_f64;
+    let mut innov_var = f64::NAN;
+    let mut ret_var = f64::NAN;
+    let mut cusum_pos = 0.0_f64;
+    let mut cusum_neg = 0.0_f64;
+    let mut since_break = BREAK_CAP;
+    let mut prev = closes[0];
+    for &x in &closes[1..] {
+        if !x.is_finite() {
+            continue;
+        }
+        let pred = level + slope;
+        let innov = x - pred;
+        level = pred + G * innov;
+        slope += H * innov;
+        innov_var = if innov_var.is_finite() {
+            LAMBDA * innov_var + (1.0 - LAMBDA) * innov * innov
+        } else {
+            innov * innov
+        };
+        if prev > 0.0 {
+            let r = x / prev - 1.0;
+            if r.is_finite() {
+                // Score against the PRIOR vol so a genuine shock reads at
+                // full size before the EWMA absorbs it.
+                if ret_var.is_finite() {
+                    let vol = ret_var.sqrt();
+                    if vol > 0.0 {
+                        let z = r / vol;
+                        cusum_pos = (cusum_pos + z - CUSUM_K).max(0.0);
+                        cusum_neg = (cusum_neg - z - CUSUM_K).max(0.0);
+                        since_break = (since_break + 1.0).min(BREAK_CAP);
+                        if cusum_pos > CUSUM_H || cusum_neg > CUSUM_H {
+                            cusum_pos = 0.0;
+                            cusum_neg = 0.0;
+                            since_break = 0.0;
+                        }
+                    }
+                }
+                ret_var = if ret_var.is_finite() {
+                    LAMBDA * ret_var + (1.0 - LAMBDA) * r * r
+                } else {
+                    r * r
+                };
+            }
+        }
+        prev = x;
+    }
+    if !(slope.is_finite() && innov_var.is_finite()) {
+        return None;
+    }
+    let sigma = innov_var.sqrt();
+    let tstat = if sigma > 0.0 {
+        slope * (2.0 / H).sqrt() / sigma
+    } else {
+        0.0 // zero measured noise: no significance claim without a scale
+    };
+    tstat.is_finite().then_some((slope, tstat, since_break))
 }
 
 fn stat_row(
@@ -373,6 +548,165 @@ mod tests {
         }
         // Positive-expectancy sample: median outcome grows with horizon.
         assert!(proj[1].p50 > proj[0].p50);
+    }
+
+    #[test]
+    fn kalman_cusum_reads_a_noisy_ramp_as_significant_and_quiet() {
+        // Persistent drift under deterministic pseudo-noise: strong positive
+        // slope, |t| >= 2, and a long-quiet CUSUM (drift < 0.5 sigma/bar).
+        let closes: Vec<f64> = (0..200)
+            .map(|i| 100.0 + 0.08 * i as f64 + 0.3 * ((i as f64) * 0.9).sin())
+            .collect();
+        let (slope, tstat, brk) = kalman_cusum(&closes).expect("warm");
+        assert!(slope > 0.0, "slope must be positive: {slope}");
+        assert!(tstat >= 2.0, "trend must be significant: t = {tstat}");
+        assert!(brk > 10.0, "steady drift must not fire CUSUM: brk = {brk}");
+    }
+
+    #[test]
+    fn kalman_cusum_fires_on_an_injected_shift() {
+        // Calm range, then a hard level break: bars-since-break must read
+        // fresh at the end of the window.
+        let mut closes: Vec<f64> = (0..150)
+            .map(|i| 100.0 + 0.3 * ((i as f64) * 0.9).sin())
+            .collect();
+        for i in 0..5 {
+            closes.push(97.0 - 0.4 * i as f64); // -3% gap, then a slide
+        }
+        let (_, _, brk) = kalman_cusum(&closes).expect("warm");
+        assert!(brk <= 5.0, "shift must register as a fresh break: {brk}");
+    }
+
+    #[test]
+    fn kalman_cusum_is_nan_safe_and_needs_warmup() {
+        assert!(kalman_cusum(&[100.0; 10]).is_none(), "short window");
+        // Non-finite closes are skipped, output stays finite.
+        let mut closes: Vec<f64> = (0..100)
+            .map(|i| 100.0 + 0.05 * i as f64 + 0.2 * ((i as f64) * 1.3).sin())
+            .collect();
+        closes[40] = f64::NAN;
+        let (slope, tstat, brk) = kalman_cusum(&closes).expect("warm");
+        assert!(slope.is_finite() && tstat.is_finite() && brk.is_finite());
+    }
+
+    #[test]
+    fn kalman_trend_profits_on_a_noisy_persistent_trend() {
+        // Chop, then a persistent drift smaller than the bar noise (so the
+        // CUSUM stays quiet) — the kalman rule must ride it net positive.
+        let closes: Vec<f64> = (0..350)
+            .map(|i| {
+                let base = if i < 100 {
+                    100.0
+                } else {
+                    100.0 + 0.08 * (i - 100) as f64
+                };
+                base + 0.3 * ((i as f64) * 0.9).sin()
+            })
+            .collect();
+        let trades = backtest("kalman_trend", "T", &mk_bars(&closes));
+        assert!(!trades.is_empty(), "no trades on a persistent trend");
+        assert!(
+            trades.iter().map(|t| t.ret).sum::<f64>() > 0.0,
+            "kalman trend trades net negative"
+        );
+        assert_eq!(trades[0].side, Side::Buy);
+    }
+
+    #[test]
+    fn kalman_trend_stays_flat_on_stationary_noise() {
+        let closes: Vec<f64> = (0..300)
+            .map(|i| 100.0 + 0.3 * ((i as f64) * 0.9).sin())
+            .collect();
+        let trades = backtest("kalman_trend", "T", &mk_bars(&closes));
+        assert!(
+            trades.is_empty(),
+            "no significant trend, no trades: {} trades",
+            trades.len()
+        );
+    }
+
+    fn full_stat(strategy: &str, trades: u32, expectancy: f64) -> StrategyStats {
+        StrategyStats {
+            strategy: strategy.into(),
+            symbol: "T".into(),
+            interval: Interval::M1,
+            bars: 500,
+            trades,
+            win_rate: None,
+            profit_factor: None,
+            sharpe: None,
+            max_drawdown: None,
+            expectancy: Some(expectancy),
+            equity_multiple: None,
+        }
+    }
+
+    #[test]
+    fn best_pick_prefers_oos_expectancy_when_qualified() {
+        // A looks best on the full sample but collapses out-of-sample;
+        // B holds up. With >= 10 OOS trades each, B must win.
+        let stats = vec![full_stat("a", 40, 0.010), full_stat("b", 40, 0.002)];
+        let oos = vec![
+            OosStat {
+                key: "a/T".into(),
+                trades: 12,
+                expectancy: -0.001,
+            },
+            OosStat {
+                key: "b/T".into(),
+                trades: 11,
+                expectancy: 0.003,
+            },
+        ];
+        assert_eq!(pick_best(&stats, &oos), Some("b/T".to_string()));
+    }
+
+    #[test]
+    fn best_pick_falls_back_to_full_sample_without_oos_depth() {
+        // OOS samples too small (< 10 trades) -> full-sample expectancy
+        // decides, exactly as before the walk-forward split.
+        let stats = vec![full_stat("a", 40, 0.010), full_stat("b", 40, 0.002)];
+        let oos = vec![OosStat {
+            key: "b/T".into(),
+            trades: 3,
+            expectancy: 0.5,
+        }];
+        assert_eq!(pick_best(&stats, &oos), Some("a/T".to_string()));
+        assert_eq!(pick_best(&stats, &[]), Some("a/T".to_string()));
+    }
+
+    #[test]
+    fn report_note_carries_walk_forward_oos_summary() {
+        // Alternating trend blocks spread trades across both splits so
+        // full-sample counts qualify and OOS rows appear in the note.
+        let mut closes: Vec<f64> = (0..80).map(|i| 100.0 + ((i % 5) as f64) * 0.05).collect();
+        let mut px = *closes.last().unwrap();
+        for block in 0..12 {
+            let step = if block % 2 == 0 { 1.004 } else { 0.996 };
+            for _ in 0..60 {
+                px *= step;
+                closes.push(px);
+            }
+        }
+        let store = BarStore::new();
+        for bar in mk_bars(&closes) {
+            store.push(Bar {
+                symbol: "BTC-USD".into(),
+                ..bar
+            });
+        }
+        let report = run(&store, &["BTC-USD".into()]);
+        assert!(
+            report.note.contains("walk-forward 70/30"),
+            "note must document the OOS split: {}",
+            report.note
+        );
+        let counts: Vec<(String, u32)> = report
+            .stats
+            .iter()
+            .map(|s| (format!("{}/{}", s.strategy, s.symbol), s.trades))
+            .collect();
+        assert!(report.best.is_some(), "no best; trade counts: {counts:?}");
     }
 
     #[test]

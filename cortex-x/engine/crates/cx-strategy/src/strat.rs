@@ -34,6 +34,14 @@ const MEANREV_EXIT_Z: f64 = 0.5;
 const BREAKOUT_RANGE_ATR: f64 = 0.8;
 /// breakout_d decays to flat after this many bars without a new breakout.
 const BREAKOUT_DECAY_BARS: u32 = 30;
+/// kalman_trend enters at |kalman_tstat| >= this ...
+const KALMAN_ENTRY_T: f64 = 2.0;
+/// ... maps |t| in [2, 4] onto conviction [0.35, 0.9] ...
+const KALMAN_FULL_T: f64 = 4.0;
+/// ... requires cusum_break > this (no change-point in the last 10 bars) ...
+const KALMAN_QUIET_BARS: f64 = 10.0;
+/// ... and exits on a FRESH change-point (cusum_break <= this).
+const KALMAN_FRESH_BREAK: f64 = 2.0;
 
 /// A strategy's opinion for one symbol on one bar.
 #[derive(Debug, Clone)]
@@ -79,9 +87,11 @@ struct SymState {
     /// meanrev_z open fade side: +1 long, -1 short, 0 flat.
     meanrev_open: i8,
     breakout: BreakoutState,
+    /// kalman_trend held side: +1 long, -1 short, 0 flat.
+    kalman_open: i8,
     /// Last PUBLISHED (direction, conviction) per built-in, indexed like
     /// [`BUILT_INS`]. None = never published / reset by a disable.
-    last_pub: [Option<(f64, f64)>; 3],
+    last_pub: [Option<(f64, f64)>; 4],
 }
 
 impl SymState {
@@ -91,7 +101,8 @@ impl SymState {
             prev_feats: None,
             meanrev_open: 0,
             breakout: BreakoutState::default(),
-            last_pub: [None, None, None],
+            kalman_open: 0,
+            last_pub: [None, None, None, None],
         }
     }
 }
@@ -171,6 +182,7 @@ fn on_bar(bus: &Bus, shared: &Shared, st: &mut SymState, bar: &Bar) {
         eval_momentum(&feats, regime, regime_conf),
         eval_meanrev(&feats, regime, &mut st.meanrev_open),
         eval_breakout(bar, st.prev_feats.as_ref(), &feats, &mut st.breakout),
+        eval_kalman(&feats, &mut st.kalman_open),
     ];
     for (idx, opinion) in opinions.into_iter().enumerate() {
         if !shared.is_enabled(idx) {
@@ -180,6 +192,7 @@ fn on_bar(bus: &Bus, shared: &Shared, st: &mut SymState, bar: &Bar) {
             match idx {
                 1 => st.meanrev_open = 0,
                 2 => st.breakout = BreakoutState::default(),
+                3 => st.kalman_open = 0,
                 _ => {}
             }
             continue;
@@ -395,6 +408,57 @@ fn eval_breakout(
     }
 }
 
+/// "kalman_trend": statistical trend rider. Enters when the Kalman slope
+/// t-stat clears |t| >= 2.0 AND the CUSUM detector has been quiet for more
+/// than 10 bars (no fresh change-point); direction = sign(kalman_slope).
+/// Conviction maps |t| in [2, 4] onto [0.35, 0.9]. Exits (flat) when the
+/// t-stat sign flips against the held direction, or on a fresh change-point
+/// (cusum_break <= 2). The three inputs come from cx-ta's compute_features
+/// and only appear once the estimators are warm.
+fn eval_kalman(feats: &BTreeMap<String, f64>, open: &mut i8) -> Opinion {
+    let (Some(&slope), Some(&tstat), Some(&brk)) = (
+        feats.get("kalman_slope"),
+        feats.get("kalman_tstat"),
+        feats.get("cusum_break"),
+    ) else {
+        *open = 0;
+        return Opinion::flat("kalman: features not warm");
+    };
+    if *open != 0 {
+        let flipped = sgn(tstat) != 0 && sgn(tstat) != *open;
+        if flipped || brk <= KALMAN_FRESH_BREAK {
+            *open = 0;
+            return Opinion::flat(if flipped {
+                "kalman: t-stat sign flipped against held direction"
+            } else {
+                "kalman: fresh change-point, trend statistics untrusted"
+            });
+        }
+    }
+    if *open == 0 && tstat.abs() >= KALMAN_ENTRY_T && brk > KALMAN_QUIET_BARS {
+        *open = sgn(slope);
+    }
+    if *open == 0 {
+        return Opinion::flat("kalman: no significant trend");
+    }
+    let conviction = (0.35
+        + (tstat.abs() - KALMAN_ENTRY_T) / (KALMAN_FULL_T - KALMAN_ENTRY_T) * 0.55)
+        .clamp(0.35, 0.9);
+    let mut features = BTreeMap::new();
+    features.insert("kalman_slope".to_string(), slope);
+    features.insert("kalman_tstat".to_string(), tstat);
+    features.insert("cusum_break".to_string(), brk);
+    Opinion {
+        direction: *open as f64,
+        conviction,
+        rationale: format!(
+            "kalman: {} trend (t {tstat:+.2}, slope {slope:+.5}), {brk:.0} bars since last change-point",
+            if *open > 0 { "up" } else { "down" },
+        ),
+        features,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,6 +605,112 @@ mod tests {
             last_dir = sgn(op.direction);
         }
         assert_eq!(last_dir, 0);
+    }
+
+    #[test]
+    fn kalman_enters_on_significant_quiet_trend() {
+        let mut open = 0i8;
+        let f = feats(&[
+            ("kalman_slope", 0.02),
+            ("kalman_tstat", 2.5),
+            ("cusum_break", 30.0),
+        ]);
+        let op = eval_kalman(&f, &mut open);
+        assert_eq!(sgn(op.direction), 1);
+        // |t| = 2.5 maps to 0.35 + 0.5/2 * 0.55 = 0.4875.
+        assert!((op.conviction - 0.4875).abs() < 1e-12);
+        assert!(op.features.contains_key("kalman_tstat"));
+
+        // Downtrend: direction follows the slope sign.
+        let mut open = 0i8;
+        let f = feats(&[
+            ("kalman_slope", -0.02),
+            ("kalman_tstat", -3.0),
+            ("cusum_break", 20.0),
+        ]);
+        let op = eval_kalman(&f, &mut open);
+        assert_eq!(sgn(op.direction), -1);
+    }
+
+    #[test]
+    fn kalman_conviction_maps_t_2_to_4_onto_bounds() {
+        let entry = |t: f64| {
+            let mut open = 0i8;
+            let f = feats(&[
+                ("kalman_slope", 0.02),
+                ("kalman_tstat", t),
+                ("cusum_break", 30.0),
+            ]);
+            eval_kalman(&f, &mut open).conviction
+        };
+        assert!((entry(2.0) - 0.35).abs() < 1e-12);
+        assert!((entry(4.0) - 0.9).abs() < 1e-12);
+        assert!((entry(6.0) - 0.9).abs() < 1e-12, "clamped above t=4");
+    }
+
+    #[test]
+    fn kalman_blocked_by_weak_t_or_recent_change_point() {
+        let mut open = 0i8;
+        // |t| below the entry bar -> flat.
+        let f = feats(&[
+            ("kalman_slope", 0.02),
+            ("kalman_tstat", 1.5),
+            ("cusum_break", 30.0),
+        ]);
+        assert_eq!(sgn(eval_kalman(&f, &mut open).direction), 0);
+        // Strong t but a change-point within the last 10 bars -> flat.
+        let f = feats(&[
+            ("kalman_slope", 0.02),
+            ("kalman_tstat", 3.0),
+            ("cusum_break", 8.0),
+        ]);
+        assert_eq!(sgn(eval_kalman(&f, &mut open).direction), 0);
+        assert_eq!(open, 0);
+    }
+
+    #[test]
+    fn kalman_exits_on_sign_flip_or_fresh_break() {
+        // Open long, then the t-stat flips negative -> exit.
+        let mut open = 1i8;
+        let f = feats(&[
+            ("kalman_slope", -0.001),
+            ("kalman_tstat", -0.4),
+            ("cusum_break", 30.0),
+        ]);
+        let op = eval_kalman(&f, &mut open);
+        assert_eq!(sgn(op.direction), 0);
+        assert_eq!(open, 0);
+
+        // Open long, fresh change-point (cusum_break <= 2) -> exit.
+        let mut open = 1i8;
+        let f = feats(&[
+            ("kalman_slope", 0.02),
+            ("kalman_tstat", 2.5),
+            ("cusum_break", 1.0),
+        ]);
+        let op = eval_kalman(&f, &mut open);
+        assert_eq!(sgn(op.direction), 0);
+        assert_eq!(open, 0);
+
+        // Held trend with a decayed-but-same-sign t and quiet CUSUM: holds
+        // at floor conviction.
+        let mut open = 1i8;
+        let f = feats(&[
+            ("kalman_slope", 0.005),
+            ("kalman_tstat", 1.2),
+            ("cusum_break", 40.0),
+        ]);
+        let op = eval_kalman(&f, &mut open);
+        assert_eq!(sgn(op.direction), 1);
+        assert!((op.conviction - 0.35).abs() < 1e-12);
+    }
+
+    #[test]
+    fn kalman_flat_and_reset_when_features_not_warm() {
+        let mut open = 1i8;
+        let op = eval_kalman(&feats(&[("kalman_slope", 0.02)]), &mut open);
+        assert_eq!(sgn(op.direction), 0);
+        assert_eq!(open, 0, "cold features must reset the held side");
     }
 
     #[test]

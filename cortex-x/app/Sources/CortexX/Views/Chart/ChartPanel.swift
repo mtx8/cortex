@@ -9,6 +9,7 @@ struct ChartPanel: View {
     @State private var flashDirection = 0
     @State private var flashToken = 0
     @State private var flashSymbol = ""
+    @State private var symbolHovering = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -53,9 +54,22 @@ struct ChartPanel: View {
         let top = model.bookTop[symbol]
 
         return HStack(spacing: 12) {
-            Text(symbol)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(Theme.bone)
+            if AppModel.isEquity(symbol) {
+                Button {
+                    model.openCompany(symbol)
+                } label: {
+                    Text(symbol)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(symbolHovering ? Theme.ember : Theme.bone)
+                }
+                .buttonStyle(.plain)
+                .onHover { symbolHovering = $0 }
+                .help("company")
+            } else {
+                Text(symbol)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Theme.bone)
+            }
 
             Text(price.map { ChartMath.formatPrice($0, grouped: true) } ?? "—")
                 .font(.system(size: 21, weight: .semibold))

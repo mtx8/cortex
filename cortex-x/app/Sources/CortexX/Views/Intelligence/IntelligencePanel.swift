@@ -27,7 +27,6 @@ struct IntelligencePanel: View {
                     .frame(height: macroHeight)
             }
         }
-        .frame(width: 340)
         .background(Theme.ink)
     }
 }

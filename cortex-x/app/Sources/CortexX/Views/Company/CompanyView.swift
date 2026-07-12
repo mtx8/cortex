@@ -1,23 +1,447 @@
 // COMPANY — Bloomberg-SPLC-class company intelligence board.
 // suppliers | the company (segments + fundamentals) | customers.
-// Placeholder pending the company-view build task; keeps the shell compiling.
+// Relation cards with known tickers walk the graph (openCompany).
+// Sources are footnoted — honesty is a feature.
 
 import SwiftUI
+
+// MARK: - Pure helpers (internal for tests)
+
+enum CompanyFormat {
+    /// Abbreviated money: $1.23T / $25.0B / $890M / $12.5K. nil -> em dash, never 0.
+    static func abbrevMoney(_ v: Double?) -> String {
+        guard let v, v.isFinite else { return "—" }
+        let a = abs(v)
+        let sign = v < 0 ? "-" : ""
+        func fmt(_ x: Double, _ suffix: String) -> String {
+            let s: String
+            if x >= 100 { s = String(format: "%.0f", x) }
+            else if x >= 10 { s = String(format: "%.1f", x) }
+            else { s = String(format: "%.2f", x) }
+            return sign + "$" + s + suffix
+        }
+        if a >= 1e12 { return fmt(a / 1e12, "T") }
+        if a >= 1e9 { return fmt(a / 1e9, "B") }
+        if a >= 1e6 { return fmt(a / 1e6, "M") }
+        if a >= 1e3 { return fmt(a / 1e3, "K") }
+        return sign + "$" + String(format: "%.0f", a)
+    }
+
+    /// Fraction (0.564) -> "56.4%". nil -> em dash.
+    static func pct(_ fraction: Double?, signed: Bool = false) -> String {
+        guard let f = fraction, f.isFinite else { return "—" }
+        return String(format: signed ? "%+.1f%%" : "%.1f%%", f * 100)
+    }
+
+    /// Plain decimal (EPS). nil -> em dash.
+    static func plain(_ v: Double?, decimals: Int = 2) -> String {
+        guard let v, v.isFinite else { return "—" }
+        return String(format: "%.\(decimals)f", v)
+    }
+
+    /// Crypto / uncurated profiles: no graph, no segments — fundamentals-only layout.
+    static func isMinimal(_ p: CompanyProfile) -> Bool {
+        p.suppliers.isEmpty && p.customers.isEmpty && p.segments.isEmpty
+    }
+}
+
+// MARK: - View
 
 struct CompanyView: View {
     @Environment(AppModel.self) private var model
 
+    /// Stale-card guard: a profile only renders for the symbol it belongs to.
+    private var profile: CompanyProfile? {
+        guard let c = model.company, c.symbol == model.selectedSymbol else { return nil }
+        return c
+    }
+
     var body: some View {
-        VStack(spacing: 8) {
-            SectionLabel(text: "company")
-            Text("company intelligence loading…")
-                .font(.system(size: 13))
-                .foregroundStyle(Theme.dim)
+        Group {
+            if let profile {
+                board(profile)
+            } else if model.companyLoading || model.company != nil {
+                loadingState
+            } else {
+                emptyState
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.ink)
         .task(id: model.selectedSymbol) {
             model.requestCompany(model.selectedSymbol)
         }
+    }
+
+    // MARK: States
+
+    private var loadingState: some View {
+        VStack(spacing: 10) {
+            ProgressView().controlSize(.small).tint(Theme.ember)
+            Text("assembling intelligence…")
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.dim)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: 8) {
+            SectionLabel(text: "company")
+            Text("no company intelligence for \(model.selectedSymbol)")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.dim)
+            Text("select a symbol — the board assembles on demand")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.dim)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: Board
+
+    private func board(_ p: CompanyProfile) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header(p)
+            Divider().overlay(Theme.line)
+            if CompanyFormat.isMinimal(p) {
+                minimalLayout(p)
+            } else {
+                threeColumns(p)
+            }
+            Divider().overlay(Theme.line)
+            footer(p)
+        }
+    }
+
+    private func header(_ p: CompanyProfile) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(p.name)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(Theme.bone)
+                    .lineLimit(1)
+                Text(p.symbol)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Theme.dim)
+                if let px = model.lastPrice(p.symbol) {
+                    let change = model.sessionChangePct(p.symbol)
+                    Text(Fmt.price(px))
+                        .numeric(size: 13, weight: .medium)
+                        .foregroundStyle(change.map { Theme.pnlColor($0) } ?? Theme.bone)
+                    if let change {
+                        Text(Fmt.signedPct(change))
+                            .numeric(size: 11)
+                            .foregroundStyle(Theme.pnlColor(change))
+                    }
+                }
+                Spacer()
+                if model.companyLoading {
+                    ProgressView().controlSize(.mini).tint(Theme.ember)
+                }
+            }
+            Text(metaLine(p))
+                .font(.system(size: 11))
+                .foregroundStyle(Theme.dim)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    private func metaLine(_ p: CompanyProfile) -> String {
+        [p.sector, p.industry, p.country]
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+    }
+
+    private func threeColumns(_ p: CompanyProfile) -> some View {
+        GeometryReader { geo in
+            let side = max(170, min(280, geo.size.width * 0.26))
+            HStack(alignment: .top, spacing: 12) {
+                relationColumn(title: "suppliers", relations: p.suppliers)
+                    .frame(width: side)
+                centerColumn(p)
+                    .frame(maxWidth: .infinity)
+                relationColumn(title: "customers", relations: p.customers)
+                    .frame(width: side)
+            }
+            .padding(12)
+        }
+    }
+
+    // MARK: Relation columns
+
+    private func relationColumn(title: String, relations: [Relation]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                SectionLabel(text: title)
+                Text("\(relations.count)")
+                    .numeric(size: 10)
+                    .foregroundStyle(Theme.dim)
+            }
+            if relations.isEmpty {
+                Text("none curated")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.dim)
+                    .padding(.top, 4)
+            } else {
+                ScrollView(showsIndicators: false) {
+                    LazyVStack(spacing: 8) {
+                        ForEach(relations) { relation in
+                            RelationCard(relation: relation) { symbol in
+                                model.openCompany(symbol)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Center column
+
+    private func centerColumn(_ p: CompanyProfile) -> some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 18) {
+                if !p.description.isEmpty {
+                    Text(p.description)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Theme.dim)
+                        .lineSpacing(2)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                segmentsSection(p.segments)
+                fundamentalsSection(p)
+                competitorsSection(p.competitors)
+            }
+            .padding(.vertical, 2)
+        }
+    }
+
+    @ViewBuilder
+    private func segmentsSection(_ segments: [Segment]) -> some View {
+        if !segments.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(text: "what it makes")
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 170), spacing: 8)],
+                    alignment: .leading, spacing: 8
+                ) {
+                    ForEach(segments) { segment in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(segment.name)
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Theme.bone)
+                                .lineLimit(1)
+                            Text(segment.note)
+                                .font(.system(size: 10))
+                                .foregroundStyle(Theme.dim)
+                                .lineLimit(2)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, minHeight: 52, alignment: .topLeading)
+                        .panel()
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func fundamentalsSection(_ p: CompanyProfile) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                SectionLabel(text: "fundamentals")
+                if let f = p.fundamentals {
+                    Text("\(f.period) · FY\(f.fiscal_year)")
+                        .font(.system(size: 10))
+                        .monospacedDigit()
+                        .foregroundStyle(Theme.dim)
+                }
+            }
+            if let f = p.fundamentals {
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 10, alignment: .leading), count: 3),
+                    alignment: .leading, spacing: 12
+                ) {
+                    metric("revenue", CompanyFormat.abbrevMoney(f.revenue))
+                    metric("rev yoy", CompanyFormat.pct(f.revenue_yoy, signed: true),
+                           tint: f.revenue_yoy.map { Theme.pnlColor($0) })
+                    metric("gross margin", CompanyFormat.pct(f.gross_margin))
+                    metric("op margin", CompanyFormat.pct(f.op_margin))
+                    metric("net margin", CompanyFormat.pct(f.net_margin))
+                    metric("eps", CompanyFormat.plain(f.eps))
+                    metric("net income", CompanyFormat.abbrevMoney(f.net_income))
+                    metric("op cash flow", CompanyFormat.abbrevMoney(f.ocf))
+                    metric("cash", CompanyFormat.abbrevMoney(f.cash))
+                    metric("assets", CompanyFormat.abbrevMoney(f.assets))
+                    metric("liabilities", CompanyFormat.abbrevMoney(f.liabilities))
+                    metric("equity", CompanyFormat.abbrevMoney(f.equity))
+                }
+                .padding(12)
+                .panel()
+            } else {
+                Text("no fundamentals available")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.dim)
+            }
+        }
+    }
+
+    private func metric(_ label: String, _ value: String, tint: Color? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label.uppercased())
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(1.1)
+                .foregroundStyle(Theme.dim)
+                .lineLimit(1)
+            Text(value)
+                .numeric(size: 13, weight: .medium)
+                .foregroundStyle(value == "—" ? Theme.dim : (tint ?? Theme.bone))
+        }
+    }
+
+    @ViewBuilder
+    private func competitorsSection(_ competitors: [String]) -> some View {
+        if !competitors.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(text: "competitors")
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 72), spacing: 6)],
+                    alignment: .leading, spacing: 6
+                ) {
+                    ForEach(competitors, id: \.self) { competitor in
+                        CompetitorChip(name: competitor) {
+                            // Safe to always attempt: an uncurated symbol just
+                            // returns a minimal profile — no fake data either way.
+                            model.openCompany(competitor)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Minimal (crypto / uncurated) layout
+
+    private func minimalLayout(_ p: CompanyProfile) -> some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 18) {
+                if !p.description.isEmpty {
+                    Text(p.description)
+                        .font(.system(size: 12))
+                        .foregroundStyle(Theme.bone)
+                        .lineSpacing(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("no supply-chain graph curated for this asset")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.dim)
+                fundamentalsSection(p)
+                competitorsSection(p.competitors)
+            }
+            .frame(maxWidth: 560, alignment: .leading)
+            .padding(16)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: Footer
+
+    private func footer(_ p: CompanyProfile) -> some View {
+        HStack(spacing: 10) {
+            Text("graph: \(p.graph_source)")
+            Text("·")
+            Text("fundamentals: \(p.fundamentals_source)")
+            Spacer()
+        }
+        .font(.system(size: 10))
+        .foregroundStyle(Theme.dim)
+        .lineLimit(1)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+}
+
+// MARK: - Relation card
+
+private struct RelationCard: View {
+    let relation: Relation
+    let open: (String) -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        if let symbol = relation.symbol {
+            Button {
+                open(symbol)
+            } label: {
+                content(clickable: true)
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
+            .animation(DeckMotion.ease(), value: hovering)
+        } else {
+            content(clickable: false)
+        }
+    }
+
+    private func content(clickable: Bool) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(relation.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Theme.bone)
+                    .lineLimit(1)
+                Text(relation.via)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.dim)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            if clickable {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(hovering ? Theme.ember : Theme.dim)
+                    .padding(.top, 3)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .panel(highlighted: clickable && hovering)
+    }
+}
+
+// MARK: - Competitor chip
+
+private struct CompetitorChip: View {
+    let name: String
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(name)
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(hovering ? Theme.ember : Theme.bone)
+                .lineLimit(1)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .frame(maxWidth: .infinity)
+                .background(hovering ? Theme.emberTint : Theme.panel)
+                .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.chipRadius)
+                        .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(DeckMotion.ease(), value: hovering)
     }
 }

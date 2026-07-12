@@ -3,7 +3,7 @@
 //! reaches the OMS passed through RiskEngine::evaluate first. There is no
 //! second door.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cx_core::autonomy::AutonomyDial;
 use cx_core::events::{
@@ -11,10 +11,11 @@ use cx_core::events::{
 };
 use cx_core::store::BarStore;
 use cx_core::time::now_ms;
-use cx_core::types::{OrderType, Severity, Side, Tif};
+use cx_core::types::{Interval, OrderType, Severity, Side, Tif};
 use cx_core::{Bus, Command, Config, KillSwitch};
 use cx_oms::Oms;
 use cx_risk::{RiskDecision, RiskEngine};
+use cx_ta::corr::EwmaCorr;
 
 /// Fusion direction magnitude below which a symbol is considered flat.
 const EXIT_BAND: f64 = 0.15;
@@ -31,6 +32,9 @@ pub struct TradePipeline {
     dial: Arc<AutonomyDial>,
     kill: Arc<KillSwitch>,
     cfg: Config,
+    /// EWMA return correlations across the traded set, fed from completed
+    /// M1 bars — powers the correlation-aware (tighten-only) sizing scalar.
+    corr: Mutex<EwmaCorr>,
 }
 
 impl TradePipeline {
@@ -51,6 +55,7 @@ impl TradePipeline {
             dial,
             kill,
             cfg,
+            corr: Mutex::new(EwmaCorr::new()),
         })
     }
 
@@ -84,6 +89,15 @@ impl TradePipeline {
         match ev {
             EngineEvent::Signal(sig) if sig.strategy == "fusion" => {
                 self.on_fusion_signal(sig).await;
+            }
+            // Completed M1 bars feed the cross-symbol correlation tracker
+            // (EwmaCorr pairs asynchronous clocks internally).
+            EngineEvent::Bar(b) if b.complete && b.interval == Interval::M1 => {
+                if b.open.is_finite() && b.open.abs() > f64::EPSILON && b.close.is_finite() {
+                    if let Ok(mut corr) = self.corr.lock() {
+                        corr.update(&b.symbol, b.close / b.open - 1.0);
+                    }
+                }
             }
             EngineEvent::Caution(c) => {
                 self.risk.set_caution(c.scope.as_deref(), c.value, &c.reason);
@@ -145,9 +159,27 @@ impl TradePipeline {
                 .map(|per_bar| per_bar * M1_BARS_PER_YEAR.sqrt())
                 .map(|ann| cx_ta::quant::vol_target_scalar(TARGET_ANNUAL_VOL, ann))
                 .unwrap_or(1.0);
+            // Correlation-aware diversification: shrink when the candidate
+            // is crowded against the symbols already held. Tighten-only —
+            // the scalar lives in [0.5, 1.0] and reads 1.0 with no data
+            // (cx_ta::corr::diversification_scalar), so it can never grow
+            // a position.
+            let held: Vec<String> = view
+                .positions
+                .iter()
+                .filter(|(s, (qty, _))| s.as_str() != sig.symbol && qty.abs() > 1e-12)
+                .map(|(s, _)| s.clone())
+                .collect();
+            let corr_scalar = match self.corr.lock() {
+                Ok(corr) => {
+                    cx_ta::corr::diversification_scalar(corr.avg_corr(&sig.symbol, &held))
+                }
+                Err(_) => 1.0,
+            };
             let target_notional = equity
                 * self.cfg.risk.max_position_pct
                 * vol_scalar
+                * corr_scalar
                 * sig.conviction.clamp(0.0, 1.0);
             sig.direction.signum() * target_notional / last_px
         } else {

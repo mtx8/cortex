@@ -4,17 +4,29 @@
 //! bar publishes ONE fused opinion per symbol — the only signal the trade
 //! pipeline acts on.
 //!
-//! Weighting: conviction * exp(-age_minutes / 5) * strategy weight
-//! (built-ins 1.0, "llm-strategist" 0.6, unknown sources 0.4). Fused
-//! conviction is the weighted mean conviction scaled by an agreement factor
-//! (1.0 all signs agree -> 0.4 full disagreement). Contributors older than
-//! 30 minutes drop out entirely.
+//! Weighting: conviction * exp(-age_minutes / 5) * strategy weight. The
+//! per-strategy weight is learned ONLINE via Hedge (multiplicative weights):
+//! on every completed M1 bar, each strategy with an active signal on that
+//! bar's symbol is scored against the bar-to-bar vol-normalized return
+//! (w <- w * exp(eta * direction * r_hat), eta = 0.15, r_hat clamped to
+//! +/-3), then all known weights are renormalized to mean 1.0 and clamped
+//! into [0.15, 3.0] — a bad strategy decays toward the floor, a hot one
+//! compounds toward the cap, none ever dies or dominates. Initial weights
+//! keep the old static prior: built-ins 1.0, "llm-strategist" 0.6, unknown
+//! sources 0.4. The vol normalizer is an internal per-symbol EWMA variance
+//! of bar-to-bar returns (lambda = 0.94, RiskMetrics-style), seeded with the
+//! first squared return. Live weights are surfaced in every fused signal's
+//! `features` map as `w_<strategy>`.
+//!
+//! Fused conviction is the weighted mean conviction scaled by an agreement
+//! factor (1.0 all signs agree -> 0.4 full disagreement). Contributors older
+//! than 30 minutes drop out entirely.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use cx_core::bus::BusEvent;
-use cx_core::events::{AgentThought, EngineEvent, StrategySignal};
+use cx_core::events::{AgentThought, Bar, EngineEvent, StrategySignal};
 use cx_core::time::now_ms;
 use cx_core::types::{Interval, Severity};
 use cx_core::{Bus, Config};
@@ -34,6 +46,16 @@ const MIN_AGREEMENT: f64 = 0.4;
 /// Hard cap on tracked (strategy, symbol) entries — bounded memory even if
 /// the bus carries arbitrarily many exotic strategy names.
 const MAX_ENTRIES: usize = 512;
+/// Hedge learning rate.
+const HEDGE_ETA: f64 = 0.15;
+/// Vol-normalized returns are clamped to +/- this before the Hedge update.
+const HEDGE_RET_CLAMP: f64 = 3.0;
+/// No strategy weight ever decays below this (nothing dies) ...
+const WEIGHT_FLOOR: f64 = 0.15;
+/// ... or compounds above this (nothing dominates).
+const WEIGHT_CAP: f64 = 3.0;
+/// EWMA decay of the per-symbol return-variance estimate (RiskMetrics).
+const VOL_LAMBDA: f64 = 0.94;
 
 /// One remembered contributor opinion (already validated finite).
 #[derive(Debug, Clone)]
@@ -43,24 +65,53 @@ struct Contribution {
     ts_ms: i64,
 }
 
-/// The fusion book: latest signal per (strategy, symbol) plus the last
-/// published fused opinion per symbol (the no-spam baseline).
+/// Per-symbol EWMA state backing the Hedge vol normalizer.
+#[derive(Debug, Clone, Copy)]
+struct VolState {
+    last_close: f64,
+    /// EWMA of squared bar-to-bar returns; NaN until the first return.
+    ewma_var: f64,
+}
+
+/// The fusion book: latest signal per (strategy, symbol), the last published
+/// fused opinion per symbol (the no-spam baseline), the learned Hedge weight
+/// per strategy, and per-symbol vol state for return normalization.
 #[derive(Debug, Default)]
 pub(crate) struct FusionBook {
     latest: HashMap<(String, String), Contribution>,
     last_pub: HashMap<String, (f64, f64)>,
+    /// Learned Hedge weight per strategy; seeded from [`initial_weight`] on
+    /// first sight, bounded to [`MAX_ENTRIES`] names.
+    weights: HashMap<String, f64>,
+    /// Per-symbol return/vol state; keyed only by configured symbols (the
+    /// bar path filters), so bounded.
+    vol: HashMap<String, VolState>,
 }
 
 impl FusionBook {
-    /// Drop every symbol's latest signal for `strategy` (disable path).
+    /// Drop every symbol's latest signal for `strategy` (disable path). The
+    /// learned Hedge weight intentionally survives — while disabled the
+    /// strategy has no active signals, so its weight cannot drift, and a
+    /// re-enable resumes from what was learned.
     pub(crate) fn remove_strategy(&mut self, strategy: &str) {
         self.latest.retain(|(s, _), _| s != strategy);
     }
+
+    /// The current blend weight for a strategy: learned if known, otherwise
+    /// the static prior.
+    fn weight_of(&self, name: &str) -> f64 {
+        self.weights
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| initial_weight(name))
+    }
 }
 
-/// Blend weight per source. Built-ins are trusted 1.0; the LLM strategist
-/// advises at 0.6; anything unknown on the bus counts at 0.4.
-fn strategy_weight(name: &str) -> f64 {
+/// Initial (prior) weight per source — the same starting point the old
+/// static blend used. Built-ins are trusted 1.0; the LLM strategist advises
+/// at 0.6; anything unknown on the bus starts at 0.4. Hedge takes it from
+/// there.
+fn initial_weight(name: &str) -> f64 {
     if BUILT_INS.contains(&name) {
         1.0
     } else if name == "llm-strategist" {
@@ -83,6 +134,7 @@ pub(crate) async fn run(bus: Arc<Bus>, cfg: Config, shared: Arc<Shared>, mut rx:
                         && bar.interval == Interval::M1
                         && symbols.contains(&bar.symbol) =>
                 {
+                    hedge_on_bar(&shared, bar);
                     fuse_and_publish(&bus, &shared, &bar.symbol);
                 }
                 _ => {}
@@ -121,6 +173,12 @@ fn on_signal(shared: &Shared, sig: &StrategySignal) {
             book.latest.remove(&oldest);
         }
     }
+    // Seed the Hedge weight on first sight so renormalization spans every
+    // known strategy; same bound as the signal book.
+    if !book.weights.contains_key(&sig.strategy) && book.weights.len() < MAX_ENTRIES {
+        book.weights
+            .insert(sig.strategy.clone(), initial_weight(&sig.strategy));
+    }
     book.latest.insert(
         key,
         Contribution {
@@ -129,6 +187,100 @@ fn on_signal(shared: &Shared, sig: &StrategySignal) {
             ts_ms: sig.ts_ms,
         },
     );
+}
+
+/// The online Hedge update, run on every completed M1 bar BEFORE the fuse.
+///
+/// The bar closes the "next bar" for the signals already in the book, so
+/// each strategy holding an active (non-expired) opinion on this symbol is
+/// scored: w <- w * exp(eta * direction * r_hat). r_hat is the bar-to-bar
+/// return divided by the symbol's EWMA vol (sqrt of the lambda=0.94 EWMA of
+/// squared returns, seeded with the first squared return) and clamped to
+/// +/-3; flat opinions score exp(0) = 1 and are untouched. After the
+/// updates, all known weights renormalize to mean 1.0 and clamp into
+/// [0.15, 3.0]. NaN-safe: a non-finite close, return, or normalizer skips
+/// the entire update, leaving weights unchanged.
+fn hedge_on_bar(shared: &Shared, bar: &Bar) {
+    let mut book = shared.lock_fusion();
+
+    // --- return + EWMA vol update -------------------------------------
+    if !(bar.close.is_finite() && bar.close > 0.0) {
+        return; // never let a bad close poison last_close or the weights
+    }
+    let prev = book.vol.get(&bar.symbol).copied();
+    let mut r_hat: Option<f64> = None;
+    let next_state = match prev {
+        Some(v) if v.last_close > 0.0 => {
+            let r = bar.close / v.last_close - 1.0;
+            if r.is_finite() {
+                let var = if v.ewma_var.is_finite() {
+                    VOL_LAMBDA * v.ewma_var + (1.0 - VOL_LAMBDA) * r * r
+                } else {
+                    r * r // seed on the first observed return
+                };
+                let vol = var.sqrt();
+                if vol > 0.0 {
+                    let z = (r / vol).clamp(-HEDGE_RET_CLAMP, HEDGE_RET_CLAMP);
+                    if z.is_finite() {
+                        r_hat = Some(z);
+                    }
+                }
+                VolState {
+                    last_close: bar.close,
+                    ewma_var: var,
+                }
+            } else {
+                VolState {
+                    last_close: bar.close,
+                    ewma_var: v.ewma_var,
+                }
+            }
+        }
+        _ => VolState {
+            last_close: bar.close,
+            ewma_var: f64::NAN,
+        },
+    };
+    book.vol.insert(bar.symbol.clone(), next_state);
+    let Some(r_hat) = r_hat else {
+        return; // no scorable return this bar; weights unchanged
+    };
+
+    // --- multiplicative update for active contributors ----------------
+    let now = now_ms();
+    let scored: Vec<(String, f64)> = book
+        .latest
+        .iter()
+        .filter(|((_, sym), c)| {
+            sym == &bar.symbol && now.saturating_sub(c.ts_ms) <= MAX_AGE_MS
+        })
+        .map(|((strat, _), c)| (strat.clone(), c.direction))
+        .collect();
+    if scored.is_empty() {
+        return;
+    }
+    for (strat, direction) in scored {
+        let factor = (HEDGE_ETA * direction * r_hat).exp();
+        let w = book.weight_of(&strat) * factor;
+        if !w.is_finite() {
+            continue;
+        }
+        if book.weights.contains_key(&strat) || book.weights.len() < MAX_ENTRIES {
+            book.weights.insert(strat, w);
+        }
+    }
+
+    // --- renormalize to mean 1.0, then floor/cap ----------------------
+    let n = book.weights.len();
+    if n > 0 {
+        let sum: f64 = book.weights.values().sum();
+        if sum.is_finite() && sum > 0.0 {
+            let scale = n as f64 / sum;
+            for w in book.weights.values_mut() {
+                *w = (*w * scale).clamp(WEIGHT_FLOOR, WEIGHT_CAP);
+            }
+        }
+    }
 }
 
 /// Fuse the live contributors for one symbol and publish if the opinion
@@ -140,19 +292,25 @@ fn fuse_and_publish(bus: &Bus, shared: &Shared, symbol: &str) {
     book.latest
         .retain(|_, c| now.saturating_sub(c.ts_ms) <= MAX_AGE_MS);
 
-    // (strategy, direction, conviction, weight), name-sorted for a
-    // deterministic rationale.
+    // (strategy, direction, conviction, blend weight), name-sorted for a
+    // deterministic rationale. The blend weight folds in the LIVE Hedge
+    // weight for the source strategy.
     let mut contribs: Vec<(String, f64, f64, f64)> = book
         .latest
         .iter()
         .filter(|((_, sym), _)| sym == symbol)
         .filter_map(|((strat, _), c)| {
             let age_min = (now - c.ts_ms).max(0) as f64 / 60_000.0;
-            let w = c.conviction * (-age_min / DECAY_MINUTES).exp() * strategy_weight(strat);
+            let w = c.conviction * (-age_min / DECAY_MINUTES).exp() * book.weight_of(strat);
             (w.is_finite() && w > 0.0).then(|| (strat.clone(), c.direction, c.conviction, w))
         })
         .collect();
     contribs.sort_by(|a, b| a.0.cmp(&b.0));
+    // Live per-strategy Hedge weights for the features map (`w_<strategy>`).
+    let live_weights: Vec<(String, f64)> = contribs
+        .iter()
+        .map(|(name, ..)| (name.clone(), book.weight_of(name)))
+        .collect();
 
     let (direction, conviction) = if contribs.is_empty() {
         (0.0, 0.0)
@@ -199,6 +357,9 @@ fn fuse_and_publish(bus: &Bus, shared: &Shared, symbol: &str) {
     let mut features = BTreeMap::new();
     for (name, d, c, _) in &contribs {
         features.insert(name.clone(), d * c);
+    }
+    for (name, w) in &live_weights {
+        features.insert(format!("w_{name}"), *w);
     }
     let ts = now_ms();
     tracing::debug!(symbol, direction, conviction, %rationale, "fusion");
@@ -254,13 +415,114 @@ mod tests {
         None
     }
 
+    fn m1_bar(i: i64, close: f64) -> cx_core::events::Bar {
+        cx_core::events::Bar {
+            symbol: "TST".into(),
+            interval: Interval::M1,
+            ts_open_ms: i * 60_000,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1.0,
+            trade_count: 1,
+            vwap: close,
+            complete: true,
+        }
+    }
+
     #[test]
-    fn weights_by_source() {
-        assert_eq!(strategy_weight("momentum_x"), 1.0);
-        assert_eq!(strategy_weight("meanrev_z"), 1.0);
-        assert_eq!(strategy_weight("breakout_d"), 1.0);
-        assert_eq!(strategy_weight("llm-strategist"), 0.6);
-        assert_eq!(strategy_weight("mystery_alpha"), 0.4);
+    fn initial_weights_by_source() {
+        assert_eq!(initial_weight("momentum_x"), 1.0);
+        assert_eq!(initial_weight("meanrev_z"), 1.0);
+        assert_eq!(initial_weight("breakout_d"), 1.0);
+        assert_eq!(initial_weight("kalman_trend"), 1.0);
+        assert_eq!(initial_weight("llm-strategist"), 0.6);
+        assert_eq!(initial_weight("mystery_alpha"), 0.4);
+    }
+
+    #[test]
+    fn hedge_rewards_the_right_strategy_and_decays_the_wrong_one() {
+        // A is always long, B always short, and the price only rises:
+        // A must compound toward the cap, B must decay to the floor.
+        let sh = shared();
+        let mut close = 100.0;
+        for i in 0..120_i64 {
+            let now = now_ms();
+            on_signal(&sh, &sig("a", "TST", 1.0, 0.8, now));
+            on_signal(&sh, &sig("b", "TST", -1.0, 0.8, now));
+            hedge_on_bar(&sh, &m1_bar(i, close));
+            close *= 1.001; // deterministic +10bps per bar
+        }
+        let book = sh.lock_fusion();
+        let wa = book.weights["a"];
+        let wb = book.weights["b"];
+        assert!(wa > 1.5, "right strategy must rise toward the cap: {wa}");
+        assert!(
+            (wb - WEIGHT_FLOOR).abs() < 1e-9,
+            "wrong strategy must sit at the floor: {wb}"
+        );
+        for w in book.weights.values() {
+            assert!((WEIGHT_FLOOR..=WEIGHT_CAP).contains(w), "out of bounds: {w}");
+        }
+    }
+
+    #[test]
+    fn hedge_renormalizes_to_mean_one_when_unclamped() {
+        let sh = shared();
+        let mut close = 100.0;
+        for i in 0..4_i64 {
+            let now = now_ms();
+            on_signal(&sh, &sig("a", "TST", 1.0, 0.8, now));
+            on_signal(&sh, &sig("b", "TST", -1.0, 0.8, now));
+            hedge_on_bar(&sh, &m1_bar(i, close));
+            close *= 1.001;
+        }
+        let book = sh.lock_fusion();
+        let mean: f64 =
+            book.weights.values().sum::<f64>() / book.weights.len() as f64;
+        assert!((mean - 1.0).abs() < 1e-9, "mean must be 1.0: {mean}");
+        for w in book.weights.values() {
+            assert!((WEIGHT_FLOOR..=WEIGHT_CAP).contains(w));
+        }
+    }
+
+    #[test]
+    fn hedge_ignores_non_finite_bars() {
+        let sh = shared();
+        let mut close = 100.0;
+        for i in 0..5_i64 {
+            on_signal(&sh, &sig("a", "TST", 1.0, 0.8, now_ms()));
+            // A flat contributor keeps the renorm from pinning "a" at 1.0.
+            on_signal(&sh, &sig("b", "TST", 0.0, 0.3, now_ms()));
+            hedge_on_bar(&sh, &m1_bar(i, close));
+            close *= 1.001;
+        }
+        let before = sh.lock_fusion().weights.clone();
+        assert!(!before.is_empty());
+        hedge_on_bar(&sh, &m1_bar(5, f64::NAN));
+        hedge_on_bar(&sh, &m1_bar(6, f64::INFINITY));
+        hedge_on_bar(&sh, &m1_bar(7, -1.0));
+        let after = sh.lock_fusion().weights.clone();
+        assert_eq!(before, after, "bad bars must leave weights unchanged");
+        // And the poisoned closes never entered the vol state: the next
+        // good bar still scores against the last good close.
+        hedge_on_bar(&sh, &m1_bar(8, close));
+        assert!(sh.lock_fusion().weights["a"] > after["a"]);
+    }
+
+    #[test]
+    fn fused_signal_surfaces_live_weights_as_features() {
+        let now = now_ms();
+        let bus = Bus::new(64);
+        let mut rx = bus.subscribe();
+        let sh = shared();
+        on_signal(&sh, &sig("momentum_x", "TST", 1.0, 0.8, now));
+        on_signal(&sh, &sig("llm-strategist", "TST", 1.0, 0.6, now));
+        fuse_and_publish(&bus, &sh, "TST");
+        let out = fused_signal(&mut rx).expect("fusion");
+        assert!((out.features["w_momentum_x"] - 1.0).abs() < 1e-9);
+        assert!((out.features["w_llm-strategist"] - 0.6).abs() < 1e-9);
     }
 
     #[test]
