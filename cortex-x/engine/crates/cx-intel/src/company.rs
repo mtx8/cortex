@@ -7,7 +7,9 @@
 //!
 //! Both sides degrade independently: no curated entry -> honest
 //! "no curated graph"; EDGAR unreachable/unknown ticker -> fundamentals
-//! stay None with `fundamentals_source: "unavailable"`.
+//! stay None with `fundamentals_source: "unavailable"`; a filer whose
+//! companyfacts hold no annual (10-K/20-F) values -> "no annual report
+//! data in EDGAR" (data absence is not a fetch failure).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -23,8 +25,10 @@ use crate::splc_data;
 const SEC_TICKERS_URL: &str = "https://www.sec.gov/files/company_tickers.json";
 /// The ticker map is ~2 MB today; leave generous headroom.
 const TICKER_MAP_CAP: usize = 8 * 1024 * 1024;
-/// companyfacts payloads for megacaps run well past the default 4 MB cap.
-const COMPANYFACTS_CAP: usize = 24 * 1024 * 1024;
+/// companyfacts payloads for megacaps run well past the default 4 MB cap,
+/// and money-center banks (JPM, BAC) carry the largest XBRL fact sets of
+/// all — keep headroom well above their current payload sizes.
+const COMPANYFACTS_CAP: usize = 48 * 1024 * 1024;
 const CIK_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// Ticker -> CIK map, parsed once and reused for 24h. The SEC file changes
@@ -39,11 +43,16 @@ pub async fn fetch_company(egress: &Egress, symbol: &str) -> CompanyProfile {
 
     if is_equity(&symbol) {
         match fetch_fundamentals(egress, &symbol).await {
-            Ok(Some(f)) => {
+            Ok(FundamentalsOutcome::Data(f)) => {
                 profile.fundamentals = Some(f);
-                profile.fundamentals_source = "sec-edgar (10-K/10-Q)".into();
+                profile.fundamentals_source = "sec-edgar (10-K/20-F)".into();
             }
-            Ok(None) => profile.fundamentals_source = "unavailable (not an SEC filer)".into(),
+            Ok(FundamentalsOutcome::NotAFiler) => {
+                profile.fundamentals_source = "unavailable (not an SEC filer)".into();
+            }
+            Ok(FundamentalsOutcome::NoAnnualData) => {
+                profile.fundamentals_source = "no annual report data in EDGAR".into();
+            }
             Err(e) => {
                 tracing::warn!(symbol = %symbol, error = %e, "edgar fetch failed");
                 profile.fundamentals_source = "unavailable (fetch failed)".into();
@@ -83,19 +92,46 @@ fn minimal_profile(symbol: &str) -> CompanyProfile {
     }
 }
 
+/// Profile served when COMPANY intel is disabled in config: an honest,
+/// instant answer instead of a request that never resolves client-side.
+pub fn disabled_profile(symbol: &str) -> CompanyProfile {
+    let mut p = minimal_profile(&symbol.trim().to_uppercase());
+    p.description = "COMPANY intelligence is disabled (intel.enable_company = false).".into();
+    p.graph_source = "disabled".into();
+    p.fundamentals_source = "disabled".into();
+    p.ts_ms = now_ms();
+    p
+}
+
+/// Outcome of an EDGAR fundamentals lookup that completed without a fetch
+/// error. Lets the caller label "no data exists" differently from "the
+/// fetch failed".
+#[derive(Debug)]
+pub enum FundamentalsOutcome {
+    /// Latest annual fundamentals extracted.
+    Data(Fundamentals),
+    /// Ticker is not in the SEC map (ETFs, non-filers).
+    NotAFiler,
+    /// companyfacts fetched fine but held no annual (10-K/20-F, FY)
+    /// us-gaap values (e.g. IFRS-only filers).
+    NoAnnualData,
+}
+
 /// Latest annual fundamentals from EDGAR company facts.
-/// `Ok(None)` when the ticker is not in the SEC map (ETFs, non-filers).
 pub async fn fetch_fundamentals(
     egress: &Egress,
     symbol: &str,
-) -> Result<Option<Fundamentals>, CxError> {
+) -> Result<FundamentalsOutcome, CxError> {
     let Some(cik) = cik_for(egress, symbol).await? else {
-        return Ok(None);
+        return Ok(FundamentalsOutcome::NotAFiler);
     };
     let raw = egress
         .get_text_with_cap(&companyfacts_url(cik), COMPANYFACTS_CAP)
         .await?;
-    parse_companyfacts(&raw).map(Some)
+    Ok(match parse_companyfacts(&raw)? {
+        Some(f) => FundamentalsOutcome::Data(f),
+        None => FundamentalsOutcome::NoAnnualData,
+    })
 }
 
 /// EDGAR requires the 10-digit zero-padded CIK in the path.
@@ -111,12 +147,13 @@ async fn cik_for(egress: &Egress, symbol: &str) -> Result<Option<u64>, CxError> 
     }
     let raw = egress.get_text_with_cap(SEC_TICKERS_URL, TICKER_MAP_CAP).await?;
     let map = Arc::new(parse_cik_map(&raw)?);
-    *CIK_CACHE.lock().unwrap() = Some((Instant::now(), Arc::clone(&map)));
+    *CIK_CACHE.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some((Instant::now(), Arc::clone(&map)));
     Ok(map.get(symbol).copied())
 }
 
 fn cached_cik_map() -> Option<Arc<HashMap<String, u64>>> {
-    let guard = CIK_CACHE.lock().unwrap();
+    let guard = CIK_CACHE.lock().unwrap_or_else(|p| p.into_inner());
     guard
         .as_ref()
         .and_then(|(at, map)| (at.elapsed() < CIK_TTL).then(|| Arc::clone(map)))
@@ -146,8 +183,8 @@ pub(crate) fn parse_cik_map(raw: &str) -> Result<HashMap<String, u64>, CxError> 
     Ok(map)
 }
 
-/// One us-gaap tag reduced to its latest annual (10-K, fp "FY") point, plus
-/// the prior fiscal year's value for YoY math.
+/// One us-gaap tag reduced to its latest annual (10-K/20-F, fp "FY") point,
+/// plus the prior fiscal year's value for YoY math.
 #[derive(Debug, Clone)]
 struct TagLatest {
     val: f64,
@@ -156,16 +193,19 @@ struct TagLatest {
     fy: i64,
 }
 
-/// Extract `Fundamentals` from a companyfacts payload. Malformed JSON or a
-/// payload without extractable annual us-gaap values -> Err (the caller
-/// discloses "unavailable"). Every number passes the NaN firewall.
-pub(crate) fn parse_companyfacts(raw: &str) -> Result<Fundamentals, CxError> {
+/// Extract `Fundamentals` from a companyfacts payload. Malformed JSON ->
+/// Err; a well-formed payload without extractable annual us-gaap values ->
+/// `Ok(None)` (the caller discloses "no annual report data", not a fetch
+/// failure). Every number passes the NaN firewall.
+pub(crate) fn parse_companyfacts(raw: &str) -> Result<Option<Fundamentals>, CxError> {
     let v: serde_json::Value = serde_json::from_str(raw)?;
-    let gaap = v
+    let Some(gaap) = v
         .get("facts")
         .and_then(|f| f.get("us-gaap"))
         .and_then(|g| g.as_object())
-        .ok_or_else(|| CxError::Serde("companyfacts: no us-gaap facts".into()))?;
+    else {
+        return Ok(None);
+    };
 
     // Revenues predates ASC 606 and often goes stale after 2018, while the
     // contract-revenue tag is current — so among the fallbacks we keep the
@@ -189,7 +229,7 @@ pub(crate) fn parse_companyfacts(raw: &str) -> Result<Fundamentals, CxError> {
     let cash = latest_with_fallback(gaap, &["CashAndCashEquivalentsAtCarryingValue"], "USD");
     let ocf = latest_with_fallback(gaap, &["NetCashProvidedByUsedInOperatingActivities"], "USD");
 
-    let frame = revenue
+    let Some(frame) = revenue
         .as_ref()
         .or(net.as_ref())
         .or(assets.as_ref())
@@ -200,7 +240,9 @@ pub(crate) fn parse_companyfacts(raw: &str) -> Result<Fundamentals, CxError> {
         .or(eps.as_ref())
         .or(cash.as_ref())
         .or(ocf.as_ref())
-        .ok_or_else(|| CxError::Serde("companyfacts: no annual us-gaap values".into()))?;
+    else {
+        return Ok(None);
+    };
     let fiscal_year = if frame.fy > 0 {
         frame.fy.to_string()
     } else {
@@ -214,7 +256,7 @@ pub(crate) fn parse_companyfacts(raw: &str) -> Result<Fundamentals, CxError> {
         .and_then(fin);
     let val = |t: &Option<TagLatest>| t.as_ref().and_then(|x| fin(x.val));
 
-    Ok(Fundamentals {
+    Ok(Some(Fundamentals {
         revenue: rev_val,
         revenue_yoy,
         gross_margin: ratio(val(&gross), rev_val),
@@ -229,7 +271,7 @@ pub(crate) fn parse_companyfacts(raw: &str) -> Result<Fundamentals, CxError> {
         cash: val(&cash),
         period: "FY".into(),
         fiscal_year,
-    })
+    }))
 }
 
 /// NaN firewall: finite or None. Every value that reaches a profile goes
@@ -247,7 +289,7 @@ fn ratio(num: Option<f64>, den: Option<f64>) -> Option<f64> {
 }
 
 /// Best annual point across a fallback list of tags: each tag reduces to its
-/// latest 10-K/FY entry, and the candidate with the most recent period end
+/// latest annual FY entry, and the candidate with the most recent period end
 /// wins (guards against stale legacy tags shadowing current ones).
 fn latest_with_fallback(
     gaap: &serde_json::Map<String, serde_json::Value>,
@@ -270,7 +312,7 @@ fn latest_annual(
     Some(TagLatest { val, prior, end, fy })
 }
 
-/// All annual (form 10-K*, fp "FY") points for one tag/unit, deduped by
+/// All annual (form 10-K*/20-F*, fp "FY") points for one tag/unit, deduped by
 /// period end (comparative re-reports overwrite in filing order) and sorted
 /// ascending by end date — ISO dates order correctly as strings.
 fn annual_points(
@@ -288,10 +330,12 @@ fn annual_points(
     };
     let mut by_end: BTreeMap<String, (i64, f64)> = BTreeMap::new();
     for e in entries {
+        // Annual reports: 10-K (domestic) or 20-F (foreign private issuers
+        // like TSM/ASML — excluding them mislabeled real filers as absent).
         let form_ok = e
             .get("form")
             .and_then(|x| x.as_str())
-            .is_some_and(|f| f.starts_with("10-K"));
+            .is_some_and(|f| f.starts_with("10-K") || f.starts_with("20-F"));
         let fp_ok = e.get("fp").and_then(|x| x.as_str()) == Some("FY");
         if !(form_ok && fp_ok) {
             continue;
@@ -366,7 +410,7 @@ mod tests {
 
     #[test]
     fn companyfacts_fixture_extracts_latest_fy() {
-        let f = parse_companyfacts(FIXTURE).unwrap();
+        let f = parse_companyfacts(FIXTURE).unwrap().unwrap();
         approx(f.revenue.unwrap(), 391_035_000_000.0);
         approx(
             f.revenue_yoy.unwrap(),
@@ -395,15 +439,31 @@ mod tests {
     }
 
     #[test]
-    fn companyfacts_rejects_malformed_and_missing_gaap() {
+    fn companyfacts_distinguishes_malformed_from_no_annual_data() {
+        // Malformed JSON is a genuine error.
         assert!(parse_companyfacts("not json {").is_err());
-        assert!(parse_companyfacts("{}").is_err());
-        assert!(parse_companyfacts(r#"{"facts":{"dei":{}}}"#).is_err());
+        // Well-formed payloads without annual us-gaap values are Ok(None) —
+        // "no annual report data", not a fetch failure.
+        assert_eq!(parse_companyfacts("{}").unwrap(), None);
+        assert_eq!(parse_companyfacts(r#"{"facts":{"dei":{}}}"#).unwrap(), None);
         // us-gaap present but only quarterly entries -> no annual values.
         let quarterly_only = r#"{"facts":{"us-gaap":{"Revenues":{"units":{"USD":[
             {"start":"2024-01-01","end":"2024-03-31","val":5,"fy":2024,"fp":"Q1","form":"10-Q","filed":"2024-05-01"}
         ]}}}}}"#;
-        assert!(parse_companyfacts(quarterly_only).is_err());
+        assert_eq!(parse_companyfacts(quarterly_only).unwrap(), None);
+    }
+
+    #[test]
+    fn twenty_f_annual_reports_are_accepted() {
+        // Foreign private issuers (TSM, ASML) file 20-F, not 10-K.
+        let twenty_f = r#"{"facts":{"us-gaap":{"Revenues":{"units":{"USD":[
+            {"start":"2023-01-01","end":"2023-12-31","val":70000000000,"fy":2023,"fp":"FY","form":"20-F","filed":"2024-04-15"},
+            {"start":"2024-01-01","end":"2024-12-31","val":90000000000,"fy":2024,"fp":"FY","form":"20-F/A","filed":"2025-04-18"}
+        ]}}}}}"#;
+        let f = parse_companyfacts(twenty_f).unwrap().unwrap();
+        approx(f.revenue.unwrap(), 90_000_000_000.0);
+        approx(f.revenue_yoy.unwrap(), 2.0 / 7.0);
+        assert_eq!(f.fiscal_year, "2024");
     }
 
     #[test]
@@ -418,7 +478,7 @@ mod tests {
                 {"start":"2023-01-01","end":"2023-12-31","val":3,"fy":2023,"fp":"FY","form":"10-K","filed":"2024-02-01"}
             ]}}
         }}}"#;
-        let f = parse_companyfacts(zero_latest).unwrap();
+        let f = parse_companyfacts(zero_latest).unwrap().unwrap();
         assert_eq!(f.revenue, Some(0.0));
         assert_eq!(f.gross_margin, None);
         approx(f.revenue_yoy.unwrap(), -1.0);
@@ -428,7 +488,7 @@ mod tests {
             {"start":"2022-01-01","end":"2022-12-31","val":0,"fy":2022,"fp":"FY","form":"10-K","filed":"2023-02-01"},
             {"start":"2023-01-01","end":"2023-12-31","val":5,"fy":2023,"fp":"FY","form":"10-K","filed":"2024-02-01"}
         ]}}}}}"#;
-        let f = parse_companyfacts(zero_prior).unwrap();
+        let f = parse_companyfacts(zero_prior).unwrap().unwrap();
         assert_eq!(f.revenue, Some(5.0));
         assert_eq!(f.revenue_yoy, None);
     }
@@ -438,7 +498,7 @@ mod tests {
         let basic_only = r#"{"facts":{"us-gaap":{"EarningsPerShareBasic":{"units":{"USD/shares":[
             {"start":"2023-01-01","end":"2023-12-31","val":2.5,"fy":2023,"fp":"FY","form":"10-K","filed":"2024-02-01"}
         ]}}}}}"#;
-        let f = parse_companyfacts(basic_only).unwrap();
+        let f = parse_companyfacts(basic_only).unwrap().unwrap();
         approx(f.eps.unwrap(), 2.5);
         assert_eq!(f.fiscal_year, "2023");
         assert_eq!(f.revenue, None);

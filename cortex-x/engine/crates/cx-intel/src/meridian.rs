@@ -64,6 +64,12 @@ pub const THEMES: &[(&str, &str)] = &[
 const DAY_MS: i64 = 86_400_000;
 /// Event ring capacity (deduped by normalized title).
 const RING_CAP: usize = 200;
+/// Counting-dedup TTL: a title re-seen within this window is never "fresh".
+/// Decoupled from the display ring so a single-theme news storm cannot evict
+/// quiet themes' titles and inflate their counts on refetch.
+const DEDUP_TTL_MS: i64 = 48 * 3_600_000;
+/// Per-theme counting-dedup map cap (oldest-first eviction beyond this).
+const DEDUP_CAP: usize = 500;
 /// Events carried in each GeoPulse (newest first).
 const PULSE_EVENTS: usize = 60;
 /// Baseline retention (days of per-poll counts kept).
@@ -155,10 +161,14 @@ pub struct MeridianState {
     counts: HashMap<&'static str, VecDeque<(i64, u32)>>,
     /// Per-theme tone EWMA (~7d half-life).
     tones: HashMap<&'static str, ToneEwma>,
-    /// Deduped event ring, oldest -> newest.
+    /// Deduped event ring, oldest -> newest (display only).
     ring: VecDeque<GeoEvent>,
-    /// Normalized titles currently in the ring.
-    seen: HashSet<String>,
+    /// Normalized titles currently in the ring (display dedupe only).
+    ring_seen: HashSet<String>,
+    /// Per-theme counting dedup: normalized title -> last_seen_ms. TTL- and
+    /// cap-bounded, independent of ring eviction — freshness for COUNTING
+    /// comes from here only.
+    counted: HashMap<&'static str, HashMap<String, i64>>,
     /// Per-force (ts_ms, value) history for trend_7d (~8d retained).
     force_hist: HashMap<&'static str, VecDeque<(i64, f64)>>,
     /// Latest curve regime + 2s10s bps from the macro bus.
@@ -170,26 +180,46 @@ impl MeridianState {
         self.macro_curve = Some((curve_regime, spread_2s10s_bps));
     }
 
-    /// Ingest one theme's freshly parsed articles at `now`: dedupe into the
-    /// ring, record the new-article count (zero counts matter — quiet days
-    /// ARE the baseline), and fold fresh tones into the theme EWMA.
+    /// Ingest one theme's freshly parsed articles at `now`: record the
+    /// new-article count (zero counts matter — quiet days ARE the baseline),
+    /// fold fresh tones into the theme EWMA, and dedupe into the display
+    /// ring. COUNTING freshness comes from the per-theme TTL map only, so
+    /// ring eviction under a single-theme storm cannot re-mint other themes'
+    /// stale titles as fresh.
     fn ingest(&mut self, theme: &'static str, parsed: Vec<GeoEvent>, now: i64) -> u32 {
+        let counted = self.counted.entry(theme).or_default();
+        counted.retain(|_, last_seen| now - *last_seen <= DEDUP_TTL_MS);
         let mut fresh = 0u32;
         let mut tone_sum = 0.0;
         for ev in parsed {
             let key = normalize_title(&ev.title);
-            if key.is_empty() || self.seen.contains(&key) {
+            if key.is_empty() {
                 continue;
             }
-            self.seen.insert(key);
-            tone_sum += if ev.tone.is_finite() { ev.tone } else { 0.0 };
-            self.ring.push_back(ev);
-            fresh += 1;
-            if self.ring.len() > RING_CAP {
-                if let Some(old) = self.ring.pop_front() {
-                    self.seen.remove(&normalize_title(&old.title));
+            if counted.insert(key.clone(), now).is_none() {
+                fresh += 1;
+                tone_sum += if ev.tone.is_finite() { ev.tone } else { 0.0 };
+            }
+            // Display ring keeps its own dedupe; eviction here is cosmetic.
+            if self.ring_seen.insert(key) {
+                self.ring.push_back(ev);
+                if self.ring.len() > RING_CAP {
+                    if let Some(old) = self.ring.pop_front() {
+                        self.ring_seen.remove(&normalize_title(&old.title));
+                    }
                 }
             }
+        }
+        // Cap the counting map, evicting least-recently-seen titles first.
+        while counted.len() > DEDUP_CAP {
+            let Some(oldest) = counted
+                .iter()
+                .min_by_key(|(_, last_seen)| **last_seen)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            counted.remove(&oldest);
         }
         let hist = self.counts.entry(theme).or_default();
         hist.push_back((now, fresh));
@@ -393,7 +423,9 @@ impl ToneEwma {
                 self.value = Some(v * w + x * (1.0 - w));
             }
         }
-        self.last_ts = ts;
+        // Never move backward on an out-of-order older timestamp, or the
+        // next in-order update would over-decay.
+        self.last_ts = self.last_ts.max(ts);
     }
 }
 
@@ -594,34 +626,86 @@ mod tests {
         assert_eq!(st.ring.len(), 2);
     }
 
-    #[test]
-    fn ring_caps_at_200_and_frees_titles() {
-        let mut st = MeridianState::default();
-        for i in 0..250 {
-            let ev = GeoEvent {
-                title: format!("headline number {i}"),
-                source_domain: "x.com".into(),
-                url: String::new(),
-                tone: 0.0,
-                theme: "armed_conflict".into(),
-                countries: Vec::new(),
-                ts_ms: i,
-            };
-            st.ingest("armed_conflict", vec![ev], i);
-        }
-        assert_eq!(st.ring.len(), RING_CAP);
-        assert_eq!(st.seen.len(), RING_CAP);
-        // The evicted oldest title can be ingested again.
-        let ev = GeoEvent {
-            title: "headline number 0".into(),
+    fn geo_event(theme: &str, title: String, ts_ms: i64) -> GeoEvent {
+        GeoEvent {
+            title,
             source_domain: "x.com".into(),
             url: String::new(),
             tone: 0.0,
-            theme: "armed_conflict".into(),
+            theme: theme.into(),
             countries: Vec::new(),
-            ts_ms: 999,
-        };
-        assert_eq!(st.ingest("armed_conflict", vec![ev], 999), 1);
+            ts_ms,
+        }
+    }
+
+    #[test]
+    fn ring_caps_at_200_and_frees_titles_for_display_only() {
+        let mut st = MeridianState::default();
+        for i in 0..250 {
+            let ev = geo_event("armed_conflict", format!("headline number {i}"), i);
+            st.ingest("armed_conflict", vec![ev], i);
+        }
+        assert_eq!(st.ring.len(), RING_CAP);
+        assert_eq!(st.ring_seen.len(), RING_CAP);
+        // The evicted oldest title re-enters the DISPLAY ring, but it was
+        // seen within the counting TTL, so it is not counted fresh again.
+        let ev = geo_event("armed_conflict", "headline number 0".into(), 999);
+        assert_eq!(st.ingest("armed_conflict", vec![ev], 999), 0);
+        assert_eq!(st.ring.len(), RING_CAP);
+        assert!(st.ring_seen.contains("headline number 0"));
+    }
+
+    #[test]
+    fn single_theme_storm_does_not_remint_evicted_quiet_titles_as_fresh() {
+        // W1 regression: one theme floods 25 new titles per poll for enough
+        // polls to evict a quiet theme's stable titles from the 200-slot
+        // display ring; re-ingesting the stable titles must count 0 fresh.
+        let mut st = MeridianState::default();
+        let stable: Vec<GeoEvent> = (0..5)
+            .map(|i| geo_event("natural_disasters", format!("quiet stable headline {i}"), 0))
+            .collect();
+        assert_eq!(st.ingest("natural_disasters", stable.clone(), 1_000), 5);
+
+        let mut now = 1_000;
+        for poll in 0..12 {
+            now += 60_000;
+            let flood: Vec<GeoEvent> = (0..25)
+                .map(|i| {
+                    geo_event("armed_conflict", format!("storm headline {poll} {i}"), now)
+                })
+                .collect();
+            assert_eq!(st.ingest("armed_conflict", flood, now), 25);
+        }
+        // The storm has fully evicted the quiet theme from the display ring.
+        assert!(st.ring.iter().all(|e| e.theme == "armed_conflict"));
+        assert!(!st.ring_seen.contains("quiet stable headline 0"));
+
+        // Refetch of the same stable titles: 0 fresh (no inflated counts).
+        now += 60_000;
+        assert_eq!(st.ingest("natural_disasters", stable, now), 0);
+        let hist = st.counts.get("natural_disasters").unwrap();
+        assert_eq!(hist.back(), Some(&(now, 0)));
+    }
+
+    #[test]
+    fn counting_dedup_expires_after_ttl_and_respects_cap() {
+        let mut st = MeridianState::default();
+        let ev = geo_event("sanctions_trade", "old sanctions headline".into(), 0);
+        assert_eq!(st.ingest("sanctions_trade", vec![ev.clone()], 1_000), 1);
+        // Re-seen inside the TTL: refreshed, not fresh.
+        assert_eq!(st.ingest("sanctions_trade", vec![ev.clone()], 2_000), 0);
+        // Unseen for longer than the TTL: fresh again.
+        assert_eq!(
+            st.ingest("sanctions_trade", vec![ev], 2_000 + DEDUP_TTL_MS + 1),
+            1
+        );
+
+        // Cap: DEDUP_CAP + 100 titles in one poll keeps the map at the cap.
+        let flood: Vec<GeoEvent> = (0..DEDUP_CAP + 100)
+            .map(|i| geo_event("tech_exports", format!("cap headline {i}"), 0))
+            .collect();
+        st.ingest("tech_exports", flood, 5_000);
+        assert_eq!(st.counted.get("tech_exports").unwrap().len(), DEDUP_CAP);
     }
 
     #[test]
@@ -634,6 +718,20 @@ mod tests {
         assert!((e.value.unwrap() + 2.0).abs() < 1e-9);
         // Non-finite input is ignored.
         e.update(f64::NAN, 8 * DAY_MS);
+        assert!((e.value.unwrap() + 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tone_ewma_ignores_out_of_order_older_timestamps() {
+        let mut e = ToneEwma::default();
+        e.update(-4.0, 7 * DAY_MS);
+        // Out-of-order older update: value unchanged AND last_ts holds.
+        e.update(0.0, 3 * DAY_MS);
+        assert_eq!(e.value, Some(-4.0));
+        assert_eq!(e.last_ts, 7 * DAY_MS);
+        // The next in-order update decays exactly one half-life (7d), not
+        // the 11d it would see if last_ts had slid backward.
+        e.update(0.0, 14 * DAY_MS);
         assert!((e.value.unwrap() + 2.0).abs() < 1e-9);
     }
 

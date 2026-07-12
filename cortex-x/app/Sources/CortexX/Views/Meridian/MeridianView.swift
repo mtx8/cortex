@@ -56,15 +56,18 @@ struct MeridianView: View {
                     VStack(spacing: 0) {
                         header(pulse, now: context.date)
                         Divider().overlay(Theme.line)
+                        // Flanks flex down so the machine pane (the point of
+                        // the view) keeps a readable width at minWindow with
+                        // both app rails open.
                         HStack(alignment: .top, spacing: 0) {
                             forcesPane(pulse)
-                                .frame(width: 200)
+                                .frame(minWidth: 150, idealWidth: 200, maxWidth: 200)
                             Divider().overlay(Theme.line)
                             machinePane(pulse, now: context.date)
-                                .frame(maxWidth: .infinity)
+                                .frame(minWidth: 300, maxWidth: .infinity)
                             Divider().overlay(Theme.line)
                             feedPane(pulse, now: context.date)
-                                .frame(width: 280)
+                                .frame(minWidth: 180, idealWidth: 280, maxWidth: 280)
                         }
                     }
                 }
@@ -341,15 +344,23 @@ private struct CausalChainCard: View {
     }
 }
 
+/// Feed URLs are untrusted network data: only http(s) may reach the default
+/// handler — file:// and custom app schemes are refused.
+func openGeoURL(_ raw: String) {
+    guard let url = URL(string: raw),
+          let scheme = url.scheme?.lowercased(),
+          scheme == "http" || scheme == "https"
+    else { return }
+    NSWorkspace.shared.open(url)
+}
+
 private struct EvidenceLink: View {
     let event: GeoEvent
     @State private var hovering = false
 
     var body: some View {
         Button {
-            if let url = URL(string: event.url) {
-                NSWorkspace.shared.open(url)
-            }
+            openGeoURL(event.url)
         } label: {
             VStack(alignment: .leading, spacing: 1) {
                 Text(event.title)
@@ -421,9 +432,7 @@ private struct GeoEventRow: View {
 
     var body: some View {
         Button {
-            if let url = URL(string: event.url) {
-                NSWorkspace.shared.open(url)
-            }
+            openGeoURL(event.url)
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {

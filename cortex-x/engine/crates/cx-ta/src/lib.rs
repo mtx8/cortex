@@ -191,8 +191,12 @@ pub fn compute_features(bars: &[Bar]) -> BTreeMap<String, f64> {
         out.insert("garch_vol".into(), v);
     }
     if let Some(k) = v_kalman {
-        out.insert("kalman_slope".into(), k.slope);
-        out.insert("kalman_tstat".into(), k.tstat);
+        // Local finite guard: these are the only insertions that trust an
+        // external recursion, so they prove finiteness at the boundary.
+        if k.slope.is_finite() && k.tstat.is_finite() {
+            out.insert("kalman_slope".into(), k.slope);
+            out.insert("kalman_tstat".into(), k.tstat);
+        }
     }
     if let Some(b) = v_cusum {
         out.insert("cusum_break".into(), b as f64);

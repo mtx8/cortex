@@ -53,12 +53,11 @@ enum RegimeBoardLayout {
         }
     }
 
-    /// Breadth percentages may arrive as 0..1 fractions or 0..100 percents;
-    /// normalize to a 0..1 gauge fraction without inventing data.
+    /// Breadth arrives as 0..100 percent (cx-intel contract); normalize to a
+    /// 0..1 gauge fraction. No fraction/percent guessing — 0.5 means 0.5%.
     static func gaugeFraction(_ value: Double?) -> Double? {
         guard let value, value.isFinite, value >= 0 else { return nil }
-        let fraction = value > 1 ? value / 100 : value
-        return min(fraction, 1)
+        return min(value / 100, 1)
     }
 }
 
@@ -240,17 +239,18 @@ private struct RegimeRowCard: View {
     let openCompany: () -> Void
     @State private var hovering = false
 
+    // Engine emits fractions (0.20 = 20%); render as percent.
     private var leadMetric: (text: String, color: Color) {
         if RegimeBoardLayout.showsRunup(row.state) {
-            return (String(format: "%+.1f%%", abs(row.runup_pct)), Theme.up)
+            return (String(format: "%+.1f%%", abs(row.runup_pct) * 100), Theme.up)
         }
-        return (String(format: "%.1f%%", -abs(row.drawdown_pct)), Theme.down)
+        return (String(format: "%.1f%%", -abs(row.drawdown_pct) * 100), Theme.down)
     }
 
     private var factsLine: String {
         var parts = ["\(row.days_in_state)d in state"]
         if let dist = row.dist_50_200_pct, dist.isFinite {
-            parts.append(String(format: "50/200 %+.1f%%", dist))
+            parts.append(String(format: "50/200 %+.1f%%", dist * 100))
         }
         return parts.joined(separator: " · ")
     }

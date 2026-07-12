@@ -3,6 +3,7 @@
 //! reaches the OMS passed through RiskEngine::evaluate first. There is no
 //! second door.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use cx_core::autonomy::AutonomyDial;
@@ -35,6 +36,14 @@ pub struct TradePipeline {
     /// EWMA return correlations across the traded set, fed from completed
     /// M1 bars — powers the correlation-aware (tighten-only) sizing scalar.
     corr: Mutex<EwmaCorr>,
+    /// Configured symbol set: the ONLY symbols allowed into the correlation
+    /// tracker. EwmaCorr has no internal cap, so an unfiltered feed would
+    /// grow O(n^2) if a producer ever emitted unconfigured symbols.
+    symbols: HashSet<String>,
+    /// Previous completed-M1 close per configured symbol, so the tracker is
+    /// fed close-to-close returns (completed-bar returns, like the rest of
+    /// the system) instead of intra-bar close/open. Bounded by `symbols`.
+    prev_close: Mutex<HashMap<String, f64>>,
 }
 
 impl TradePipeline {
@@ -47,6 +56,7 @@ impl TradePipeline {
         kill: Arc<KillSwitch>,
         cfg: Config,
     ) -> Arc<Self> {
+        let symbols: HashSet<String> = cfg.symbols.iter().cloned().collect();
         Arc::new(Self {
             bus,
             store,
@@ -56,6 +66,8 @@ impl TradePipeline {
             kill,
             cfg,
             corr: Mutex::new(EwmaCorr::new()),
+            symbols,
+            prev_close: Mutex::new(HashMap::new()),
         })
     }
 
@@ -91,11 +103,25 @@ impl TradePipeline {
                 self.on_fusion_signal(sig).await;
             }
             // Completed M1 bars feed the cross-symbol correlation tracker
-            // (EwmaCorr pairs asynchronous clocks internally).
+            // (EwmaCorr pairs asynchronous clocks internally). Gated on the
+            // configured symbol set, and fed CLOSE-TO-CLOSE returns across
+            // consecutive completed bars via a per-symbol prev-close map.
             EngineEvent::Bar(b) if b.complete && b.interval == Interval::M1 => {
-                if b.open.is_finite() && b.open.abs() > f64::EPSILON && b.close.is_finite() {
-                    if let Ok(mut corr) = self.corr.lock() {
-                        corr.update(&b.symbol, b.close / b.open - 1.0);
+                if self.symbols.contains(&b.symbol) && b.close.is_finite() {
+                    let prev = self
+                        .prev_close
+                        .lock()
+                        .ok()
+                        .and_then(|mut m| m.insert(b.symbol.clone(), b.close));
+                    if let Some(pc) = prev {
+                        if pc.abs() > f64::EPSILON {
+                            let r = b.close / pc - 1.0;
+                            if r.is_finite() {
+                                if let Ok(mut corr) = self.corr.lock() {
+                                    corr.update(&b.symbol, r);
+                                }
+                            }
+                        }
                     }
                 }
             }

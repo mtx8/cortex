@@ -38,6 +38,9 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) {
 pub fn serve_company(bus: Arc<Bus>, symbol: String, enabled: bool) {
     tokio::spawn(async move {
         if !enabled {
+            // Still answer: a silent request leaves the client's loading
+            // state hanging forever. Disclose the disabled state instead.
+            bus.publish(EngineEvent::Company(company::disabled_profile(&symbol)));
             return;
         }
         let egress = Egress::new();

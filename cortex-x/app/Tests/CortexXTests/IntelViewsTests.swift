@@ -122,9 +122,10 @@ final class IntelViewsTests: XCTestCase {
     }
 
     func testBreadthGaugeFractionNormalizesPercentOrFraction() throws {
+        // Contract: breadth is always 0..100 percent. 0.5 means 0.5%, not 50%.
         XCTAssertEqual(try XCTUnwrap(RegimeBoardLayout.gaugeFraction(62.5)), 0.625, accuracy: 1e-9)
-        XCTAssertEqual(try XCTUnwrap(RegimeBoardLayout.gaugeFraction(0.625)), 0.625, accuracy: 1e-9)
-        XCTAssertEqual(try XCTUnwrap(RegimeBoardLayout.gaugeFraction(1.0)), 1.0, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(RegimeBoardLayout.gaugeFraction(0.5)), 0.005, accuracy: 1e-9)
+        XCTAssertEqual(try XCTUnwrap(RegimeBoardLayout.gaugeFraction(1.0)), 0.01, accuracy: 1e-9)
         XCTAssertEqual(try XCTUnwrap(RegimeBoardLayout.gaugeFraction(240)), 1.0, accuracy: 1e-9) // clamped
         XCTAssertNil(RegimeBoardLayout.gaugeFraction(nil))
         XCTAssertNil(RegimeBoardLayout.gaugeFraction(-4))

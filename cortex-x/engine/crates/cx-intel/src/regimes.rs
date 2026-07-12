@@ -127,8 +127,9 @@ async fn ensure_d1_history(egress: &Egress, store: &BarStore, symbols: &[String]
 }
 
 /// Yahoo v8 chart JSON -> complete D1 bars (local copy of the cx-md parse
-/// approach; cx-intel deliberately does not depend on cx-md). Null slots are
-/// skipped; malformed payloads yield an empty vec, never a panic.
+/// approach; cx-intel deliberately does not depend on cx-md). Null slots and
+/// the in-progress current-day row are skipped; malformed payloads yield an
+/// empty vec, never a panic.
 pub(crate) fn parse_yahoo_d1(symbol: &str, raw: &str, max: usize) -> Vec<Bar> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
         return Vec::new();
@@ -161,6 +162,10 @@ pub(crate) fn parse_yahoo_d1(symbol: &str, raw: &str, max: usize) -> Vec<Bar> {
         return Vec::new();
     };
 
+    // Yahoo returns the in-progress session as the last row; a moving live
+    // close would flip threshold states intraday and reset days_in_state.
+    // Classify only on complete sessions: drop anything in today's bucket.
+    let today_bucket = bucket_start(now_ms(), Interval::D1.ms());
     let mut bars: Vec<Bar> = Vec::new();
     for i in 0..ts.len() {
         let (Some(t), Some(o), Some(h), Some(l), Some(c)) = (
@@ -175,10 +180,14 @@ pub(crate) fn parse_yahoo_d1(symbol: &str, raw: &str, max: usize) -> Vec<Bar> {
         if ![o, h, l, c].iter().all(|x| x.is_finite() && *x > 0.0) || h < l {
             continue;
         }
+        let ts_open_ms = bucket_start(t * 1000, Interval::D1.ms());
+        if ts_open_ms >= today_bucket {
+            continue;
+        }
         bars.push(Bar {
             symbol: symbol.to_string(),
             interval: Interval::D1,
-            ts_open_ms: bucket_start(t * 1000, Interval::D1.ms()),
+            ts_open_ms,
             open: o,
             high: h,
             low: l,
@@ -213,6 +222,7 @@ pub fn scan_with_prev(
         };
         let closes: Vec<f64> = bars
             .iter()
+            .filter(|b| b.complete) // cx-md's live forming D1 bar is not a session
             .map(|b| b.close)
             .filter(|c| c.is_finite() && *c > 0.0)
             .collect();
@@ -260,6 +270,7 @@ fn sma_last(closes: &[f64], w: usize) -> Option<f64> {
 pub fn classify(symbol: &str, bars_d1: &[Bar], prev: Option<&RegimeRow>) -> Option<RegimeRow> {
     let closes: Vec<f64> = bars_d1
         .iter()
+        .filter(|b| b.complete) // classify complete sessions only
         .map(|b| b.close)
         .filter(|c| c.is_finite() && *c > 0.0)
         .collect();
@@ -695,5 +706,63 @@ mod tests {
         assert!(parse_yahoo_d1("AAPL", "junk", 10).is_empty());
         assert!(parse_yahoo_d1("AAPL", "{}", 10).is_empty());
         assert!(parse_yahoo_d1("AAPL", r#"{"chart":{"result":null}}"#, 10).is_empty());
+    }
+
+    #[test]
+    fn yahoo_d1_parse_drops_the_in_progress_session_row() {
+        // Yahoo returns today's live session as the last row; classifying on
+        // its moving close flips threshold states intraday. It must be gone.
+        let today_bucket = bucket_start(now_ms(), Interval::D1.ms());
+        let today_s = today_bucket / 1000 + 3600; // mid-session timestamp
+        let past0 = (today_bucket - 2 * Interval::D1.ms()) / 1000;
+        let past1 = (today_bucket - Interval::D1.ms()) / 1000;
+        let raw = format!(
+            r#"{{"chart":{{"result":[{{"timestamp":[{past0},{past1},{today_s}],
+                "indicators":{{"quote":[{{
+                    "open":[100.0,101.0,102.0],"high":[105.0,106.0,107.0],
+                    "low":[99.0,100.0,101.0],"close":[104.0,105.0,106.0],
+                    "volume":[1000,900,1100]}}]}}}}]}}}}"#
+        );
+        let bars = parse_yahoo_d1("AAPL", &raw, 10);
+        assert_eq!(bars.len(), 2);
+        assert!(bars.iter().all(|b| b.ts_open_ms < today_bucket));
+        assert!(bars.iter().all(|b| b.complete));
+        assert_eq!(bars[1].close, 105.0);
+    }
+
+    #[test]
+    fn classify_and_scan_ignore_the_forming_incomplete_bar() {
+        // A live forming D1 bar (cx-md pushes complete == false) with a
+        // crash-level close must not move the classification.
+        let closes = ramp(100.0, 200.0, 300);
+        let mut bars = mk_bars(&closes);
+        let clean = classify("TEST", &bars, None).unwrap();
+        bars.push(Bar {
+            symbol: "TEST".into(),
+            interval: Interval::D1,
+            ts_open_ms: 300 * 86_400_000,
+            open: 140.0,
+            high: 140.0,
+            low: 140.0,
+            close: 140.0, // intraday -30% print
+            volume: 1.0,
+            trade_count: 0,
+            vwap: 140.0,
+            complete: false,
+        });
+        let row = classify("TEST", &bars, None).unwrap();
+        assert_eq!(row.state, clean.state);
+        assert_eq!(row.days_in_state, clean.days_in_state);
+        assert_eq!(row.last_close, clean.last_close);
+
+        // Breadth path ignores it too: last complete close stays above SMAs.
+        let store = BarStore::new();
+        for bar in &bars {
+            store.push(bar.clone());
+        }
+        let board = scan(&store, &["TEST".to_string()]);
+        assert_eq!(board.rows.len(), 1);
+        assert_eq!(board.breadth.pct_above_200d, Some(100.0));
+        assert_eq!(board.breadth.pct_above_50d, Some(100.0));
     }
 }

@@ -48,16 +48,21 @@ struct OosStat {
 }
 
 /// Best-pick with walk-forward honesty: rank by OOS expectancy across rows
-/// with >= [`OOS_MIN_TRADES`] OOS trades; if no row qualifies, fall back to
-/// full-sample expectancy among rows with >= 10 trades (the old behavior).
+/// with >= [`OOS_MIN_TRADES`] OOS trades AND positive expectancy — a
+/// "least-bad loser" is never a recommendation. With no positive-OOS
+/// candidate, fall back to full-sample expectancy among rows with >= 10
+/// trades, again requiring expectancy > 0. All-negative everywhere returns
+/// None: "best: none" is more honest than crowning a proven loser.
 fn pick_best(stats: &[StrategyStats], oos: &[OosStat]) -> Option<String> {
-    let qualified = oos.iter().filter(|o| o.trades >= OOS_MIN_TRADES);
+    let qualified = oos
+        .iter()
+        .filter(|o| o.trades >= OOS_MIN_TRADES && o.expectancy > 0.0);
     if let Some(winner) = qualified.max_by(|a, b| a.expectancy.total_cmp(&b.expectancy)) {
         return Some(winner.key.clone());
     }
     stats
         .iter()
-        .filter(|s| s.trades >= 10)
+        .filter(|s| s.trades >= 10 && s.expectancy.is_some_and(|e| e > 0.0))
         .max_by(|a, b| {
             a.expectancy
                 .unwrap_or(f64::MIN)
@@ -175,7 +180,7 @@ pub(crate) fn backtest(
     let mut entry_px = 0.0_f64;
     let mut entry_ts = 0_i64;
 
-    let mut close_at = |pos: i8, entry_px: f64, entry_ts: i64, px: f64, ts: i64,
+    let close_at = |pos: i8, entry_px: f64, entry_ts: i64, px: f64, ts: i64,
                         trades: &mut Vec<SimTrade>| {
         let raw = (px / entry_px - 1.0) * pos as f64;
         if raw.is_finite() && entry_px > 0.0 {
@@ -285,15 +290,21 @@ fn decide(
             (want, exit)
         }
         "kalman_trend" => {
-            // Same pure rule as cx-strategy's kalman_trend: enter when
-            // |t-stat| >= 2 with no CUSUM change-point in the last 10 bars,
-            // direction = sign(slope); exit on a t-stat sign flip against
-            // the held side or a fresh change-point (<= 2 bars ago). The
-            // estimators are computed locally (below) on the close window.
-            let closes: Vec<f64> = window.iter().map(|b| b.close).collect();
-            let Some((slope, tstat, brk)) = kalman_cusum(&closes) else {
+            // Same pure rule AND same estimators as cx-strategy's live
+            // kalman_trend: kalman_slope / kalman_tstat / cusum_break come
+            // from cx_ta::compute_features on the window — the identical
+            // Kalman(level+trend) filter and mean-adjusted CUSUM the live
+            // strategy consumes, so the backtest measures the rule that
+            // actually trades. Enter when |t-stat| >= 2 with no CUSUM
+            // change-point in the last 10 bars, direction = sign(slope);
+            // exit on a t-stat sign flip against the held side or a fresh
+            // change-point (cusum_break <= 2).
+            let slope = g("kalman_slope");
+            let tstat = g("kalman_tstat");
+            let brk = g("cusum_break");
+            if !(slope.is_finite() && tstat.is_finite() && brk.is_finite()) {
                 return (0, pos != 0);
-            };
+            }
             let want = if tstat.abs() >= 2.0 && brk > 10.0 {
                 if slope > 0.0 {
                     1
@@ -310,92 +321,6 @@ fn decide(
         }
         _ => (0, true),
     }
-}
-
-/// Local Kalman(level+trend) + two-sided CUSUM over a close window, for the
-/// kalman_trend backtest replication. cx-ta grows equivalent quant2
-/// estimators in a parallel change; this tiny pure re-implementation keeps
-/// cx-sim compile-independent of that work while replicating the same RULE.
-///
-/// Filter: g-h (steady-state Kalman) with level gain G=0.3, slope gain
-/// H=0.05; innovation variance tracked by EWMA (lambda=0.94). The slope
-/// t-stat is slope / (sigma_innov / sqrt(2/H)) — the g-h slope effectively
-/// averages ~2/H bars, so that is its standard error under noise.
-/// CUSUM: two-sided on vol-normalized returns (EWMA vol, lambda=0.94) with
-/// drift allowance k=0.5 and threshold h=5; returns bars since last break,
-/// capped at 250 (a never-broken window reads as long-quiet).
-///
-/// Returns (slope, tstat, bars_since_break); None below 30 bars. NaN-safe:
-/// non-finite closes are skipped, outputs are finite or None.
-fn kalman_cusum(closes: &[f64]) -> Option<(f64, f64, f64)> {
-    const G: f64 = 0.3;
-    const H: f64 = 0.05;
-    const LAMBDA: f64 = 0.94;
-    const CUSUM_K: f64 = 0.5;
-    const CUSUM_H: f64 = 5.0;
-    const BREAK_CAP: f64 = 250.0;
-    if closes.len() < 30 || !closes[0].is_finite() {
-        return None;
-    }
-    let mut level = closes[0];
-    let mut slope = 0.0_f64;
-    let mut innov_var = f64::NAN;
-    let mut ret_var = f64::NAN;
-    let mut cusum_pos = 0.0_f64;
-    let mut cusum_neg = 0.0_f64;
-    let mut since_break = BREAK_CAP;
-    let mut prev = closes[0];
-    for &x in &closes[1..] {
-        if !x.is_finite() {
-            continue;
-        }
-        let pred = level + slope;
-        let innov = x - pred;
-        level = pred + G * innov;
-        slope += H * innov;
-        innov_var = if innov_var.is_finite() {
-            LAMBDA * innov_var + (1.0 - LAMBDA) * innov * innov
-        } else {
-            innov * innov
-        };
-        if prev > 0.0 {
-            let r = x / prev - 1.0;
-            if r.is_finite() {
-                // Score against the PRIOR vol so a genuine shock reads at
-                // full size before the EWMA absorbs it.
-                if ret_var.is_finite() {
-                    let vol = ret_var.sqrt();
-                    if vol > 0.0 {
-                        let z = r / vol;
-                        cusum_pos = (cusum_pos + z - CUSUM_K).max(0.0);
-                        cusum_neg = (cusum_neg - z - CUSUM_K).max(0.0);
-                        since_break = (since_break + 1.0).min(BREAK_CAP);
-                        if cusum_pos > CUSUM_H || cusum_neg > CUSUM_H {
-                            cusum_pos = 0.0;
-                            cusum_neg = 0.0;
-                            since_break = 0.0;
-                        }
-                    }
-                }
-                ret_var = if ret_var.is_finite() {
-                    LAMBDA * ret_var + (1.0 - LAMBDA) * r * r
-                } else {
-                    r * r
-                };
-            }
-        }
-        prev = x;
-    }
-    if !(slope.is_finite() && innov_var.is_finite()) {
-        return None;
-    }
-    let sigma = innov_var.sqrt();
-    let tstat = if sigma > 0.0 {
-        slope * (2.0 / H).sqrt() / sigma
-    } else {
-        0.0 // zero measured noise: no significance claim without a scale
-    };
-    tstat.is_finite().then_some((slope, tstat, since_break))
 }
 
 fn stat_row(
@@ -551,54 +476,43 @@ mod tests {
     }
 
     #[test]
-    fn kalman_cusum_reads_a_noisy_ramp_as_significant_and_quiet() {
-        // Persistent drift under deterministic pseudo-noise: strong positive
-        // slope, |t| >= 2, and a long-quiet CUSUM (drift < 0.5 sigma/bar).
-        let closes: Vec<f64> = (0..200)
-            .map(|i| 100.0 + 0.08 * i as f64 + 0.3 * ((i as f64) * 0.9).sin())
+    fn kalman_rule_fires_where_the_real_estimator_is_significant_and_quiet() {
+        // Build a window where the REAL estimator (cx_ta::compute_features,
+        // the same one the live strategy consumes) reads a significant
+        // (|t| >= 2), CUSUM-quiet (brk > 10) uptrend — the exact entry
+        // preconditions — then assert the backtest actually trades it long.
+        let closes: Vec<f64> = (0..300)
+            .map(|i| 100.0 + 0.5 * i as f64 + 0.2 * ((i as f64) * 0.9).sin())
             .collect();
-        let (slope, tstat, brk) = kalman_cusum(&closes).expect("warm");
-        assert!(slope > 0.0, "slope must be positive: {slope}");
-        assert!(tstat >= 2.0, "trend must be significant: t = {tstat}");
-        assert!(brk > 10.0, "steady drift must not fire CUSUM: brk = {brk}");
+        let bars = mk_bars(&closes);
+        let feats = cx_ta::compute_features(&bars);
+        assert!(
+            feats["kalman_tstat"] >= 2.0,
+            "fixture must be significant: t = {}",
+            feats["kalman_tstat"]
+        );
+        assert!(
+            feats["cusum_break"] > 10.0,
+            "fixture must be CUSUM-quiet: brk = {}",
+            feats["cusum_break"]
+        );
+        let trades = backtest("kalman_trend", "T", &bars);
+        assert!(!trades.is_empty(), "entry rule did not fire");
+        assert_eq!(trades[0].side, Side::Buy);
     }
 
     #[test]
-    fn kalman_cusum_fires_on_an_injected_shift() {
-        // Calm range, then a hard level break: bars-since-break must read
-        // fresh at the end of the window.
-        let mut closes: Vec<f64> = (0..150)
-            .map(|i| 100.0 + 0.3 * ((i as f64) * 0.9).sin())
-            .collect();
-        for i in 0..5 {
-            closes.push(97.0 - 0.4 * i as f64); // -3% gap, then a slide
-        }
-        let (_, _, brk) = kalman_cusum(&closes).expect("warm");
-        assert!(brk <= 5.0, "shift must register as a fresh break: {brk}");
-    }
-
-    #[test]
-    fn kalman_cusum_is_nan_safe_and_needs_warmup() {
-        assert!(kalman_cusum(&[100.0; 10]).is_none(), "short window");
-        // Non-finite closes are skipped, output stays finite.
-        let mut closes: Vec<f64> = (0..100)
-            .map(|i| 100.0 + 0.05 * i as f64 + 0.2 * ((i as f64) * 1.3).sin())
-            .collect();
-        closes[40] = f64::NAN;
-        let (slope, tstat, brk) = kalman_cusum(&closes).expect("warm");
-        assert!(slope.is_finite() && tstat.is_finite() && brk.is_finite());
-    }
-
-    #[test]
-    fn kalman_trend_profits_on_a_noisy_persistent_trend() {
-        // Chop, then a persistent drift smaller than the bar noise (so the
-        // CUSUM stays quiet) — the kalman rule must ride it net positive.
+    fn kalman_trend_profits_on_a_strong_persistent_trend() {
+        // Chop, then a strong persistent drift comfortably above the bar
+        // noise: through the real estimator (mean-adjusted CUSUM treats a
+        // steady drift as baseline, not a perpetual break) the kalman rule
+        // must enter and ride it net positive.
         let closes: Vec<f64> = (0..350)
             .map(|i| {
                 let base = if i < 100 {
                     100.0
                 } else {
-                    100.0 + 0.08 * (i - 100) as f64
+                    100.0 + 0.4 * (i - 100) as f64
                 };
                 base + 0.3 * ((i as f64) * 0.9).sin()
             })
@@ -673,6 +587,40 @@ mod tests {
         }];
         assert_eq!(pick_best(&stats, &oos), Some("a/T".to_string()));
         assert_eq!(pick_best(&stats, &[]), Some("a/T".to_string()));
+    }
+
+    #[test]
+    fn best_pick_skips_all_negative_oos_and_falls_through() {
+        // Every OOS-qualified row is a proven loser: none may be crowned.
+        // The positive full-sample row wins via the fallback instead.
+        let stats = vec![full_stat("a", 40, 0.010), full_stat("b", 40, -0.002)];
+        let oos = vec![
+            OosStat {
+                key: "a/T".into(),
+                trades: 12,
+                expectancy: -0.001,
+            },
+            OosStat {
+                key: "b/T".into(),
+                trades: 15,
+                expectancy: -0.004,
+            },
+        ];
+        assert_eq!(pick_best(&stats, &oos), Some("a/T".to_string()));
+    }
+
+    #[test]
+    fn best_pick_returns_none_when_everything_loses() {
+        // Negative OOS and negative full-sample everywhere: "best: none"
+        // beats recommending the least-bad loser.
+        let stats = vec![full_stat("a", 40, -0.010), full_stat("b", 40, -0.002)];
+        let oos = vec![OosStat {
+            key: "b/T".into(),
+            trades: 15,
+            expectancy: -0.004,
+        }];
+        assert_eq!(pick_best(&stats, &oos), None);
+        assert_eq!(pick_best(&stats, &[]), None);
     }
 
     #[test]

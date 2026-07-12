@@ -19,7 +19,7 @@ pub(crate) const CURATED_SYMBOLS: &[&str] = &[
     "MSFT", "GOOGL", "META", "AMZN", "ORCL", "CRM", "ADBE", "NFLX", "SNOW", "PLTR", "SHOP",
     "UBER", "ABNB",
     // Financials & payments
-    "JPM", "BAC", "GS", "MS", "V", "MA", "PYPL", "SQ", "COIN",
+    "JPM", "BAC", "GS", "MS", "V", "MA", "PYPL", "XYZ", "COIN",
     // Consumer, retail & autos
     "WMT", "COST", "HD", "PG", "KO", "PEP", "NKE", "SBUX", "DIS", "F", "GM", "TSLA",
     // Health care
@@ -644,7 +644,7 @@ pub fn curated(symbol: &str) -> Option<CompanyProfile> {
                 (None, "DTC brands", "online retail platform"),
                 (None, "Enterprises", "headless commerce"),
             ],
-            &["AMZN", "SQ", "WIX"],
+            &["AMZN", "XYZ", "WIX"],
         ),
         "UBER" => p(
             "UBER", "Uber Technologies", "Industrials", "Mobility Platform", "United States",
@@ -801,7 +801,7 @@ pub fn curated(symbol: &str) -> Option<CompanyProfile> {
                 (Some("BAC"), "Bank of America", "card issuance volume"),
                 (None, "Merchants & acquirers", "acceptance network"),
                 (Some("PYPL"), "PayPal", "wallet network partnership"),
-                (Some("SQ"), "Block", "Square acquiring rails"),
+                (Some("XYZ"), "Block", "Square acquiring rails"),
             ],
             &["MA", "AXP", "PYPL"],
         ),
@@ -848,12 +848,13 @@ pub fn curated(symbol: &str) -> Option<CompanyProfile> {
                 (None, "Consumers", "wallets and Venmo"),
                 (None, "Platforms & marketplaces", "Braintree processing"),
             ],
-            &["SQ", "GPN", "AFRM", "AAPL"],
+            &["XYZ", "GPN", "AFRM", "AAPL"],
         ),
-        "SQ" => p(
-            "SQ", "Block, Inc.", "Financials", "Fintech", "United States",
+        "XYZ" => p(
+            "XYZ", "Block, Inc.", "Financials", "Fintech", "United States",
             "Seller (Square) plus consumer (Cash App) fintech ecosystems with Afterpay \
-             BNPL and bitcoin initiatives; trades as XYZ since January 2025.",
+             BNPL and bitcoin initiatives; formerly Square, Inc. — ticker changed \
+             from SQ to XYZ in January 2025.",
             &[
                 ("Square", "seller POS and acquiring ecosystem"),
                 ("Cash App", "consumer payments and banking"),
@@ -892,7 +893,7 @@ pub fn curated(symbol: &str) -> Option<CompanyProfile> {
                 (None, "Institutions", "custody and prime services"),
                 (None, "USDC holders", "stablecoin payments rails"),
             ],
-            &["HOOD", "SQ", "PYPL"],
+            &["HOOD", "XYZ", "PYPL"],
         ),
 
         // ── Consumer, retail & autos ─────────────────────────────────────
@@ -1576,6 +1577,15 @@ mod tests {
         assert!(curated("ZZZZ").is_none());
         assert!(curated("BTC-USD").is_none());
         assert!(curated("nvda").is_none()); // callers uppercase first
+        assert!(curated("SQ").is_none()); // Block trades as XYZ since Jan 2025
+    }
+
+    #[test]
+    fn block_is_curated_under_its_current_xyz_ticker() {
+        let block = curated("XYZ").unwrap();
+        assert_eq!(block.symbol, "XYZ");
+        assert_eq!(block.name, "Block, Inc.");
+        assert!(block.description.contains("SQ"), "former ticker disclosed");
     }
 
     #[test]
