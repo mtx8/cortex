@@ -61,6 +61,9 @@ async fn main() -> anyhow::Result<()> {
     // AI agent mesh: analyst, macro sentinel, risk officer, auditor, strategist.
     let mesh = cx_agents::start(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
 
+    // Intel squadron: REGIMES scanner + MERIDIAN poller (COMPANY is on-demand).
+    cx_intel::start(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
+
     // Snapshot assembly + websocket gateway.
     let snap = SnapshotSrc::new(
         cfg.symbols.clone(),
@@ -138,6 +141,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 });
+            }
+            Command::GetCompany { symbol } => {
+                cx_intel::serve_company(Arc::clone(&bus), symbol, cfg.intel.enable_company);
             }
             other => pipeline.handle_command(other).await,
         }

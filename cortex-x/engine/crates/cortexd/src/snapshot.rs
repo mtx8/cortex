@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use cx_core::autonomy::AutonomyDial;
 use std::collections::HashMap;
 
-use cx_core::events::{AgentThought, EngineEvent, FeedStatus, MacroSnapshot, OrderUpdate};
+use cx_core::events::{
+    AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, OrderUpdate, RegimeBoard,
+};
 use cx_core::store::BarStore;
 use cx_core::types::Interval;
 use cx_core::Bus;
@@ -29,6 +31,8 @@ pub struct SnapshotSrc {
     orders: Mutex<VecDeque<OrderUpdate>>,
     macro_last: Mutex<Option<MacroSnapshot>>,
     feeds: Mutex<HashMap<String, FeedStatus>>,
+    regimes_last: Mutex<Option<RegimeBoard>>,
+    geo_last: Mutex<Option<GeoPulse>>,
 }
 
 impl SnapshotSrc {
@@ -49,6 +53,8 @@ impl SnapshotSrc {
             orders: Mutex::new(VecDeque::new()),
             macro_last: Mutex::new(None),
             feeds: Mutex::new(HashMap::new()),
+            regimes_last: Mutex::new(None),
+            geo_last: Mutex::new(None),
         })
     }
 
@@ -98,6 +104,14 @@ impl SnapshotSrc {
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .insert(f.feed.clone(), f.clone());
+                        }
+                        EngineEvent::RegimeMap(r) => {
+                            *this.regimes_last.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(r.clone());
+                        }
+                        EngineEvent::Geo(g) => {
+                            *this.geo_last.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(g.clone());
                         }
                         _ => {}
                     },
@@ -156,6 +170,13 @@ impl SnapshotSource for SnapshotSrc {
             .cloned()
             .collect();
 
+        let regimes_last = self
+            .regimes_last
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let geo_last = self.geo_last.lock().unwrap_or_else(|p| p.into_inner()).clone();
+
         serde_json::json!({
             "symbols": self.symbols,
             "bars": bars,
@@ -166,6 +187,8 @@ impl SnapshotSource for SnapshotSrc {
             "orders": orders,
             "macro": macro_last,
             "feeds": feeds,
+            "regimes": regimes_last,
+            "geo": geo_last,
         })
     }
 }

@@ -16,6 +16,9 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "api.anthropic.com",
     "cdn.cboe.com",
     "query1.finance.yahoo.com",
+    "data.sec.gov",
+    "www.sec.gov",
+    "api.gdeltproject.org",
     "localhost",
     "127.0.0.1",
 ];

@@ -183,6 +183,7 @@ dependencies = [
  "anyhow",
  "cx-agents",
  "cx-core",
+ "cx-intel",
  "cx-md",
  "cx-oms",
  "cx-risk",
@@ -268,6 +269,19 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "cx-intel"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "cx-core",
+ "cx-ta",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 

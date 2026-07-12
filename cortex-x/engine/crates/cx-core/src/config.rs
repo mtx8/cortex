@@ -145,6 +145,43 @@ impl Default for AiConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct IntelConfig {
+    /// Universe scanned by the REGIMES board (bare US tickers/ETFs only;
+    /// configured `symbols` are always included on top of this list).
+    pub universe: Vec<String>,
+    /// MERIDIAN GDELT poll cadence (seconds, floor 300).
+    pub gdelt_poll_secs: u64,
+    /// REGIMES scan cadence (seconds, floor 300).
+    pub regime_scan_secs: u64,
+    pub enable_company: bool,
+    pub enable_regimes: bool,
+    pub enable_meridian: bool,
+}
+
+/// Liquid US megacaps + core index ETFs. Dashed share classes are excluded
+/// on purpose: a dash routes a symbol to the crypto feed.
+pub const DEFAULT_UNIVERSE: &[&str] = &[
+    "SPY", "QQQ", "IWM", "DIA", "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META",
+    "TSLA", "AVGO", "JPM", "V", "MA", "UNH", "HD", "PG", "XOM", "CVX",
+    "LLY", "ABBV", "MRK", "COST", "WMT", "KO", "PEP", "BAC", "NFLX", "AMD",
+    "CRM", "ORCL", "ADBE", "INTC", "QCOM", "TXN", "CAT", "BA", "GE", "DIS",
+];
+
+impl Default for IntelConfig {
+    fn default() -> Self {
+        Self {
+            universe: DEFAULT_UNIVERSE.iter().map(|s| s.to_string()).collect(),
+            gdelt_poll_secs: 900,
+            regime_scan_secs: 1_800,
+            enable_company: true,
+            enable_regimes: true,
+            enable_meridian: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -168,6 +205,7 @@ pub struct Config {
     pub paper: PaperConfig,
     pub ai: AiConfig,
     pub server: ServerConfig,
+    pub intel: IntelConfig,
     /// Extra free-form knobs for strategies, keyed by strategy name.
     pub strategy_params: BTreeMap<String, BTreeMap<String, f64>>,
 }
@@ -188,6 +226,7 @@ impl Default for Config {
             paper: PaperConfig::default(),
             ai: AiConfig::default(),
             server: ServerConfig::default(),
+            intel: IntelConfig::default(),
             strategy_params: BTreeMap::new(),
         }
     }
@@ -263,6 +302,12 @@ impl Config {
         }
         if self.paper.starting_cash <= 0.0 {
             return Err(CxError::Config("paper.starting_cash must be > 0".into()));
+        }
+        if self.intel.gdelt_poll_secs < 300 {
+            return Err(CxError::Config("intel.gdelt_poll_secs must be >= 300".into()));
+        }
+        if self.intel.regime_scan_secs < 300 {
+            return Err(CxError::Config("intel.regime_scan_secs must be >= 300".into()));
         }
         Ok(())
     }

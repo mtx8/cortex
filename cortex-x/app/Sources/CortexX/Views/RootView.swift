@@ -20,8 +20,11 @@ struct RootView: View {
                     Group {
                         switch model.centerMode {
                         case .chart: ChartPanel()
+                        case .company: CompanyView()
                         case .options: OptionsChainView()
                         case .foundry: FoundryView()
+                        case .regimes: RegimesView()
+                        case .meridian: MeridianView()
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

@@ -355,6 +355,174 @@ pub struct SimReport {
     pub ts_ms: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Intel squadron: COMPANY (supply-chain + fundamentals), REGIMES, MERIDIAN.
+// ---------------------------------------------------------------------------
+
+/// One business segment / product line of a company ("what it makes").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Segment {
+    pub name: String,
+    pub note: String,
+}
+
+/// A supply-chain relation (supplier or customer). `symbol` is present when
+/// the counterparty is itself a listed ticker — those are click-navigable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Relation {
+    pub symbol: Option<String>,
+    pub name: String,
+    /// What flows across the relation, e.g. "leading-edge wafer fabrication".
+    pub via: String,
+}
+
+/// Latest reported fundamentals extracted from SEC EDGAR XBRL company facts.
+/// Everything optional: filings vary, and absence is more honest than zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Fundamentals {
+    pub revenue: Option<f64>,
+    pub revenue_yoy: Option<f64>,
+    pub gross_margin: Option<f64>,
+    pub op_margin: Option<f64>,
+    pub net_income: Option<f64>,
+    pub net_margin: Option<f64>,
+    pub eps: Option<f64>,
+    pub assets: Option<f64>,
+    pub liabilities: Option<f64>,
+    pub equity: Option<f64>,
+    pub ocf: Option<f64>,
+    pub cash: Option<f64>,
+    /// e.g. "FY" or "Q2"; `fiscal_year` e.g. "2026".
+    pub period: String,
+    pub fiscal_year: String,
+}
+
+/// Bloomberg-SPLC-class company intelligence card, served on demand via
+/// `Command::GetCompany`. Sources are always disclosed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompanyProfile {
+    pub symbol: String,
+    pub name: String,
+    pub sector: String,
+    pub industry: String,
+    pub country: String,
+    pub description: String,
+    pub segments: Vec<Segment>,
+    pub suppliers: Vec<Relation>,
+    pub customers: Vec<Relation>,
+    pub competitors: Vec<String>,
+    pub fundamentals: Option<Fundamentals>,
+    /// e.g. "curated graph (MTX Labs, 2026-07)" or "no curated graph".
+    pub graph_source: String,
+    /// e.g. "sec-edgar (10-K/10-Q)" or "unavailable".
+    pub fundamentals_source: String,
+    pub ts_ms: i64,
+}
+
+/// Secular market state of one symbol, classified on daily bars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegimeState {
+    Bull,
+    EnteringBull,
+    Correction,
+    EnteringBear,
+    Bear,
+    Recovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegimeRow {
+    pub symbol: String,
+    pub state: RegimeState,
+    /// Drawdown from the 252d high, fraction in [0, 1].
+    pub drawdown_pct: f64,
+    /// Run-up from the 252d low, fraction >= 0.
+    pub runup_pct: f64,
+    pub days_in_state: u32,
+    /// (SMA50 - SMA200) / SMA200, when both exist.
+    pub dist_50_200_pct: Option<f64>,
+    pub last_close: f64,
+}
+
+/// Cross-sectional market breadth over the scanned universe.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Breadth {
+    pub pct_above_200d: Option<f64>,
+    pub pct_above_50d: Option<f64>,
+    pub bulls: u32,
+    pub bears: u32,
+    pub entering_bull: u32,
+    pub entering_bear: u32,
+    pub universe_size: u32,
+}
+
+/// The REGIMES board: every scanned symbol's bull/bear state + breadth.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegimeBoard {
+    pub rows: Vec<RegimeRow>,
+    pub breadth: Breadth,
+    pub source: String,
+    pub ts_ms: i64,
+}
+
+/// One geopolitical news event (GDELT), deduped and theme-bucketed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeoEvent {
+    pub title: String,
+    pub source_domain: String,
+    pub url: String,
+    /// GDELT average tone: negative = grim, positive = calm.
+    pub tone: f64,
+    pub theme: String,
+    pub countries: Vec<String>,
+    pub ts_ms: i64,
+}
+
+/// One of Dalio's five forces, gauged 0-100 from a disclosed proxy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForceGauge {
+    pub force: String,
+    pub value: f64,
+    /// 7-day change in gauge points (signed).
+    pub trend_7d: f64,
+    /// The honest label of what actually drives the number.
+    pub proxy: String,
+}
+
+/// An asset touched by a causal chain. `direction`: +1 up-pressure,
+/// -1 down-pressure.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssetImpact {
+    /// Ticker when listed ("XOM") or an asset class label ("crude oil").
+    pub target: String,
+    pub direction: i32,
+    pub note: String,
+}
+
+/// A fired Dalio-style transmission chain: event theme -> mechanism steps
+/// -> asset pressure, with the evidence that fired it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CausalChain {
+    pub rule_id: String,
+    pub title: String,
+    pub steps: Vec<String>,
+    pub assets: Vec<AssetImpact>,
+    /// Firing intensity (article-count z-score vs 30d baseline), >= threshold.
+    pub intensity: f64,
+    pub evidence: Vec<GeoEvent>,
+}
+
+/// MERIDIAN pulse: forces, fired chains, and the raw event feed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GeoPulse {
+    pub forces: Vec<ForceGauge>,
+    pub chains: Vec<CausalChain>,
+    pub events: Vec<GeoEvent>,
+    pub source: String,
+    pub ts_ms: i64,
+}
+
 /// Answer to an `AskAi` command — the copilot channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiAnswer {
@@ -387,6 +555,9 @@ pub enum EngineEvent {
     OptionsChain(OptionsChain),
     Sim(SimReport),
     AiAnswer(AiAnswer),
+    Company(CompanyProfile),
+    RegimeMap(RegimeBoard),
+    Geo(GeoPulse),
 }
 
 impl EngineEvent {
@@ -421,6 +592,9 @@ impl EngineEvent {
             EngineEvent::OptionsChain(_) => "options_chain",
             EngineEvent::Sim(_) => "sim",
             EngineEvent::AiAnswer(_) => "ai_answer",
+            EngineEvent::Company(_) => "company",
+            EngineEvent::RegimeMap(_) => "regime_map",
+            EngineEvent::Geo(_) => "geo",
         }
     }
 }

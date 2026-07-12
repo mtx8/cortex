@@ -45,13 +45,19 @@ final class AppModel {
     private(set) var macro: MacroSnapshot?
     private(set) var feeds: [String: FeedStatus] = [:]
 
-    // MARK: Options
-    enum CenterMode: String, CaseIterable { case chart, options, foundry }
+    // MARK: Center sections
+    enum CenterMode: String, CaseIterable { case chart, company, options, foundry, regimes, meridian }
     var centerMode: CenterMode = .chart
     private(set) var optionsChain: OptionsChain?
     private(set) var chainLoading = false
     private(set) var simReport: SimReport?
     private(set) var simRunning = false
+
+    // MARK: Intel (COMPANY / REGIMES / MERIDIAN)
+    private(set) var company: CompanyProfile?
+    private(set) var companyLoading = false
+    private(set) var regimeBoard: RegimeBoard?
+    private(set) var geoPulse: GeoPulse?
 
     // MARK: Copilot
     private(set) var copilot: [CopilotMessage] = []
@@ -102,6 +108,19 @@ final class AppModel {
     func runSimulation() {
         simRunning = true
         send(.runSimulation)
+    }
+
+    /// Load the COMPANY intelligence card and switch to the company section.
+    func openCompany(_ symbol: String) {
+        centerMode = .company
+        requestCompany(symbol)
+    }
+
+    func requestCompany(_ symbol: String) {
+        // Re-request even when a profile is showing: the board follows the
+        // selected symbol, and stale cards must never masquerade as current.
+        companyLoading = true
+        send(.getCompany(symbol: symbol))
     }
 
     func askCopilot(_ question: String) {
@@ -181,6 +200,13 @@ final class AppModel {
                 copilot.append(CopilotMessage(id: a.request_id, role: .cortex, text: a.answer, model: a.model))
             }
             if pendingAsk == a.request_id { pendingAsk = nil }
+        case .company(let profile):
+            company = profile
+            companyLoading = false
+        case .regimeMap(let board):
+            regimeBoard = board
+        case .geo(let pulse):
+            geoPulse = pulse
         case .gap, .error, .unknown:
             break
         }
@@ -208,6 +234,8 @@ final class AppModel {
         orders = snap.orders.sorted { $0.ts_ms > $1.ts_ms }
         if let m = snap.macro { macro = m }
         for f in snap.feeds ?? [] { feeds[f.feed] = f }
+        if let r = snap.regimes { regimeBoard = r }
+        if let g = snap.geo { geoPulse = g }
         for (symbol, byInterval) in rebuilt {
             if sessionOpen[symbol] == nil {
                 sessionOpen[symbol] = byInterval[.m1]?.last?.close ?? byInterval[.h1]?.last?.close

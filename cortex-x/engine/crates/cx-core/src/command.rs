@@ -52,4 +52,9 @@ pub enum Command {
         underlying: String,
         expiry: Option<String>,
     },
+    /// Fetch the COMPANY intelligence card (supply-chain graph + EDGAR
+    /// fundamentals). Answered via `EngineEvent::Company`.
+    GetCompany {
+        symbol: String,
+    },
 }

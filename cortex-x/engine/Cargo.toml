@@ -9,6 +9,7 @@ members = [
     "crates/cx-sim",
     "crates/cx-strategy",
     "crates/cx-agents",
+    "crates/cx-intel",
     "crates/cx-server",
     "crates/cortexd",
 ]
@@ -45,6 +46,7 @@ cx-oms = { path = "crates/cx-oms" }
 cx-sim = { path = "crates/cx-sim" }
 cx-strategy = { path = "crates/cx-strategy" }
 cx-agents = { path = "crates/cx-agents" }
+cx-intel = { path = "crates/cx-intel" }
 cx-server = { path = "crates/cx-server" }
 
 [profile.release]

@@ -443,6 +443,145 @@ struct AiAnswer: Codable, Equatable {
     var ts_ms: Int64
 }
 
+// MARK: - Intel: COMPANY (supply chain + fundamentals)
+
+struct Segment: Codable, Equatable, Identifiable {
+    var name: String
+    var note: String
+    var id: String { name }
+}
+
+struct Relation: Codable, Equatable, Identifiable {
+    var symbol: String?
+    var name: String
+    var via: String
+    var id: String { name }
+}
+
+struct Fundamentals: Codable, Equatable {
+    var revenue: Double?
+    var revenue_yoy: Double?
+    var gross_margin: Double?
+    var op_margin: Double?
+    var net_income: Double?
+    var net_margin: Double?
+    var eps: Double?
+    var assets: Double?
+    var liabilities: Double?
+    var equity: Double?
+    var ocf: Double?
+    var cash: Double?
+    var period: String
+    var fiscal_year: String
+}
+
+struct CompanyProfile: Codable, Equatable {
+    var symbol: String
+    var name: String
+    var sector: String
+    var industry: String
+    var country: String
+    var description: String
+    var segments: [Segment]
+    var suppliers: [Relation]
+    var customers: [Relation]
+    var competitors: [String]
+    var fundamentals: Fundamentals?
+    var graph_source: String
+    var fundamentals_source: String
+    var ts_ms: Int64
+}
+
+// MARK: - Intel: REGIMES (bull/bear board)
+
+enum RegimeState: String, Codable, CaseIterable {
+    case bull, entering_bull, correction, entering_bear, bear, recovery
+    var label: String {
+        switch self {
+        case .bull: "bull"
+        case .entering_bull: "entering bull"
+        case .correction: "correction"
+        case .entering_bear: "entering bear"
+        case .bear: "bear"
+        case .recovery: "recovery"
+        }
+    }
+}
+
+struct RegimeRow: Codable, Equatable, Identifiable {
+    var symbol: String
+    var state: RegimeState
+    var drawdown_pct: Double
+    var runup_pct: Double
+    var days_in_state: UInt32
+    var dist_50_200_pct: Double?
+    var last_close: Double
+    var id: String { symbol }
+}
+
+struct Breadth: Codable, Equatable {
+    var pct_above_200d: Double?
+    var pct_above_50d: Double?
+    var bulls: UInt32
+    var bears: UInt32
+    var entering_bull: UInt32
+    var entering_bear: UInt32
+    var universe_size: UInt32
+}
+
+struct RegimeBoard: Codable, Equatable {
+    var rows: [RegimeRow]
+    var breadth: Breadth
+    var source: String
+    var ts_ms: Int64
+}
+
+// MARK: - Intel: MERIDIAN (Dalio cause-effect engine)
+
+struct GeoEvent: Codable, Equatable, Identifiable {
+    var title: String
+    var source_domain: String
+    var url: String
+    var tone: Double
+    var theme: String
+    var countries: [String]
+    var ts_ms: Int64
+    var id: String { "\(theme)-\(ts_ms)-\(title.hashValue)" }
+}
+
+struct ForceGauge: Codable, Equatable, Identifiable {
+    var force: String
+    var value: Double
+    var trend_7d: Double
+    var proxy: String
+    var id: String { force }
+}
+
+struct AssetImpact: Codable, Equatable, Identifiable {
+    var target: String
+    var direction: Int
+    var note: String
+    var id: String { target }
+}
+
+struct CausalChain: Codable, Equatable, Identifiable {
+    var rule_id: String
+    var title: String
+    var steps: [String]
+    var assets: [AssetImpact]
+    var intensity: Double
+    var evidence: [GeoEvent]
+    var id: String { rule_id }
+}
+
+struct GeoPulse: Codable, Equatable {
+    var forces: [ForceGauge]
+    var chains: [CausalChain]
+    var events: [GeoEvent]
+    var source: String
+    var ts_ms: Int64
+}
+
 // MARK: - Snapshot (initial state replay from cortexd)
 
 struct EngineSnapshot: Codable {
@@ -456,6 +595,8 @@ struct EngineSnapshot: Codable {
     var orders: [OrderUpdate]
     var macro: MacroSnapshot?
     var feeds: [FeedStatus]?
+    var regimes: RegimeBoard?
+    var geo: GeoPulse?
 }
 
 // MARK: - Inbound frame (server -> client), tag field "type"
@@ -480,6 +621,9 @@ enum ServerFrame {
     case optionsChain(OptionsChain)
     case sim(SimReport)
     case aiAnswer(AiAnswer)
+    case company(CompanyProfile)
+    case regimeMap(RegimeBoard)
+    case geo(GeoPulse)
     case gap(dropped: Int)
     case error(detail: String)
     case unknown(type: String)
@@ -513,6 +657,9 @@ enum ServerFrame {
         case "options_chain": return .optionsChain(try dec.decode(OptionsChain.self, from: data))
         case "sim": return .sim(try dec.decode(SimReport.self, from: data))
         case "ai_answer": return .aiAnswer(try dec.decode(AiAnswer.self, from: data))
+        case "company": return .company(try dec.decode(CompanyProfile.self, from: data))
+        case "regime_map": return .regimeMap(try dec.decode(RegimeBoard.self, from: data))
+        case "geo": return .geo(try dec.decode(GeoPulse.self, from: data))
         case "gap":
             struct Gap: Codable { var dropped: Int }
             return .gap(dropped: try dec.decode(Gap.self, from: data).dropped)
@@ -538,6 +685,7 @@ enum Command {
     case sync(barsPerSymbol: Int)
     case getOptionsChain(underlying: String, expiry: String?)
     case runSimulation
+    case getCompany(symbol: String)
 
     func encoded() throws -> Data {
         var obj: [String: Any]
@@ -567,6 +715,8 @@ enum Command {
             if let expiry { obj["expiry"] = expiry }
         case .runSimulation:
             obj = ["cmd": "run_simulation"]
+        case let .getCompany(symbol):
+            obj = ["cmd": "get_company", "symbol": symbol]
         }
         return try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
     }
