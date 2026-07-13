@@ -105,6 +105,15 @@ final class ChartInteraction {
         if rightOffset < 1 { rightOffset = 0 } // snap back onto the live edge
     }
 
+    /// Range preset (1y/2y/5y/all): show exactly the last `barCount` bars,
+    /// pinned to the live edge. Clamped to the zoom bounds.
+    func applyRange(barCount: Int) {
+        barsVisible = min(
+            max(Double(barCount), ChartMath.minVisibleBars), ChartMath.maxVisibleBars
+        )
+        resetToLive()
+    }
+
     /// Double-click / 'live' chip: re-engage follow.
     func resetToLive() {
         dragAnchorOffset = nil

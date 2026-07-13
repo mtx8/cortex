@@ -465,3 +465,40 @@ final class ChartMathTests: XCTestCase {
         XCTAssertEqual(ChartMath.formatVolume(0.5), "0.50")
     }
 }
+
+// MARK: - Range presets
+
+extension ChartMathTests {
+    private func rangeBar(_ ts: Int64) -> Bar {
+        Bar(
+            symbol: "T", interval: .d1, ts_open_ms: ts, open: 1, high: 2,
+            low: 1, close: 1.5, volume: 10, trade_count: 1, vwap: 1.5,
+            complete: true
+        )
+    }
+
+    func testBarsWithinCountsTrailingWindow() {
+        let day: Int64 = 86_400_000
+        let now: Int64 = 2_000 * day
+        let bars = (0..<1_000).map { rangeBar(now - Int64(999 - $0) * day) }
+        // 1y window: bars with open >= now - 365d -> exactly 366 (inclusive cutoff).
+        XCTAssertEqual(ChartMath.barsWithin(spanMs: 365 * day, bars: bars, nowMs: now), 366)
+        XCTAssertEqual(ChartMath.barsWithin(spanMs: nil, bars: bars, nowMs: now), 1_000)
+        XCTAssertEqual(ChartMath.barsWithin(spanMs: 5_000 * day, bars: bars, nowMs: now), 1_000)
+        XCTAssertEqual(ChartMath.barsWithin(spanMs: 365 * day, bars: [], nowMs: now), 0)
+        // All bars older than the window.
+        XCTAssertEqual(
+            ChartMath.barsWithin(spanMs: day, bars: Array(bars.prefix(10)), nowMs: now), 0
+        )
+    }
+
+    func testChartRangePresets() {
+        XCTAssertEqual(ChartRange.y1.spanMs, 365 * 86_400_000)
+        XCTAssertNil(ChartRange.all.spanMs)
+        XCTAssertFalse(ChartRange.y1.weekly)
+        XCTAssertFalse(ChartRange.y2.weekly)
+        XCTAssertTrue(ChartRange.y5.weekly)
+        XCTAssertTrue(ChartRange.all.weekly)
+        XCTAssertEqual(ChartRange.allCases.map(\.label), ["1y", "2y", "5y", "all"])
+    }
+}

@@ -10,6 +10,8 @@ struct ChartPanel: View {
     /// View-level weekly bars: aggregates the 1d series on the fly. Not a
     /// wire interval, so AppModel stays untouched.
     @State private var weeklyMode = false
+    /// Active range preset; cleared when an interval is picked manually.
+    @State private var selectedRange: ChartRange?
     @State private var flashDirection = 0
     @State private var flashToken = 0
     @State private var flashSymbol = ""
@@ -40,6 +42,7 @@ struct ChartPanel: View {
         .panel()
         .onChange(of: model.selectedSymbol) { _, _ in
             interaction.resetForNewSeries()
+            selectedRange = nil
             flashToken += 1
             flashDirection = 0
         }
@@ -104,6 +107,8 @@ struct ChartPanel: View {
 
             Spacer(minLength: 8)
 
+            rangePicker
+
             intervalPicker($model.selectedInterval)
 
             feedDot
@@ -160,16 +165,53 @@ struct ChartPanel: View {
         .help("bid / ask / spread")
     }
 
+    /// 1y / 2y / 5y / all — sets the visible span (and a sane bar size:
+    /// daily for 1-2y, weekly for 5y/all), pinned to the live edge.
+    private var rangePicker: some View {
+        HStack(spacing: 2) {
+            ForEach(ChartRange.allCases) { range in
+                intervalChip(range.label, isOn: selectedRange == range) {
+                    applyRange(range)
+                }
+            }
+        }
+        .padding(2)
+        .background(Theme.ink)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.chipRadius)
+                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+        )
+    }
+
+    private func applyRange(_ range: ChartRange) {
+        selectedRange = range
+        model.selectedInterval = .d1
+        weeklyMode = range.weekly
+        let series = weeklyMode
+            ? ChartMath.aggregateWeekly(model.bars(model.selectedSymbol, .d1))
+            : model.bars(model.selectedSymbol, .d1)
+        let count = ChartMath.barsWithin(
+            spanMs: range.spanMs, bars: series,
+            nowMs: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        // Series present: frame the window. Still backfilling: show what
+        // arrives (the reset handlers keep the live edge pinned).
+        interaction.applyRange(barCount: max(count, 20))
+    }
+
     private func intervalPicker(_ selection: Binding<Interval>) -> some View {
         HStack(spacing: 2) {
             ForEach(Interval.allCases) { iv in
                 intervalChip(iv.label, isOn: !weeklyMode && selection.wrappedValue == iv) {
+                    selectedRange = nil
                     weeklyMode = false
                     selection.wrappedValue = iv
                 }
             }
             // Weekly rides on the 1d feed; the 1d chip deselects while on.
             intervalChip("1w", isOn: weeklyMode) {
+                selectedRange = nil
                 selection.wrappedValue = .d1
                 weeklyMode = true
             }

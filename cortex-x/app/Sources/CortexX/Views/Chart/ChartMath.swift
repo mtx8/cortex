@@ -409,3 +409,55 @@ enum ChartMath {
         return f
     }()
 }
+
+// MARK: - Range presets (1y / 2y / 5y / all)
+
+/// Visible-span presets for the chart header. Intervals set bar SIZE; a
+/// range sets how much history is in view (and picks a sane bar size).
+enum ChartRange: String, CaseIterable, Identifiable {
+    case y1, y2, y5, all
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .y1: "1y"
+        case .y2: "2y"
+        case .y5: "5y"
+        case .all: "all"
+        }
+    }
+
+    /// Calendar span in ms; nil = everything available.
+    var spanMs: Int64? {
+        switch self {
+        case .y1: 365 * 86_400_000
+        case .y2: 730 * 86_400_000
+        case .y5: 1_826 * 86_400_000
+        case .all: nil
+        }
+    }
+
+    /// Long ranges read better on weekly candles; 1-2y stay daily.
+    var weekly: Bool {
+        switch self {
+        case .y1, .y2: false
+        case .y5, .all: true
+        }
+    }
+}
+
+extension ChartMath {
+    /// Bars whose open falls inside the trailing `spanMs` window ending at
+    /// `nowMs`. Bars are ascending; nil span means the whole series.
+    static func barsWithin(spanMs: Int64?, bars: [Bar], nowMs: Int64) -> Int {
+        guard let spanMs else { return bars.count }
+        let cutoff = nowMs - spanMs
+        // Binary search for the first bar at/after the cutoff.
+        var lo = 0, hi = bars.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if bars[mid].ts_open_ms < cutoff { lo = mid + 1 } else { hi = mid }
+        }
+        return bars.count - lo
+    }
+}
