@@ -73,6 +73,11 @@ pub struct RiskConfig {
     pub caution_max_shrink: f64,
     /// Caution entries expire after this many seconds (TTL-bounded memory).
     pub caution_ttl_secs: u64,
+    /// ATR trailing protective exit: close an open position when price
+    /// retraces this many ATRs from its high-water mark (reduce-only).
+    pub trail_atr_mult: f64,
+    /// Master switch for the ATR trailing protective exit.
+    pub trail_enabled: bool,
 }
 
 impl Default for RiskConfig {
@@ -88,6 +93,8 @@ impl Default for RiskConfig {
             max_total_drawdown: 0.10,
             caution_max_shrink: 0.95,
             caution_ttl_secs: 1_800,
+            trail_atr_mult: 2.5,
+            trail_enabled: true,
         }
     }
 }
@@ -128,6 +135,10 @@ pub struct AiConfig {
     /// Strategic loop cadence. The LLM is NEVER in the execution hot path.
     pub strategist_cadence_secs: u64,
     pub max_output_tokens: u32,
+    /// AUTORESEARCH cadence: how often the engine replays bounded recipe
+    /// experiments over stored history (paper-only, off the hot path).
+    /// 0 disables the loop entirely; anything else must be >= 3600.
+    pub autoresearch_secs: u64,
 }
 
 impl Default for AiConfig {
@@ -139,6 +150,7 @@ impl Default for AiConfig {
             local_llm_model: "llama3.1".into(),
             strategist_cadence_secs: 300,
             max_output_tokens: 1024,
+            autoresearch_secs: 21_600,
         }
     }
 }
@@ -305,6 +317,11 @@ impl Config {
                 return Err(CxError::Config(format!("risk.{name} must be in [0,1]")));
             }
         }
+        if !(r.trail_atr_mult.is_finite() && (0.5..=10.0).contains(&r.trail_atr_mult)) {
+            return Err(CxError::Config(
+                "risk.trail_atr_mult must be in [0.5, 10]".into(),
+            ));
+        }
         if self.paper.starting_cash <= 0.0 {
             return Err(CxError::Config("paper.starting_cash must be > 0".into()));
         }
@@ -316,6 +333,11 @@ impl Config {
         }
         if self.intel.scanner_secs < 60 {
             return Err(CxError::Config("intel.scanner_secs must be >= 60".into()));
+        }
+        if self.ai.autoresearch_secs != 0 && self.ai.autoresearch_secs < 3_600 {
+            return Err(CxError::Config(
+                "ai.autoresearch_secs must be 0 (disabled) or >= 3600".into(),
+            ));
         }
         Ok(())
     }
@@ -334,6 +356,36 @@ mod tests {
     fn secret_never_debugs_value() {
         let s = Secret("sk-super-secret".into());
         assert_eq!(format!("{s:?}"), "Secret(***)");
+    }
+
+    #[test]
+    fn trail_atr_mult_bounds_enforced() {
+        let mut cfg = Config::default();
+        cfg.risk.trail_atr_mult = 0.49;
+        assert!(cfg.validate().is_err());
+        cfg.risk.trail_atr_mult = 10.01;
+        assert!(cfg.validate().is_err());
+        cfg.risk.trail_atr_mult = f64::NAN;
+        assert!(cfg.validate().is_err());
+        cfg.risk.trail_atr_mult = f64::INFINITY;
+        assert!(cfg.validate().is_err());
+        cfg.risk.trail_atr_mult = 0.5;
+        assert!(cfg.validate().is_ok());
+        cfg.risk.trail_atr_mult = 10.0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn autoresearch_cadence_bounds_enforced() {
+        let mut cfg = Config::default();
+        cfg.ai.autoresearch_secs = 0; // disabled is valid
+        assert!(cfg.validate().is_ok());
+        cfg.ai.autoresearch_secs = 3_599; // below the floor
+        assert!(cfg.validate().is_err());
+        cfg.ai.autoresearch_secs = 3_600; // at the floor
+        assert!(cfg.validate().is_ok());
+        cfg.ai.autoresearch_secs = 21_600; // the default
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

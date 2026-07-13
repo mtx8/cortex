@@ -17,9 +17,20 @@
 //! - No LLM ever sits in the execution hot path; every LLM touchpoint is a
 //!   slow strategic cycle or an operator question.
 //! - The ONLY text an LLM ever sees is `ledger.render()` output (plus the
-//!   operator's question) — no secrets, no config, no raw keys.
+//!   operator's question and, for memory questions, verbatim PALACE hits —
+//!   stored engine output) — no secrets, no config, no raw keys.
 //! - Agents degrade to Thought(info) on network trouble; the mesh never
 //!   panics on external input.
+//!
+//! Two persistent-intelligence modules ride alongside the agents:
+//! - [`palace`] (private): local-first VERBATIM memory (MemPalace-pattern
+//!   rooms/drawers + closet index) fed by a bus subscriber; the ledger
+//!   renders its closet, the copilot searches its drawers.
+//! - [`autoresearch`] (public): the pure half of the recipe-optimization
+//!   loop (grid + adoption rule + brief). cortexd hosts the runner, because
+//!   cx-agents is bus-only and must not import cx-sim.
+
+pub mod autoresearch;
 
 mod analyst;
 mod auditor;
@@ -27,6 +38,7 @@ mod copilot;
 mod ledger;
 mod llm;
 mod macro_agent;
+mod palace;
 mod risk_officer;
 mod strategist;
 
@@ -51,6 +63,7 @@ struct MeshInner {
     bus: Arc<Bus>,
     ledger: Arc<ContextLedger>,
     llm: Arc<LlmClient>,
+    palace: Option<Arc<palace::Palace>>,
     symbols: Vec<String>,
 }
 
@@ -66,6 +79,7 @@ impl MeshHandle {
                 Arc::clone(&inner.bus),
                 Arc::clone(&inner.ledger),
                 Arc::clone(&inner.llm),
+                inner.palace.clone(),
                 inner.symbols.clone(),
                 request_id,
                 question,
@@ -80,7 +94,16 @@ impl MeshHandle {
 /// a tokio runtime. All bus subscriptions happen synchronously here, so no
 /// event published after `start` returns can be missed.
 pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
-    let ledger = ContextLedger::new(Arc::clone(&store));
+    // PALACE: local-first verbatim memory at ~/.cortex/palace. Unavailable
+    // (no home dir, io error) degrades to a mesh without persistent memory
+    // — never a startup failure. Its ingest task watches the bus for the
+    // events that constitute institutional memory.
+    let palace = palace::Palace::open_default();
+    if let Some(p) = &palace {
+        palace::spawn_ingest(p, &bus);
+    }
+
+    let ledger = ContextLedger::with_palace(Arc::clone(&store), palace.clone());
     ledger.spawn_ingest(&bus);
 
     let llm = Arc::new(LlmClient::new(cfg.ai.clone()));
@@ -114,11 +137,16 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
         None,
         1.0,
         format!(
-            "agent mesh online: market_analyst, macro_sentinel, risk_officer, execution_auditor{}",
+            "agent mesh online: market_analyst, macro_sentinel, risk_officer, execution_auditor{}{}",
             if strategist_on {
                 ", strategist (llm)"
             } else {
                 ", strategist (auto-detecting local llm)"
+            },
+            if palace.is_some() {
+                "; palace memory attached"
+            } else {
+                "; palace memory unavailable"
             }
         ),
     );
@@ -128,6 +156,7 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
             bus,
             ledger,
             llm,
+            palace,
             symbols: cfg.symbols,
         }),
     }
@@ -379,6 +408,7 @@ mod tests {
             Arc::clone(&bus),
             ledger,
             llm,
+            None, // no palace: the heuristic desk read must not need one
             vec!["BTC-USD".to_string()],
             "req-7".into(),
             "how are we positioned?".into(),
@@ -405,6 +435,9 @@ mod tests {
     /// `start(bus, store, cfg) -> MeshHandle` and `MeshHandle::ask`.
     #[tokio::test]
     async fn start_and_ask_answer_arrives_on_the_bus() {
+        // Redirect the palace into a scratch dir so the test never touches
+        // the operator's real ~/.cortex/palace.
+        std::env::set_var("CORTEX_PALACE_DIR", palace::test_dir("start-ask"));
         let bus = Bus::new(1_024);
         let store = Arc::new(BarStore::new());
         // Point the "local llm" at the discard port so the test can never

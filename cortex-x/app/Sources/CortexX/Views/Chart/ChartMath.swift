@@ -122,6 +122,32 @@ enum ChartMath {
         return out
     }
 
+    /// MACD(12, 26, 9): macd = EMA12 - EMA26, signal = EMA9 of the macd line,
+    /// hist = macd - signal. Each series stays nil until its inputs are warm
+    /// (macd from index 25, signal and hist from index 33).
+    static func macdSeries(closes: [Double]) -> (macd: [Double?], signal: [Double?], hist: [Double?]) {
+        let count = closes.count
+        let fast = ema(closes, period: 12)
+        let slow = ema(closes, period: 26)
+        var macd = [Double?](repeating: nil, count: count)
+        for i in 0..<count {
+            if let f = fast[i], let s = slow[i] { macd[i] = f - s }
+        }
+        var signal = [Double?](repeating: nil, count: count)
+        var hist = [Double?](repeating: nil, count: count)
+        if let start = macd.firstIndex(where: { $0 != nil }) {
+            // macd is contiguous once defined, so the ?? never substitutes.
+            let defined = macd[start...].map { $0 ?? 0 }
+            let sig = ema(defined, period: 9)
+            for (j, s) in sig.enumerated() {
+                guard let s else { continue }
+                signal[start + j] = s
+                if let m = macd[start + j] { hist[start + j] = m - s }
+            }
+        }
+        return (macd, signal, hist)
+    }
+
     // MARK: - Axis
 
     /// A "nice" step (1 / 2 / 2.5 / 5 x 10^n) — the smallest nice value that
@@ -151,11 +177,157 @@ enum ChartMath {
         return out
     }
 
+    /// Mantissa ladders for log-axis ticks, densest first. Each entry
+    /// subdivides a decade; a ladder qualifies when its tightest adjacent
+    /// pair (in log10 units, including the wrap up to the next decade) still
+    /// clears the minimum on-screen gap.
+    private static let logMantissaLadders: [[Double]] = [
+        [1, 1.2, 1.4, 1.6, 1.8, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, 9],
+        [1, 1.5, 2, 3, 4, 5, 7],
+        [1, 2, 5],
+    ]
+
+    private static func tightestLogGap(_ mantissas: [Double]) -> Double {
+        guard let last = mantissas.last, let first = mantissas.first else { return 1 }
+        var g = 1 + log10(first) - log10(last) // wrap to the next decade
+        for i in 1..<mantissas.count {
+            g = min(g, log10(mantissas[i] / mantissas[i - 1]))
+        }
+        return g
+    }
+
+    /// Tick values for a log10 price axis inside [lo, hi]: 1 / 2 / 5 x 10^n
+    /// per decade, subdivided (or thinned to whole decades) so adjacent
+    /// ticks map at least `minGapPx` apart over `heightPx`. Falls back to
+    /// the linear ticks when the range is too tight for the log ladder to
+    /// place two ticks. Empty when the axis cannot support log (lo <= 0).
+    static func logAxisTicks(
+        min lo: Double, max hi: Double, heightPx: Double, minGapPx: Double = 44
+    ) -> [Double] {
+        guard lo > 0, hi > lo, heightPx.isFinite, heightPx > 0, minGapPx > 0 else { return [] }
+        let lLo = log10(lo)
+        let lHi = log10(hi)
+        let pxPerDecade = heightPx / (lHi - lLo)
+        guard pxPerDecade.isFinite, pxPerDecade > 0 else { return [] }
+
+        var mantissas: [Double] = [1]
+        var decadeStride = 1
+        if let dense = logMantissaLadders.first(
+            where: { tightestLogGap($0) * pxPerDecade >= minGapPx }
+        ) {
+            mantissas = dense
+        } else if pxPerDecade < minGapPx {
+            // Even bare decades sit too close: stride whole decades apart.
+            decadeStride = Int((minGapPx / pxPerDecade).rounded(.up))
+        }
+
+        var out: [Double] = []
+        let d0 = Int(lLo.rounded(.down))
+        let d1 = Int(lHi.rounded(.up))
+        var d = decadeStride > 1
+            ? Int((Double(d0) / Double(decadeStride)).rounded(.down)) * decadeStride
+            : d0
+        while d <= d1 {
+            let base = pow(10, Double(d))
+            for m in mantissas {
+                let v = m * base
+                if v >= lo * (1 - 1e-9), v <= hi * (1 + 1e-9) { out.append(v) }
+            }
+            d += decadeStride
+        }
+        // A sub-decade window can starve the ladder; linear ticks read
+        // better than a single lonely label.
+        if out.count < 2 {
+            return axisTicks(min: lo, max: hi, target: max(3, Int(heightPx / minGapPx)))
+        }
+        return out
+    }
+
+    // MARK: - Price-axis mapping (linear / log)
+
+    /// Fraction of `p` within [lo, hi] (0 = lo, 1 = hi) on the price axis.
+    /// `log` maps through log10; it silently falls back to linear whenever
+    /// the axis cannot support it (lo <= 0 or p <= 0), so callers never see
+    /// NaN. Log-mode tick VALUES come from `logAxisTicks`.
+    static func priceFraction(_ p: Double, lo: Double, hi: Double, log: Bool) -> Double {
+        guard hi > lo else { return 0 }
+        if log, lo > 0, p > 0 {
+            return (log10(p) - log10(lo)) / (log10(hi) - log10(lo))
+        }
+        return (p - lo) / (hi - lo)
+    }
+
+    /// Inverse of `priceFraction` (crosshair y -> price readout). Same
+    /// linear fallback when lo <= 0.
+    static func priceAtFraction(_ f: Double, lo: Double, hi: Double, log: Bool) -> Double {
+        guard hi > lo else { return lo }
+        if log, lo > 0 {
+            let l = log10(lo)
+            return pow(10, l + f * (log10(hi) - l))
+        }
+        return lo + f * (hi - lo)
+    }
+
     // MARK: - Time & buckets
+
+    /// One 7-day bar span in milliseconds — the view-level weekly bar width.
+    static let weekMs: Int64 = 7 * 86_400_000
+
+    /// The epoch (1970-01-01) is a Thursday; 1970-01-05 (epoch + 4 days) is
+    /// the first Monday, so week floors anchor against that offset.
+    private static let mondayEpochOffsetMs: Int64 = 4 * 86_400_000
 
     /// Floor a timestamp to its bar-open for the interval.
     static func bucket(_ tsMs: Int64, _ interval: Interval) -> Int64 {
         tsMs - tsMs % interval.ms
+    }
+
+    /// Floor a timestamp to its bar-open for an arbitrary bar span. The
+    /// weekly span floors to Monday-anchored weeks (matching
+    /// `aggregateWeekly`); every other span floors from the epoch.
+    static func bucket(_ tsMs: Int64, spanMs: Int64) -> Int64 {
+        guard spanMs > 0 else { return tsMs }
+        if spanMs == weekMs { return weekFloor(tsMs) }
+        return tsMs - tsMs % spanMs
+    }
+
+    /// Floor a timestamp to the Monday 00:00 UTC opening its trading week.
+    /// Floored modulo, so pre-1970 timestamps still round downward.
+    static func weekFloor(_ tsMs: Int64) -> Int64 {
+        var r = (tsMs - mondayEpochOffsetMs) % weekMs
+        if r < 0 { r += weekMs }
+        return tsMs - r
+    }
+
+    /// Aggregate a daily series into Monday-anchored 7-day buckets
+    /// (view-level weekly bars; there is no wire-protocol weekly interval,
+    /// so the result keeps `.d1`). open = first open, high = max, low = min,
+    /// close = last close, volume / trade_count = sums, vwap = close,
+    /// complete only when every member bar is complete. Input is assumed
+    /// ascending by ts_open_ms.
+    static func aggregateWeekly(_ d1: [Bar]) -> [Bar] {
+        var out: [Bar] = []
+        out.reserveCapacity(d1.count / 5 + 1)
+        for bar in d1 {
+            let open = weekFloor(bar.ts_open_ms)
+            if var acc = out.last, acc.ts_open_ms == open {
+                acc.high = max(acc.high, bar.high)
+                acc.low = min(acc.low, bar.low)
+                acc.close = bar.close
+                acc.volume += bar.volume
+                acc.trade_count += bar.trade_count
+                acc.vwap = bar.close
+                acc.complete = acc.complete && bar.complete
+                out[out.count - 1] = acc
+            } else {
+                var acc = bar
+                acc.ts_open_ms = open
+                acc.interval = .d1
+                acc.vwap = bar.close
+                out.append(acc)
+            }
+        }
+        return out
     }
 
     /// Axis label: HH:mm intraday, dd MMM for daily bars.

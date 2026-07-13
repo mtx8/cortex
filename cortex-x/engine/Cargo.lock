@@ -245,6 +245,7 @@ dependencies = [
  "chrono",
  "cx-core",
  "cx-ta",
+ "dirs",
  "futures-util",
  "rand 0.8.6",
  "reqwest",

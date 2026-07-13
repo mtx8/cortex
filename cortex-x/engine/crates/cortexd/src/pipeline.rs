@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use cx_core::autonomy::AutonomyDial;
 use cx_core::events::{
-    AgentThought, EngineEvent, OrderIntent, OrderSource, OrderStatus, OrderUpdate, StrategySignal,
+    AgentThought, Bar, EngineEvent, OrderIntent, OrderSource, OrderStatus, OrderUpdate,
+    StrategySignal,
 };
 use cx_core::store::BarStore;
 use cx_core::time::now_ms;
@@ -17,6 +18,7 @@ use cx_core::{Bus, Command, Config, KillSwitch};
 use cx_oms::Oms;
 use cx_risk::{RiskDecision, RiskEngine};
 use cx_ta::corr::EwmaCorr;
+use cx_ta::ind::Atr;
 
 /// Fusion direction magnitude below which a symbol is considered flat.
 const EXIT_BAND: f64 = 0.15;
@@ -24,6 +26,22 @@ const EXIT_BAND: f64 = 0.15;
 const ENTRY_BAND: f64 = 0.35;
 /// Ignore rebalance deltas smaller than this notional.
 const MIN_TICKET_NOTIONAL: f64 = 50.0;
+/// ATR lookback for the trailing protective exit.
+const TRAIL_ATR_PERIOD: usize = 14;
+
+/// Trailing-exit watermark for one open position.
+#[derive(Debug, Clone, Copy)]
+struct TrailMark {
+    /// Position sign at the last observation: +1 long, -1 short.
+    sign: f64,
+    /// Long: max completed-M1 close since entry; short: min.
+    hwm: f64,
+    /// Entry identity: the position's avg_px when the mark was seeded. A
+    /// materially different live avg_px with an unchanged sign means the
+    /// position closed and reopened between bars (flat Position event lost
+    /// under bus lag) — the HWM is stale and the mark re-seeds.
+    avg_px: f64,
+}
 
 pub struct TradePipeline {
     bus: Arc<Bus>,
@@ -44,6 +62,14 @@ pub struct TradePipeline {
     /// fed close-to-close returns (completed-bar returns, like the rest of
     /// the system) instead of intra-bar close/open. Bounded by `symbols`.
     prev_close: Mutex<HashMap<String, f64>>,
+    /// Streaming ATR(14) per configured symbol from completed M1 bars —
+    /// powers the ATR trailing protective exit. Bounded by `symbols`.
+    atr: Mutex<HashMap<String, Atr>>,
+    /// Trailing-exit watermark per symbol; an entry exists only while a
+    /// position is open and is cleared on close/flip so a fresh position
+    /// never inherits a stale mark. Restored if risk rejects the exit, and
+    /// self-validating via the seeded entry avg_px. Bounded by `symbols`.
+    trail: Mutex<HashMap<String, TrailMark>>,
 }
 
 impl TradePipeline {
@@ -68,6 +94,8 @@ impl TradePipeline {
             corr: Mutex::new(EwmaCorr::new()),
             symbols,
             prev_close: Mutex::new(HashMap::new()),
+            atr: Mutex::new(HashMap::new()),
+            trail: Mutex::new(HashMap::new()),
         })
     }
 
@@ -121,6 +149,20 @@ impl TradePipeline {
                                     corr.update(&b.symbol, r);
                                 }
                             }
+                        }
+                    }
+                    self.on_trail_bar(b).await;
+                }
+            }
+            // Position lifecycle resets the trailing-exit watermark: a
+            // closed or flipped position must never leave a stale HWM for
+            // the next entry to inherit.
+            EngineEvent::Position(p) => {
+                if let Ok(mut trail) = self.trail.lock() {
+                    if let Some(mark) = trail.get(&p.symbol) {
+                        let flat = !p.qty.is_finite() || p.qty.abs() <= 1e-12;
+                        if flat || p.qty.signum() != mark.sign {
+                            trail.remove(&p.symbol);
                         }
                     }
                 }
@@ -257,10 +299,140 @@ impl TradePipeline {
         self.submit_through_risk(intent, last_px).await;
     }
 
+    /// ATR trailing protective exit, evaluated on every completed M1 bar.
+    /// Tracks a per-position high-water mark (long: max close since entry;
+    /// short: min) and closes the FULL position once price retraces
+    /// `trail_atr_mult` ATRs from it. Pure risk reduction: it never fires
+    /// without a position, always submits reduce-only, and is never gated
+    /// by the autonomy dial (reductions are always allowed).
+    async fn on_trail_bar(&self, bar: &Bar) {
+        // ATR warms on every completed bar, position or not, so the trail
+        // is armed the moment a position opens. Caller guarantees a
+        // configured symbol and a finite close; Atr rejects bad high/low.
+        let atr = match self.atr.lock() {
+            Ok(mut m) => m
+                .entry(bar.symbol.clone())
+                .or_insert_with(|| Atr::new(TRAIL_ATR_PERIOD))
+                .update(bar.high, bar.low, bar.close),
+            Err(_) => return,
+        };
+        if !self.cfg.risk.trail_enabled {
+            return;
+        }
+        let close = bar.close;
+        if !(close.is_finite() && close > 0.0) {
+            return;
+        }
+        let (qty, avg_px) = self
+            .oms
+            .position(&bar.symbol)
+            .map(|p| (p.qty, p.avg_px))
+            .unwrap_or((0.0, 0.0));
+        if !qty.is_finite() {
+            return;
+        }
+        // Update the watermark and decide inside one lock scope — the
+        // guard must drop before the submit await below.
+        let fired = {
+            let Ok(mut trail) = self.trail.lock() else {
+                return;
+            };
+            if qty.abs() <= 1e-12 {
+                trail.remove(&bar.symbol);
+                return;
+            }
+            let sign = qty.signum();
+            let mark = trail
+                .entry(bar.symbol.clone())
+                .or_insert(TrailMark { sign, hwm: close, avg_px });
+            if mark.sign != sign {
+                // Flipped between bars: restart the mark on the new side.
+                *mark = TrailMark { sign, hwm: close, avg_px };
+            } else {
+                let scale = mark.avg_px.abs().max(avg_px.abs());
+                let drift = (mark.avg_px - avg_px).abs();
+                if drift.is_finite() && scale > 1e-12 && drift / scale > 1e-9 {
+                    // Same sign, different entry: closed and reopened while
+                    // the flat Position event was lost — HWM is stale.
+                    *mark = TrailMark { sign, hwm: close, avg_px };
+                }
+            }
+            mark.hwm = if sign > 0.0 {
+                mark.hwm.max(close)
+            } else {
+                mark.hwm.min(close)
+            };
+            // ATR cold or degenerate -> the trail stays disarmed.
+            let Some(atr) = atr.filter(|a| a.is_finite() && *a > 0.0) else {
+                return;
+            };
+            let retrace = if sign > 0.0 {
+                mark.hwm - close
+            } else {
+                close - mark.hwm
+            };
+            if retrace.is_finite() && retrace >= self.cfg.risk.trail_atr_mult * atr {
+                // Clear the mark now so the exit fires once, not every bar
+                // while the closing order works; it is restored below if
+                // risk rejects the exit.
+                let saved = *mark;
+                trail.remove(&bar.symbol);
+                Some((saved, retrace / atr))
+            } else {
+                None
+            }
+        };
+        let Some((saved_mark, atr_mult)) = fired else {
+            return;
+        };
+
+        let rationale = format!("ATR trail: retrace {atr_mult:.1}x ATR from HWM");
+        self.bus.publish(EngineEvent::Thought(AgentThought {
+            agent: "protector".into(),
+            squadron: "execution".into(),
+            severity: Severity::Insight,
+            text: format!(
+                "trail exit {}: {rationale} — closing {:.6}",
+                bar.symbol,
+                qty.abs()
+            ),
+            tags: vec!["trail".into(), "exit".into()],
+            confidence: 1.0,
+            symbol: Some(bar.symbol.clone()),
+            ts_ms: now_ms(),
+        }));
+
+        let intent = OrderIntent {
+            id: cx_core::ids::next_order_id(),
+            symbol: bar.symbol.clone(),
+            side: if qty > 0.0 { Side::Sell } else { Side::Buy },
+            qty: qty.abs(),
+            order_type: OrderType::Market,
+            limit_px: None,
+            tif: Tif::Ioc,
+            reduce_only: true,
+            source: OrderSource::Agent("protector".into()),
+            rationale,
+            ts_ms: now_ms(),
+        };
+        let decision = self.submit_through_risk(intent, close).await;
+        if !decision.is_approved() {
+            // A rejected exit (e.g. kill switch engaged — the protector is
+            // not kill-exempt) must not lose the protective stop: restore
+            // the watermark so the next qualifying bar fires again.
+            if let Ok(mut trail) = self.trail.lock() {
+                trail.entry(bar.symbol.clone()).or_insert(saved_mark);
+            }
+        }
+    }
+
     /// The ONLY entry point to the OMS, for every source including manual.
-    pub async fn submit_through_risk(&self, mut intent: OrderIntent, last_px: f64) {
+    /// Returns the risk decision so callers can react to a rejection (the
+    /// ATR trail restores its watermark on one).
+    pub async fn submit_through_risk(&self, mut intent: OrderIntent, last_px: f64) -> RiskDecision {
         let view = self.oms.view();
-        match self.risk.evaluate(&intent, &view, last_px) {
+        let decision = self.risk.evaluate(&intent, &view, last_px);
+        match &decision {
             RiskDecision::Approved { qty, notes } => {
                 if !notes.is_empty() {
                     self.thought(
@@ -269,7 +441,7 @@ impl TradePipeline {
                         &format!("risk shaped order {}: {}", intent.id, notes.join("; ")),
                     );
                 }
-                intent.qty = qty;
+                intent.qty = *qty;
                 self.oms.submit(intent).await;
             }
             RiskDecision::Rejected { reason } => {
@@ -290,6 +462,7 @@ impl TradePipeline {
                 );
             }
         }
+        decision
     }
 
     pub async fn handle_command(&self, cmd: Command) {
@@ -365,5 +538,325 @@ impl TradePipeline {
             symbol: symbol.map(String::from),
             ts_ms: now_ms(),
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cx_core::bus::BusEvent;
+    use cx_core::events::Position;
+    use cx_core::types::AutonomyLevel;
+    use tokio::sync::broadcast;
+
+    fn test_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.paper.latency_ms = 0;
+        cfg.paper.slippage_bps = 0.0;
+        cfg.paper.taker_fee_bps = 0.0;
+        cfg
+    }
+
+    /// Dial parked at Manual on purpose: the trail must fire anyway,
+    /// proving the autonomy dial never gates a risk reduction.
+    fn setup(cfg: Config) -> (Arc<Bus>, Arc<BarStore>, Arc<Oms>, Arc<TradePipeline>) {
+        let bus = Bus::new(1024);
+        let store = Arc::new(BarStore::new());
+        let oms = Oms::new(Arc::clone(&bus), Arc::clone(&store), cfg.paper.clone());
+        let kill = Arc::new(KillSwitch::new());
+        let risk = Arc::new(RiskEngine::new(cfg.risk.clone(), Arc::clone(&kill)));
+        let dial = Arc::new(AutonomyDial::new(AutonomyLevel::Manual));
+        let pipeline = TradePipeline::new(
+            Arc::clone(&bus),
+            Arc::clone(&store),
+            Arc::clone(&oms),
+            risk,
+            dial,
+            kill,
+            cfg,
+        );
+        (bus, store, oms, pipeline)
+    }
+
+    fn m1(symbol: &str, i: i64, high: f64, low: f64, close: f64) -> EngineEvent {
+        EngineEvent::Bar(Bar {
+            symbol: symbol.into(),
+            interval: Interval::M1,
+            ts_open_ms: i * 60_000,
+            open: close,
+            high,
+            low,
+            close,
+            volume: 1.0,
+            trade_count: 1,
+            vwap: close,
+            complete: true,
+        })
+    }
+
+    /// 14 flat bars with a 1.0 range warm ATR(14) to exactly 1.0.
+    async fn warm_atr(pipeline: &TradePipeline, symbol: &str) {
+        for i in 0..14 {
+            pipeline.on_event(&m1(symbol, i, 100.5, 99.5, 100.0)).await;
+        }
+    }
+
+    async fn open_position(store: &BarStore, oms: &Oms, symbol: &str, side: Side, qty: f64, px: f64) {
+        store.set_last_price(symbol, px);
+        oms.submit(OrderIntent {
+            id: 0,
+            symbol: symbol.into(),
+            side,
+            qty,
+            order_type: OrderType::Market,
+            limit_px: None,
+            tif: Tif::Gtc,
+            reduce_only: false,
+            source: OrderSource::Manual,
+            rationale: "test entry".into(),
+            ts_ms: now_ms(),
+        })
+        .await;
+    }
+
+    fn order_updates(rx: &mut broadcast::Receiver<BusEvent>) -> Vec<OrderUpdate> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::OrderUpdate(u) = ev.as_ref() {
+                out.push(u.clone());
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn trail_fires_on_long_retrace_reduce_only() {
+        let (bus, store, oms, pipeline) = setup(test_cfg());
+        warm_atr(&pipeline, "BTC-USD").await;
+        open_position(&store, &oms, "BTC-USD", Side::Buy, 1.0, 100.0).await;
+
+        let mut rx = bus.subscribe();
+        // Run up, then a shallow dip: HWM 101, retrace 1.0 < 2.5 * ATR.
+        pipeline.on_event(&m1("BTC-USD", 20, 101.5, 100.5, 101.0)).await;
+        pipeline.on_event(&m1("BTC-USD", 21, 101.0, 99.5, 100.0)).await;
+        assert!(order_updates(&mut rx).is_empty());
+        assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
+
+        // Deep retrace: 101 -> 96 = 5.0 >= 2.5 * ATR (~1.31 after this bar).
+        store.set_last_price("BTC-USD", 96.0);
+        pipeline.on_event(&m1("BTC-USD", 22, 100.0, 95.5, 96.0)).await;
+
+        let ups = order_updates(&mut rx);
+        assert!(!ups.is_empty(), "trail exit should have fired");
+        let intent = &ups[0].intent;
+        assert!(intent.reduce_only);
+        assert_eq!(intent.source, OrderSource::Agent("protector".into()));
+        assert_eq!(intent.side, Side::Sell);
+        assert!((intent.qty - 1.0).abs() < 1e-9);
+        assert!(intent.rationale.starts_with("ATR trail: retrace"));
+        assert!(oms.view().position_qty("BTC-USD").abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn trail_fires_on_short_retrace() {
+        let (bus, store, oms, pipeline) = setup(test_cfg());
+        warm_atr(&pipeline, "ETH-USD").await;
+        open_position(&store, &oms, "ETH-USD", Side::Sell, 2.0, 100.0).await;
+
+        let mut rx = bus.subscribe();
+        // New low: LWM parks at 98; retrace 0 -> hold.
+        pipeline.on_event(&m1("ETH-USD", 20, 98.5, 97.5, 98.0)).await;
+        assert!(order_updates(&mut rx).is_empty());
+
+        // Bounce against the short: 98 -> 103 = 5.0 >= 2.5 * ATR.
+        store.set_last_price("ETH-USD", 103.0);
+        pipeline.on_event(&m1("ETH-USD", 21, 103.5, 102.5, 103.0)).await;
+
+        let ups = order_updates(&mut rx);
+        assert!(!ups.is_empty(), "trail exit should have fired");
+        let intent = &ups[0].intent;
+        assert!(intent.reduce_only);
+        assert_eq!(intent.source, OrderSource::Agent("protector".into()));
+        assert_eq!(intent.side, Side::Buy);
+        assert!((intent.qty - 2.0).abs() < 1e-9);
+        assert!(oms.view().position_qty("ETH-USD").abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn trail_holds_while_atr_cold() {
+        let (bus, store, oms, pipeline) = setup(test_cfg());
+        // Only 5 samples reach ATR(14): far from warm.
+        for i in 0..3 {
+            pipeline.on_event(&m1("BTC-USD", i, 100.5, 99.5, 100.0)).await;
+        }
+        open_position(&store, &oms, "BTC-USD", Side::Buy, 1.0, 100.0).await;
+
+        let mut rx = bus.subscribe();
+        pipeline.on_event(&m1("BTC-USD", 10, 100.5, 99.5, 100.0)).await;
+        store.set_last_price("BTC-USD", 80.0);
+        pipeline.on_event(&m1("BTC-USD", 11, 100.0, 79.5, 80.0)).await;
+        assert!(order_updates(&mut rx).is_empty());
+        assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn trail_never_fires_without_a_position() {
+        let (bus, _store, _oms, pipeline) = setup(test_cfg());
+        warm_atr(&pipeline, "BTC-USD").await;
+
+        let mut rx = bus.subscribe();
+        pipeline.on_event(&m1("BTC-USD", 20, 110.5, 109.5, 110.0)).await;
+        pipeline.on_event(&m1("BTC-USD", 21, 110.0, 89.5, 90.0)).await;
+        assert!(order_updates(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn trail_disabled_flag_suppresses_exit() {
+        let mut cfg = test_cfg();
+        cfg.risk.trail_enabled = false;
+        let (bus, store, oms, pipeline) = setup(cfg);
+        warm_atr(&pipeline, "BTC-USD").await;
+        open_position(&store, &oms, "BTC-USD", Side::Buy, 1.0, 100.0).await;
+
+        let mut rx = bus.subscribe();
+        pipeline.on_event(&m1("BTC-USD", 20, 101.5, 100.5, 101.0)).await;
+        store.set_last_price("BTC-USD", 90.0);
+        pipeline.on_event(&m1("BTC-USD", 21, 101.0, 89.5, 90.0)).await;
+        assert!(order_updates(&mut rx).is_empty());
+        assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn rejected_trail_exit_keeps_the_watermark_until_it_can_fire() {
+        let (bus, store, oms, pipeline) = setup(test_cfg());
+        warm_atr(&pipeline, "BTC-USD").await;
+        open_position(&store, &oms, "BTC-USD", Side::Buy, 1.0, 100.0).await;
+        // HWM parks at 101.
+        pipeline.on_event(&m1("BTC-USD", 20, 101.5, 100.5, 101.0)).await;
+
+        pipeline
+            .handle_command(Command::SetKillSwitch {
+                engaged: true,
+                reason: "test".into(),
+            })
+            .await;
+
+        let mut rx = bus.subscribe();
+        // Deep retrace fires the trail, but Agent("protector") is not
+        // kill-exempt: risk rejects and the position stays open.
+        store.set_last_price("BTC-USD", 96.0);
+        pipeline.on_event(&m1("BTC-USD", 21, 100.0, 95.5, 96.0)).await;
+        let ups = order_updates(&mut rx);
+        assert!(
+            ups.iter()
+                .any(|u| matches!(u.status, OrderStatus::RejectedByRisk { .. })),
+            "trail exit should have been rejected under kill"
+        );
+        assert!(ups.iter().all(|u| !matches!(u.status, OrderStatus::Filled)));
+        assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
+        // The protective stop survives the rejection.
+        {
+            let trail = pipeline.trail.lock().expect("trail lock");
+            let mark = trail.get("BTC-USD").expect("mark restored after rejection");
+            assert!((mark.hwm - 101.0).abs() < 1e-9);
+        }
+
+        pipeline
+            .handle_command(Command::SetKillSwitch {
+                engaged: false,
+                reason: "test over".into(),
+            })
+            .await;
+
+        // Next qualifying bar fires again and now closes the position.
+        store.set_last_price("BTC-USD", 95.5);
+        pipeline.on_event(&m1("BTC-USD", 22, 96.5, 95.0, 95.5)).await;
+        let ups = order_updates(&mut rx);
+        assert!(
+            ups.iter().any(|u| matches!(u.status, OrderStatus::Filled)),
+            "trail should fire again after kill disengages"
+        );
+        assert!(oms.view().position_qty("BTC-USD").abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn stale_mark_reseeds_when_entry_identity_changes() {
+        let (bus, store, oms, pipeline) = setup(test_cfg());
+        warm_atr(&pipeline, "BTC-USD").await;
+        open_position(&store, &oms, "BTC-USD", Side::Buy, 1.0, 100.0).await;
+        // HWM parks at 105 with entry identity avg_px 100.
+        pipeline.on_event(&m1("BTC-USD", 20, 105.5, 104.5, 105.0)).await;
+
+        // Same-sign close-and-reopen between bars, with the flat Position
+        // event dropped (bus lag): the pipeline never observes qty == 0.
+        store.set_last_price("BTC-USD", 105.0);
+        oms.submit(OrderIntent {
+            id: 0,
+            symbol: "BTC-USD".into(),
+            side: Side::Sell,
+            qty: 1.0,
+            order_type: OrderType::Market,
+            limit_px: None,
+            tif: Tif::Gtc,
+            reduce_only: true,
+            source: OrderSource::Manual,
+            rationale: "test close".into(),
+            ts_ms: now_ms(),
+        })
+        .await;
+        open_position(&store, &oms, "BTC-USD", Side::Buy, 1.0, 96.0).await;
+
+        let mut rx = bus.subscribe();
+        // A stale HWM would read 105 -> 96 = 9 >= 2.5 * ATR and dump the
+        // fresh position; the avg_px identity check re-seeds at 96 instead.
+        pipeline.on_event(&m1("BTC-USD", 21, 96.5, 95.5, 96.0)).await;
+        assert!(order_updates(&mut rx).is_empty());
+        assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
+        {
+            let trail = pipeline.trail.lock().expect("trail lock");
+            let mark = trail.get("BTC-USD").expect("mark present");
+            assert!((mark.hwm - 96.0).abs() < 1e-9, "mark re-seeded from close");
+            assert!((mark.avg_px - 96.0).abs() < 1e-9, "entry identity refreshed");
+        }
+
+        // The re-seeded mark still protects: a deep retrace from 96 fires.
+        store.set_last_price("BTC-USD", 89.0);
+        pipeline.on_event(&m1("BTC-USD", 22, 96.0, 88.5, 89.0)).await;
+        let ups = order_updates(&mut rx);
+        assert!(!ups.is_empty(), "re-seeded trail should fire");
+        let intent = &ups[0].intent;
+        assert!(intent.reduce_only);
+        assert_eq!(intent.source, OrderSource::Agent("protector".into()));
+        assert!(oms.view().position_qty("BTC-USD").abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn position_close_event_resets_the_watermark() {
+        let (bus, store, oms, pipeline) = setup(test_cfg());
+        warm_atr(&pipeline, "BTC-USD").await;
+        open_position(&store, &oms, "BTC-USD", Side::Buy, 1.0, 105.0).await;
+        // HWM parks at 105.
+        pipeline.on_event(&m1("BTC-USD", 20, 105.5, 104.5, 105.0)).await;
+
+        // Close/reopen between bars: the Position event must clear the mark.
+        pipeline
+            .on_event(&EngineEvent::Position(Position {
+                symbol: "BTC-USD".into(),
+                qty: 0.0,
+                avg_px: 0.0,
+                mark_px: 105.0,
+                unrealized_pnl: 0.0,
+                realized_pnl: 0.0,
+                ts_ms: now_ms(),
+            }))
+            .await;
+
+        let mut rx = bus.subscribe();
+        // 105 -> 100 would trip a stale mark (5.0 >= 2.5 * ATR); a fresh
+        // mark re-seeds at 100 and holds.
+        store.set_last_price("BTC-USD", 100.0);
+        pipeline.on_event(&m1("BTC-USD", 21, 105.0, 99.5, 100.0)).await;
+        assert!(order_updates(&mut rx).is_empty());
+        assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
     }
 }

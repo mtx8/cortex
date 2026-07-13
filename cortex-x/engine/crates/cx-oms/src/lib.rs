@@ -12,6 +12,9 @@
 //!   purchase, sale and fee, so no PnL term is double counted.
 //! - Tick-driven `Position` events are throttled to one per symbol per 250ms
 //!   and `AccountSnapshot` to one per 500ms; fill-driven events never wait.
+//! - Reduce-only is enforced at fill time against the LIVE position: a
+//!   reduce-only order cancels when there is nothing left to reduce and
+//!   clamps to the live quantity otherwise, so it can never flip a position.
 //! - All math on network-derived numbers is NaN-safe; the account snapshot is
 //!   computable at any instant.
 
@@ -381,6 +384,16 @@ impl Oms {
         v
     }
 
+    /// Live snapshot of one tracked position, if any (flat entries are
+    /// still returned while they carry realized PnL).
+    pub fn position(&self, symbol: &str) -> Option<Position> {
+        let inner = self.lock();
+        inner
+            .positions
+            .get(symbol)
+            .map(|p| p.event(symbol, now_ms()))
+    }
+
     /// Orders still Accepted or Working, sorted by order id.
     pub fn open_orders(&self) -> Vec<OrderUpdate> {
         let inner = self.lock();
@@ -475,11 +488,39 @@ impl Oms {
     /// Full fill at `px`: signed average-cost position math, cash and fee
     /// accounting, then the immediate OrderUpdate/Fill/Position/Account
     /// publishes. Caller guarantees `px` finite > 0 and `qty` finite > 0.
+    ///
+    /// Reduce-only is enforced HERE, at the single fill choke point: the
+    /// LIVE position is re-checked under the lock, because racing closes
+    /// (e.g. ATR trail vs flatten/manual) can each pass submit-time checks
+    /// during the latency window. A reduce-only order cancels when there is
+    /// nothing left to reduce and clamps to the live quantity otherwise, so
+    /// a reduce-only fill can never flip a position's sign.
     fn execute_fill(&self, inner: &mut Inner, intent: &OrderIntent, px: f64, liquidity: Liquidity) {
         let ts = now_ms();
         Self::roll_day(inner, ts);
-        let qty = intent.qty;
         let sign = intent.side.sign();
+        let qty = if intent.reduce_only {
+            let live = inner
+                .positions
+                .get(&intent.symbol)
+                .map(|p| p.qty)
+                .unwrap_or(0.0);
+            if live.abs() < EPS || (live > 0.0) == (sign > 0.0) {
+                // Flat, or the order points WITH the position: filling
+                // would open/extend, which reduce-only forbids.
+                inner.orders.remove(&intent.id);
+                self.publish_update(
+                    intent,
+                    OrderStatus::Canceled {
+                        reason: "reduce-only: nothing to reduce".into(),
+                    },
+                );
+                return;
+            }
+            intent.qty.min(live.abs())
+        } else {
+            intent.qty
+        };
         let fee_bps = match liquidity {
             Liquidity::Maker => self.cfg.maker_fee_bps,
             Liquidity::Taker => self.cfg.taker_fee_bps,
@@ -666,6 +707,12 @@ mod tests {
             rationale: "test".into(),
             ts_ms: now_ms(),
         }
+    }
+
+    fn close_intent(symbol: &str, side: Side, qty: f64) -> OrderIntent {
+        let mut i = intent(symbol, side, qty, OrderType::Market, None);
+        i.reduce_only = true;
+        i
     }
 
     fn setup(cfg: PaperConfig) -> (Arc<Bus>, Arc<BarStore>, Arc<Oms>) {
@@ -989,6 +1036,117 @@ mod tests {
         }));
         tokio::time::sleep(Duration::from_millis(50)).await;
         approx(oms.positions()[0].mark_px, 130.0);
+    }
+
+    #[tokio::test]
+    async fn racing_reduce_only_closes_fill_once_and_cancel_once() {
+        let (bus, store, oms) = setup(cfg(50, 0.0, 0.0, 0.0));
+        store.set_last_price("BTC-USD", 100.0);
+        oms.submit(intent("BTC-USD", Side::Buy, 2.0, OrderType::Market, None))
+            .await;
+
+        // Two full closes overlap inside the latency window (submit
+        // releases the lock before the sleep): ATR trail vs flatten.
+        let mut rx = bus.subscribe();
+        let a = tokio::spawn({
+            let oms = Arc::clone(&oms);
+            async move { oms.submit(close_intent("BTC-USD", Side::Sell, 2.0)).await }
+        });
+        let b = tokio::spawn({
+            let oms = Arc::clone(&oms);
+            async move { oms.submit(close_intent("BTC-USD", Side::Sell, 2.0)).await }
+        });
+        let ids = [a.await.expect("join"), b.await.expect("join")];
+
+        let mut filled = 0;
+        let mut canceled = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::OrderUpdate(u) = ev.as_ref() {
+                if !ids.contains(&u.order_id) {
+                    continue;
+                }
+                match &u.status {
+                    OrderStatus::Filled => {
+                        filled += 1;
+                        approx(u.filled_qty, 2.0);
+                    }
+                    OrderStatus::Canceled { reason } => {
+                        canceled += 1;
+                        assert_eq!(reason, "reduce-only: nothing to reduce");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(filled, 1, "exactly one close fills");
+        assert_eq!(canceled, 1, "the loser cancels instead of flipping");
+        approx(oms.positions()[0].qty, 0.0); // flat, NEVER short
+        assert_eq!(oms.account().daily_trades, 2); // entry + one close
+    }
+
+    #[tokio::test]
+    async fn racing_partial_reduce_only_closes_clamp_and_never_flip() {
+        let (bus, store, oms) = setup(cfg(50, 0.0, 0.0, 0.0));
+        store.set_last_price("BTC-USD", 100.0);
+        oms.submit(intent("BTC-USD", Side::Buy, 2.0, OrderType::Market, None))
+            .await;
+
+        let mut rx = bus.subscribe();
+        let a = tokio::spawn({
+            let oms = Arc::clone(&oms);
+            async move { oms.submit(close_intent("BTC-USD", Side::Sell, 1.5)).await }
+        });
+        let b = tokio::spawn({
+            let oms = Arc::clone(&oms);
+            async move { oms.submit(close_intent("BTC-USD", Side::Sell, 1.5)).await }
+        });
+        let ids = [a.await.expect("join"), b.await.expect("join")];
+
+        // 1.5 + 1.5 > 2.0 held: the loser clamps to the residual 0.5 so
+        // the position lands exactly flat instead of flipping short.
+        let mut fills: Vec<f64> = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::OrderUpdate(u) = ev.as_ref() {
+                if ids.contains(&u.order_id) && matches!(u.status, OrderStatus::Filled) {
+                    fills.push(u.filled_qty);
+                }
+            }
+        }
+        fills.sort_by(|x, y| x.partial_cmp(y).expect("finite"));
+        assert_eq!(fills.len(), 2);
+        approx(fills[0], 0.5);
+        approx(fills[1], 1.5);
+        approx(oms.positions()[0].qty, 0.0); // sign never flipped
+    }
+
+    #[tokio::test]
+    async fn reduce_only_cancels_when_flat_or_same_side() {
+        let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
+        store.set_last_price("BTC-USD", 100.0);
+        let mut rx = bus.subscribe();
+
+        // Flat book: nothing to reduce.
+        let id = oms.submit(close_intent("BTC-USD", Side::Sell, 1.0)).await;
+        let update = next_update_for(&mut rx, id).await;
+        assert!(matches!(update.status, OrderStatus::Accepted));
+        let update = next_update_for(&mut rx, id).await;
+        match &update.status {
+            OrderStatus::Canceled { reason } => {
+                assert_eq!(reason, "reduce-only: nothing to reduce")
+            }
+            other => panic!("expected cancel, got {other:?}"),
+        }
+
+        // Long book + reduce-only BUY points WITH the position.
+        oms.submit(intent("BTC-USD", Side::Buy, 1.0, OrderType::Market, None))
+            .await;
+        let id = oms.submit(close_intent("BTC-USD", Side::Buy, 1.0)).await;
+        let update = next_update_for(&mut rx, id).await;
+        assert!(matches!(update.status, OrderStatus::Accepted));
+        let update = next_update_for(&mut rx, id).await;
+        assert!(matches!(update.status, OrderStatus::Canceled { .. }));
+        approx(oms.positions()[0].qty, 1.0); // untouched
+        assert_eq!(oms.account().daily_trades, 1);
     }
 
     #[tokio::test]

@@ -1,6 +1,8 @@
 // Canvas renderer for the flagship chart: candlesticks, EMA / Bollinger
-// overlays, volume + RSI subpanes, crosshair readout, pan/zoom and the AI
-// annotation layer (signal markers, agent-thought dots).
+// overlays, volume + RSI + MACD subpanes, optional log price axis,
+// crosshair readout, pan/zoom, the AI annotation layer (signal markers,
+// agent-thought dots) and the manual drawing layer (trendlines, hlines,
+// fib retracements).
 
 import SwiftUI
 
@@ -9,17 +11,27 @@ enum ChartColors {
     static let ema21 = Color(hex: 0x9B7BC7)
     static let ema50 = Color(hex: 0x6E6E78)
     static let rsi = Color(hex: 0x5E82AD)
+    static let macd = Color(hex: 0x7BB0C7)
+    static let macdSignal = Color(hex: 0xC7B77B)
     static let bbEdge = Theme.bone.opacity(0.22)
     static let bbFill = Theme.bone.opacity(0.06)
 }
 
 struct CandleChart: View {
+    let symbol: String
     let bars: [Bar]
     let interval: Interval
+    /// True bar width in ms — `ChartMath.weekMs` in weekly mode, else
+    /// `interval.ms`. Weekly bars keep `.d1` on the wire, so timestamp
+    /// bucketing and intra-gap fractions must use this, not the interval.
+    let barSpanMs: Int64
     let signals: [StrategySignal]
     let thoughts: [AgentThought]
     let feeds: [FeedStatus]
     let interaction: ChartInteraction
+    let drawingStore: DrawingStore
+
+    @FocusState private var focused: Bool
 
     var body: some View {
         GeometryReader { geo in
@@ -28,8 +40,10 @@ struct CandleChart: View {
             } else {
                 chartBody(
                     ChartFrame(
-                        bars: bars, interval: interval, signals: signals,
-                        thoughts: thoughts, size: geo.size, interaction: interaction
+                        bars: bars, interval: interval, barSpanMs: barSpanMs,
+                        signals: signals, thoughts: thoughts,
+                        drawings: drawingStore.drawings(for: symbol),
+                        size: geo.size, interaction: interaction
                     )
                 )
             }
@@ -65,7 +79,13 @@ struct CandleChart: View {
         }
         .contentShape(Rectangle())
         .gesture(dragGesture(frame))
-        .onTapGesture(count: 2) { interaction.resetToLive() }
+        .gesture(tapGesture(frame))
+        .focusable()
+        .focusEffectDisabled()
+        .focused($focused)
+        .onKeyPress(.escape) { handleEscape() }
+        .onKeyPress(.delete) { handleDelete() }
+        .onKeyPress(.deleteForward) { handleDelete() }
         .onContinuousHover { phase in
             switch phase {
             case .active(let p): interaction.hover = p
@@ -85,6 +105,70 @@ struct CandleChart: View {
                 )
             }
             .onEnded { _ in interaction.dragEnded() }
+    }
+
+    /// Cursor tool keeps the double-click-to-live reset (single clicks then
+    /// select drawings); an armed tool takes every click as an anchor.
+    private func tapGesture(_ frame: ChartFrame?) -> AnyGesture<Void> {
+        let single = SpatialTapGesture()
+            .onEnded { value in handleClick(at: value.location, frame: frame) }
+        guard interaction.activeTool == .cursor else {
+            return AnyGesture(single.map { _ in () })
+        }
+        let double = TapGesture(count: 2)
+            .onEnded { interaction.resetToLive() }
+        return AnyGesture(double.exclusively(before: single).map { _ in () })
+    }
+
+    // MARK: - Drawing interaction
+
+    private func handleClick(at p: CGPoint, frame: ChartFrame?) {
+        focused = true // arm Esc / Delete key handling
+        guard let frame else { return }
+        switch interaction.activeTool {
+        case .cursor:
+            interaction.selectedDrawingID = frame.drawingID(at: p)
+        case .trendline, .fib:
+            guard let anchor = frame.drawingPoint(at: p) else { return }
+            if let first = interaction.pendingAnchor {
+                // A second click on the exact first anchor would form a
+                // degenerate (invisible) drawing — keep waiting instead.
+                guard anchor != first else { return }
+                let kind: DrawingKind = interaction.activeTool == .fib ? .fib : .trendline
+                drawingStore.add(Drawing(kind: kind, points: [first, anchor]), for: symbol)
+                interaction.pendingAnchor = nil
+                interaction.activeTool = .cursor
+            } else {
+                interaction.pendingAnchor = anchor
+            }
+        case .hline:
+            guard let anchor = frame.drawingPoint(at: p) else { return }
+            drawingStore.add(Drawing(kind: .hline, points: [anchor]), for: symbol)
+            interaction.activeTool = .cursor
+        }
+    }
+
+    private func handleEscape() -> KeyPress.Result {
+        if interaction.pendingAnchor != nil {
+            interaction.pendingAnchor = nil
+            return .handled
+        }
+        if interaction.activeTool != .cursor {
+            interaction.activeTool = .cursor
+            return .handled
+        }
+        if interaction.selectedDrawingID != nil {
+            interaction.selectedDrawingID = nil
+            return .handled
+        }
+        return .ignored
+    }
+
+    private func handleDelete() -> KeyPress.Result {
+        guard let id = interaction.selectedDrawingID else { return .ignored }
+        drawingStore.remove(id: id, for: symbol)
+        interaction.selectedDrawingID = nil
+        return .handled
     }
 
     // MARK: - SwiftUI overlays
@@ -126,6 +210,35 @@ struct CandleChart: View {
                 label: "rsi 14", value: frame.rsiText(at: i),
                 color: ChartColors.rsi, isOn: interaction.showRSI
             ) { interaction.showRSI.toggle() }
+            LegendChip(
+                label: "macd", value: frame.macdText(at: i),
+                color: ChartColors.macd, isOn: interaction.showMACD
+            ) { interaction.showMACD.toggle() }
+            LegendChip(
+                label: "log", value: nil,
+                color: Theme.bone.opacity(0.55), isOn: interaction.logScale
+            ) { interaction.logScale.toggle() }
+            toolStrip
+        }
+    }
+
+    private var toolStrip: some View {
+        HStack(spacing: 4) {
+            Rectangle()
+                .fill(Theme.line)
+                .frame(width: Theme.hairline, height: 14)
+                .padding(.horizontal, 2)
+            ForEach(ChartTool.allCases, id: \.self) { tool in
+                ToolChip(
+                    symbol: tool.symbolName, isOn: interaction.activeTool == tool,
+                    help: tool.help
+                ) { interaction.selectTool(tool) }
+            }
+            ToolChip(symbol: "trash", isOn: false, help: "clear drawings") {
+                drawingStore.removeAll(for: symbol)
+                interaction.selectedDrawingID = nil
+                interaction.pendingAnchor = nil
+            }
         }
     }
 
@@ -199,6 +312,34 @@ struct CandleChart: View {
         case .degraded, .synthetic_fallback: Theme.warn
         case .down: Theme.down
         }
+    }
+}
+
+// MARK: - Tool chip
+
+private struct ToolChip: View {
+    let symbol: String
+    let isOn: Bool
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(isOn ? Theme.ember : Theme.dim)
+                .frame(width: 14, height: 12)
+                .padding(.horizontal, 4)
+                .padding(.vertical, 3)
+                .background(Theme.panel.opacity(0.85))
+                .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.chipRadius)
+                        .strokeBorder(Theme.line, lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 
@@ -368,6 +509,8 @@ private struct ChartFrame {
     // Inputs
     let bars: [Bar]
     let interval: Interval
+    /// True bar width in ms (weekly bars ride the `.d1` interval).
+    let barSpanMs: Int64
     let size: CGSize
     let showBB: Bool
     let hoverPoint: CGPoint?
@@ -378,6 +521,7 @@ private struct ChartFrame {
     let mainRect: CGRect
     let volRect: CGRect
     let rsiRect: CGRect?
+    let macdRect: CGRect?
     let paneBottom: CGFloat
     let timeAxisHeight: CGFloat
 
@@ -390,6 +534,8 @@ private struct ChartFrame {
     let minP: Double
     let maxP: Double
     let maxVol: Double
+    /// Log10 price mapping; false when toggled off or any visible low <= 0.
+    let logScale: Bool
 
     // Indicators (empty when toggled off; else aligned with `bars` indices)
     let ema9: [Double?]
@@ -397,21 +543,34 @@ private struct ChartFrame {
     let ema50: [Double?]
     let bb: [ChartMath.BollingerPoint?]
     let rsi: [Double?]
+    let macd: [Double?]
+    let macdSignal: [Double?]
+    let macdHist: [Double?]
 
     // AI layer, bucketed onto visible bar indices
     let visibleSignals: [(index: Int, signals: [StrategySignal])]
     let visibleThoughts: [(index: Int, thoughts: [AgentThought])]
 
+    // Drawing layer
+    let drawings: [Drawing]
+    let selectedDrawingID: UUID?
+    let pendingAnchor: DrawingPoint?
+
     init?(
-        bars: [Bar], interval: Interval, signals: [StrategySignal],
-        thoughts: [AgentThought], size: CGSize, interaction: ChartInteraction
+        bars: [Bar], interval: Interval, barSpanMs: Int64,
+        signals: [StrategySignal], thoughts: [AgentThought],
+        drawings: [Drawing], size: CGSize, interaction: ChartInteraction
     ) {
         guard !bars.isEmpty, size.width > 140, size.height > 140 else { return nil }
         self.bars = bars
         self.interval = interval
+        self.barSpanMs = max(barSpanMs, 1)
         self.size = size
         self.showBB = interaction.showBollinger
         self.hoverPoint = interaction.isDragging ? nil : interaction.hover
+        self.drawings = drawings
+        self.selectedDrawingID = interaction.selectedDrawingID
+        self.pendingAnchor = interaction.pendingAnchor
 
         // Layout
         let axisWidth: CGFloat = 56
@@ -421,12 +580,15 @@ private struct ChartFrame {
         axisX = size.width - axisWidth
         let paneH = size.height - taH
         let rsiH: CGFloat = interaction.showRSI ? (paneH * 0.18).rounded() : 0
+        let macdH: CGFloat = interaction.showMACD ? (paneH * 0.16).rounded() : 0
         let volH: CGFloat = (paneH * 0.14).rounded()
-        let mainH = paneH - volH - rsiH
+        let mainH = paneH - volH - rsiH - macdH
         mainRect = CGRect(x: 0, y: 0, width: plotWidth, height: mainH)
         volRect = CGRect(x: 0, y: mainH, width: plotWidth, height: volH)
         rsiRect = rsiH > 0 ? CGRect(x: 0, y: mainH + volH, width: plotWidth, height: rsiH) : nil
-        paneBottom = mainH + volH + rsiH
+        macdRect = macdH > 0
+            ? CGRect(x: 0, y: mainH + volH + rsiH, width: plotWidth, height: macdH) : nil
+        paneBottom = mainH + volH + rsiH + macdH
 
         // Window
         let total = bars.count
@@ -443,6 +605,12 @@ private struct ChartFrame {
         ema50 = interaction.showEMA50 ? ChartMath.ema(closes, period: 50) : []
         bb = interaction.showBollinger ? ChartMath.bollinger(closes, period: 20, k: 2) : []
         rsi = interaction.showRSI ? ChartMath.rsi(closes, period: 14) : []
+        let m = interaction.showMACD
+            ? ChartMath.macdSeries(closes: closes)
+            : (macd: [Double?](), signal: [Double?](), hist: [Double?]())
+        macd = m.macd
+        macdSignal = m.signal
+        macdHist = m.hist
 
         // Price scale over visible bars + enabled overlay values
         var lo = Double.greatestFiniteMagnitude
@@ -463,25 +631,40 @@ private struct ChartFrame {
             if ema50.count == total, let v = ema50[i] { lo = min(lo, v); hi = max(hi, v) }
         }
         if lo > hi { lo = 0; hi = 1 }
-        var pad = (hi - lo) * 0.05
-        if pad <= 0 { pad = max(abs(hi) * 0.001, 1e-9) }
-        minP = lo - pad
-        maxP = hi + pad
+        // A log axis needs a strictly positive floor; fall back to linear
+        // when any visible low (or overlay value) is <= 0.
+        logScale = interaction.logScale && lo > 0
+        if logScale {
+            // Pad in log space so the padded floor stays positive.
+            let lLo = log10(lo)
+            let lHi = log10(hi)
+            var lPad = (lHi - lLo) * 0.05
+            if lPad <= 0 { lPad = 1e-4 }
+            minP = pow(10, lLo - lPad)
+            maxP = pow(10, lHi + lPad)
+        } else {
+            var pad = (hi - lo) * 0.05
+            if pad <= 0 { pad = max(abs(hi) * 0.001, 1e-9) }
+            minP = lo - pad
+            maxP = hi + pad
+        }
         maxVol = max(mv, 1e-12)
 
-        // AI buckets -> visible bar indices
+        // AI buckets -> visible bar indices. Floor by the true bar span so
+        // weekly bars (Monday-anchored, `.d1` on the wire) still match.
+        let span = self.barSpanMs
         var indexByTs = [Int64: Int](minimumCapacity: range.count)
         for i in range { indexByTs[bars[i].ts_open_ms] = i }
         var sigMap: [Int: [StrategySignal]] = [:]
         for s in signals {
-            if let i = indexByTs[ChartMath.bucket(s.ts_ms, interval)] {
+            if let i = indexByTs[ChartMath.bucket(s.ts_ms, spanMs: span)] {
                 sigMap[i, default: []].append(s)
             }
         }
         visibleSignals = sigMap.map { (index: $0.key, signals: $0.value) }
         var thoughtMap: [Int: [AgentThought]] = [:]
         for t in thoughts {
-            if let i = indexByTs[ChartMath.bucket(t.ts_ms, interval)] {
+            if let i = indexByTs[ChartMath.bucket(t.ts_ms, spanMs: span)] {
                 thoughtMap[i, default: []].append(t)
             }
         }
@@ -497,12 +680,13 @@ private struct ChartFrame {
     }
 
     func yPrice(_ p: Double) -> CGFloat {
-        let f = (p - minP) / (maxP - minP)
+        let f = ChartMath.priceFraction(p, lo: minP, hi: maxP, log: logScale)
         return mainRect.maxY - CGFloat(f) * mainRect.height
     }
 
     func priceAtY(_ y: CGFloat) -> Double {
-        minP + Double((mainRect.maxY - y) / mainRect.height) * (maxP - minP)
+        let f = Double((mainRect.maxY - y) / mainRect.height)
+        return ChartMath.priceAtFraction(f, lo: minP, hi: maxP, log: logScale)
     }
 
     func yRSI(_ v: Double, in rect: CGRect) -> CGFloat {
@@ -515,6 +699,52 @@ private struct ChartFrame {
         let i = Int(raw.rounded())
         if range.contains(i) { return i }
         return i < range.lowerBound ? range.lowerBound : range.upperBound - 1
+    }
+
+    /// Screen x for an arbitrary timestamp: fractional bar index against the
+    /// series (bars ascend by ts_open_ms), interpolated by the true bar span
+    /// so drawing anchors survive pans, zooms, series growth and the weekly
+    /// toggle. Values beyond either end extrapolate; off-screen x simply
+    /// falls outside the clip.
+    func xTs(_ ts: Int64) -> CGFloat {
+        guard let first = bars.first else { return -1 }
+        let ms = Double(barSpanMs)
+        let last = bars.count - 1
+        if ts <= first.ts_open_ms {
+            return xD(Double(ts - first.ts_open_ms) / ms)
+        }
+        if ts >= bars[last].ts_open_ms {
+            return xD(Double(last) + Double(ts - bars[last].ts_open_ms) / ms)
+        }
+        var lo = 0
+        var hi = last
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2
+            if bars[mid].ts_open_ms <= ts { lo = mid } else { hi = mid }
+        }
+        // Clamp the intra-gap fraction so weekend/session gaps never push an
+        // anchor past the next bar.
+        let f = min(Double(ts - bars[lo].ts_open_ms) / ms, 1)
+        return xD(Double(lo) + f)
+    }
+
+    // MARK: Drawing lookups
+
+    /// Inverse frame mapping for anchor placement: nearest bar timestamp
+    /// plus the exact price under the cursor. Price pane only.
+    func drawingPoint(at p: CGPoint) -> DrawingPoint? {
+        guard mainRect.contains(p), let i = index(atX: p.x) else { return nil }
+        let price = priceAtY(p.y)
+        guard price.isFinite else { return nil }
+        return DrawingPoint(ts_ms: bars[i].ts_open_ms, price: price)
+    }
+
+    /// Topmost (most recently added) drawing within hit-test tolerance.
+    func drawingID(at p: CGPoint) -> UUID? {
+        guard mainRect.contains(p) else { return nil }
+        return drawings.last(where: {
+            DrawingMath.hitTest($0, at: p, xForTs: xTs, yForPrice: yPrice, in: mainRect)
+        })?.id
     }
 
     // MARK: Crosshair & legend lookups
@@ -565,6 +795,11 @@ private struct ChartFrame {
         return String(format: "%.1f", v)
     }
 
+    func macdText(at i: Int) -> String? {
+        guard macd.count == bars.count, i >= 0, i < macd.count, let v = macd[i] else { return nil }
+        return ChartMath.formatSigned(v)
+    }
+
     // MARK: Drawing
 
     func draw(in ctx: GraphicsContext) {
@@ -575,8 +810,10 @@ private struct ChartFrame {
         drawEMAs(ctx)
         drawVolume(ctx)
         drawRSIPane(ctx)
+        drawMACDPane(ctx)
         drawAI(ctx)
         drawLastPrice(ctx)
+        drawDrawings(ctx)
         drawCrosshair(ctx)
     }
 
@@ -611,9 +848,13 @@ private struct ChartFrame {
     private func drawGrid(_ ctx: GraphicsContext) {
         let gridColor = Theme.line.opacity(0.4)
 
-        // Horizontal price gridlines + right-axis labels
+        // Horizontal price gridlines + right-axis labels. Log mode generates
+        // 1/2/5 x 10^n ticks in log space; linear keeps nice steps.
         let target = max(3, Int(mainRect.height / 44))
-        for tick in ChartMath.axisTicks(min: minP, max: maxP, target: target) {
+        let priceTicks = logScale
+            ? ChartMath.logAxisTicks(min: minP, max: maxP, heightPx: Double(mainRect.height))
+            : ChartMath.axisTicks(min: minP, max: maxP, target: target)
+        for tick in priceTicks {
             let y = yPrice(tick).rounded() + 0.5
             guard y > mainRect.minY + 5, y < mainRect.maxY - 3 else { continue }
             var p = Path()
@@ -645,6 +886,7 @@ private struct ChartFrame {
         // Pane separators
         var separators = [volRect.minY, paneBottom]
         if let r = rsiRect { separators.append(r.minY) }
+        if let r = macdRect { separators.append(r.minY) }
         for yy in separators {
             var p = Path()
             let y = yy.rounded() + 0.5
@@ -854,6 +1096,75 @@ private struct ChartFrame {
         ctx.draw(tinyText("rsi 14"), at: CGPoint(x: 6, y: rect.minY + 9), anchor: .leading)
     }
 
+    private func drawMACDPane(_ ctx: GraphicsContext) {
+        guard let rect = macdRect, macd.count == bars.count else { return }
+
+        // Symmetric scale about zero over the visible macd / signal / hist.
+        var peak = 0.0
+        for i in range {
+            if let v = macd[i], v.isFinite { peak = max(peak, abs(v)) }
+            if let v = macdSignal[i], v.isFinite { peak = max(peak, abs(v)) }
+            if let v = macdHist[i], v.isFinite { peak = max(peak, abs(v)) }
+        }
+        if peak <= 0 { peak = 1 }
+        peak *= 1.1 // headroom
+        let halfH = max(rect.height / 2 - 3, 1)
+        func yV(_ v: Double) -> CGFloat {
+            rect.midY - CGFloat(v / peak) * halfH
+        }
+
+        // Zero line, dim
+        let y0 = rect.midY.rounded() + 0.5
+        var zero = Path()
+        zero.move(to: CGPoint(x: 0, y: y0))
+        zero.addLine(to: CGPoint(x: plotWidth, y: y0))
+        ctx.stroke(zero, with: .color(Theme.line.opacity(0.8)), lineWidth: 1)
+
+        // Histogram, up/down colored by sign
+        let bodyW = max(1, (slot * 0.7).rounded())
+        var upP = Path()
+        var downP = Path()
+        for i in range {
+            guard let h = macdHist[i], h.isFinite else { continue }
+            let xC = x(i).rounded()
+            let yy = yV(h)
+            let r = CGRect(
+                x: xC - bodyW / 2, y: min(yy, y0), width: bodyW, height: max(1, abs(yy - y0))
+            )
+            if h >= 0 { upP.addRect(r) } else { downP.addRect(r) }
+        }
+        ctx.fill(upP, with: .color(Theme.up.opacity(0.35)))
+        ctx.fill(downP, with: .color(Theme.down.opacity(0.35)))
+
+        // macd + signal lines
+        var clipped = ctx
+        clipped.clip(to: Path(rect))
+        func strokeLine(_ values: [Double?], color: Color) {
+            var path = Path()
+            var started = false
+            for i in range {
+                guard let v = values[i], v.isFinite else {
+                    started = false
+                    continue
+                }
+                let pt = CGPoint(x: x(i), y: yV(v))
+                if started {
+                    path.addLine(to: pt)
+                } else {
+                    path.move(to: pt)
+                    started = true
+                }
+            }
+            clipped.stroke(
+                path, with: .color(color), style: StrokeStyle(lineWidth: 1, lineJoin: .round)
+            )
+        }
+        strokeLine(macd, color: ChartColors.macd)
+        strokeLine(macdSignal, color: ChartColors.macdSignal)
+
+        ctx.draw(tinyText("macd 12 26 9"), at: CGPoint(x: 6, y: rect.minY + 9), anchor: .leading)
+    }
+
     private func drawAI(_ ctx: GraphicsContext) {
         // Signal triangles: long under the bar, short above. 8pt, never on candles.
         for (i, sigs) in visibleSignals {
@@ -939,19 +1250,138 @@ private struct ChartFrame {
         )
     }
 
+    // MARK: Drawing layer
+
+    /// User drawings, clipped to the price pane; above candles / AI marks,
+    /// below the crosshair. Unselected drawings render muted (ember is
+    /// reserved for AI marks and selection); the selected drawing renders
+    /// in emberHi with anchor dots and a pending first anchor shows as a
+    /// lone ember dot.
+    private func drawDrawings(_ ctx: GraphicsContext) {
+        guard !drawings.isEmpty || pendingAnchor != nil else { return }
+        var clipped = ctx
+        clipped.clip(to: Path(mainRect))
+        for d in drawings {
+            let selected = d.id == selectedDrawingID
+            switch d.kind {
+            case .trendline: drawTrendline(clipped, d, selected: selected)
+            case .hline: drawHLine(ctx, clipped, d, selected: selected)
+            case .fib: drawFib(clipped, d, selected: selected)
+            }
+        }
+        if let pending = pendingAnchor, let pt = anchorPoint(pending) {
+            clipped.fill(
+                Path(ellipseIn: CGRect(x: pt.x - 3, y: pt.y - 3, width: 6, height: 6)),
+                with: .color(Theme.ember)
+            )
+        }
+    }
+
+    private func anchorPoint(_ p: DrawingPoint) -> CGPoint? {
+        guard p.price.isFinite else { return nil }
+        let pt = CGPoint(x: xTs(p.ts_ms), y: yPrice(p.price))
+        guard pt.x.isFinite, pt.y.isFinite else { return nil }
+        return pt
+    }
+
+    private func drawAnchors(_ ctx: GraphicsContext, _ pts: [CGPoint]) {
+        for pt in pts {
+            ctx.fill(
+                Path(ellipseIn: CGRect(x: pt.x - 2.5, y: pt.y - 2.5, width: 5, height: 5)),
+                with: .color(Theme.emberHi)
+            )
+        }
+    }
+
+    /// Muted (bone) hue for unselected user drawings — ember stays reserved
+    /// for AI marks, the selection highlight and the pending anchor.
+    private static let mutedDrawing = Theme.bone.opacity(0.5)
+
+    /// 1px ray: anchored at the first point, extended past the second to
+    /// the chart edge. Muted unless selected.
+    private func drawTrendline(_ ctx: GraphicsContext, _ d: Drawing, selected: Bool) {
+        guard d.points.count >= 2,
+            let a = anchorPoint(d.points[0]),
+            let b = anchorPoint(d.points[1]) else { return }
+        let end = DrawingMath.rayEnd(from: a, through: b, in: mainRect)
+        var p = Path()
+        p.move(to: a)
+        p.addLine(to: end)
+        ctx.stroke(p, with: .color(selected ? Theme.emberHi : Self.mutedDrawing), lineWidth: 1)
+        if selected { drawAnchors(ctx, [a, b]) }
+    }
+
+    /// 1px dashed line across the pane + a right-edge price tag (drawn
+    /// unclipped, in the axis gutter). Muted unless selected.
+    private func drawHLine(
+        _ ctx: GraphicsContext, _ clipped: GraphicsContext, _ d: Drawing, selected: Bool
+    ) {
+        guard let point = d.points.first, point.price.isFinite else { return }
+        let y = yPrice(point.price)
+        guard y.isFinite, y > mainRect.minY - 1, y < mainRect.maxY + 1 else { return }
+        let color = selected ? Theme.emberHi : Self.mutedDrawing
+        let yy = y.rounded() + 0.5
+        var p = Path()
+        p.move(to: CGPoint(x: 0, y: yy))
+        p.addLine(to: CGPoint(x: plotWidth, y: yy))
+        clipped.stroke(p, with: .color(color), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+        drawTag(
+            ctx, text: ChartMath.formatPrice(point.price),
+            center: CGPoint(x: axisX + (size.width - axisX) / 2, y: yy),
+            background: Theme.panel, textColor: color
+        )
+    }
+
+    /// Dim 1px level lines between the two anchor timestamps with tiny
+    /// ratio+price labels; the 0 and 1 edges read in bone.
+    private func drawFib(_ ctx: GraphicsContext, _ d: Drawing, selected: Bool) {
+        guard d.points.count >= 2 else { return }
+        let a = d.points[0]
+        let b = d.points[1]
+        let x0 = min(xTs(a.ts_ms), xTs(b.ts_ms))
+        let x1 = max(xTs(a.ts_ms), xTs(b.ts_ms))
+        guard x0.isFinite, x1.isFinite, x1 > x0 else { return }
+        for level in DrawingMath.fibLevels(a: a.price, b: b.price) {
+            let y = yPrice(level.price)
+            guard y.isFinite else { continue }
+            let yy = y.rounded() + 0.5
+            let edge = level.ratio == 0 || level.ratio == 1
+            var p = Path()
+            p.move(to: CGPoint(x: x0, y: yy))
+            p.addLine(to: CGPoint(x: x1, y: yy))
+            let lineColor = selected
+                ? Theme.emberHi.opacity(edge ? 0.9 : 0.6)
+                : Theme.dim.opacity(edge ? 0.7 : 0.45)
+            ctx.stroke(p, with: .color(lineColor), lineWidth: 1)
+            ctx.draw(
+                Text("\(DrawingMath.ratioLabel(level.ratio)) \(ChartMath.formatPrice(level.price))")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(edge ? Theme.bone : Theme.dim),
+                at: CGPoint(x: x0 + 3, y: yy - 6), anchor: .leading
+            )
+        }
+        if selected, let pa = anchorPoint(a), let pb = anchorPoint(b) {
+            drawAnchors(ctx, [pa, pb])
+        }
+    }
+
     private func paneRect(containing y: CGFloat) -> CGRect? {
         let probe = CGPoint(x: 1, y: y)
         if mainRect.contains(probe) { return mainRect }
         if volRect.contains(probe) { return volRect }
         if let r = rsiRect, r.contains(probe) { return r }
+        if let r = macdRect, r.contains(probe) { return r }
         return nil
     }
 
-    private func drawTag(_ ctx: GraphicsContext, text: String, center: CGPoint, background: Color) {
+    private func drawTag(
+        _ ctx: GraphicsContext, text: String, center: CGPoint, background: Color,
+        textColor: Color = Theme.bone
+    ) {
         let resolved = ctx.resolve(
             Text(text)
                 .font(.system(size: 9, weight: .medium, design: .monospaced))
-                .foregroundStyle(Theme.bone)
+                .foregroundStyle(textColor)
         )
         let ts = resolved.measure(in: CGSize(width: 220, height: 20))
         var rect = CGRect(

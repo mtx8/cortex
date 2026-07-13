@@ -4,12 +4,19 @@
 //! the measured trade statistics. Pure and synchronous: statistics, not
 //! promises — small samples are labeled, never hidden.
 
+use std::collections::BTreeMap;
+
 use cx_core::events::{SimProjection, SimReport, SimTrade, StrategyStats};
 use cx_core::types::Side;
 use cx_core::store::BarStore;
 use cx_core::time::now_ms;
 use cx_core::types::{asset_class_of, AssetClass, Interval};
 use cx_ta::quant;
+
+/// Strategy-keyed tunable overrides, the same shape as
+/// `cx_core::config::Config::strategy_params` and the AUTORESEARCH grid:
+/// strategy name -> { key -> value } (e.g. "meanrev_z" -> { "z_entry": 1.75 }).
+pub type ParamMap = BTreeMap<String, BTreeMap<String, f64>>;
 
 /// Round-trip cost applied to every trade (fees + slippage), as a fraction.
 const COST_PER_TRADE: f64 = 0.001;
@@ -22,6 +29,57 @@ const STRATEGIES: [&str; 4] = ["momentum_x", "meanrev_z", "breakout_d", "kalman_
 const OOS_SPLIT: f64 = 0.7;
 /// OOS expectancy drives `best` only with at least this many OOS trades.
 const OOS_MIN_TRADES: u32 = 10;
+
+/// The tunable rule parameters, with the SAME hard bounds and defaults as
+/// the live strategy runtime (cx-strategy strat.rs `PARAM_BOUNDS` — bus-only
+/// crates cannot import each other; keep the tables in sync). Experiments
+/// replay the SAME rules under variant values; missing/unknown/non-finite
+/// keys fall back to the defaults, everything else is clamped.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RuleParams {
+    /// meanrev_z entry threshold on |zscore_20|; hard bounds [1.5, 3.0].
+    pub meanrev_z_entry: f64,
+    /// kalman_trend entry threshold on |kalman_tstat|; hard bounds [1.5, 3.5].
+    pub kalman_t_entry: f64,
+    /// breakout_d range confirmation (bar range >= this * ATR14); hard
+    /// bounds [0.5, 1.5].
+    pub breakout_min_range_atr: f64,
+}
+
+impl Default for RuleParams {
+    fn default() -> Self {
+        Self {
+            meanrev_z_entry: 2.0,
+            kalman_t_entry: 2.0,
+            breakout_min_range_atr: 0.8,
+        }
+    }
+}
+
+impl RuleParams {
+    /// Resolve a params map: known keys clamped to the hard bounds, unknown
+    /// keys ignored, missing or non-finite values default.
+    pub fn from_map(params: &ParamMap) -> Self {
+        let get = |strategy: &str, key: &str| {
+            params
+                .get(strategy)
+                .and_then(|m| m.get(key))
+                .copied()
+                .filter(|v| v.is_finite())
+        };
+        let mut rp = Self::default();
+        if let Some(v) = get("meanrev_z", "z_entry") {
+            rp.meanrev_z_entry = v.clamp(1.5, 3.0);
+        }
+        if let Some(v) = get("kalman_trend", "t_entry") {
+            rp.kalman_t_entry = v.clamp(1.5, 3.5);
+        }
+        if let Some(v) = get("breakout_d", "min_range_atr") {
+            rp.breakout_min_range_atr = v.clamp(0.5, 1.5);
+        }
+        rp
+    }
+}
 
 pub fn empty_report(note: &str) -> SimReport {
     SimReport {
@@ -71,8 +129,18 @@ fn pick_best(stats: &[StrategyStats], oos: &[OosStat]) -> Option<String> {
         .map(|s| format!("{}/{}", s.strategy, s.symbol))
 }
 
-/// Run the full sweep: every strategy x every symbol with enough history.
+/// Run the full sweep: every strategy x every symbol with enough history,
+/// under the default rule parameters (the live strategies' defaults).
 pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
+    run_with_params(store, symbols, &ParamMap::new())
+}
+
+/// [`run`] under a variant recipe: the SAME rules, data, costs and
+/// walk-forward split, with the tunable entry thresholds overridden (clamped
+/// to the live hard bounds). An empty map reproduces `run` exactly — this is
+/// the AUTORESEARCH experiment surface.
+pub fn run_with_params(store: &BarStore, symbols: &[String], params: &ParamMap) -> SimReport {
+    let rp = RuleParams::from_map(params);
     let mut stats: Vec<StrategyStats> = Vec::new();
     let mut all_trades: Vec<(String, Vec<f64>)> = Vec::new();
     let mut trade_log: Vec<SimTrade> = Vec::new();
@@ -92,7 +160,7 @@ pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
         let split_idx = ((bars.len() as f64 * OOS_SPLIT) as usize).min(bars.len() - 1);
         let split_ts = bars[split_idx].ts_open_ms;
         for strat in STRATEGIES {
-            let recs = backtest(strat, symbol, &bars);
+            let recs = backtest_with(strat, symbol, &bars, rp);
             let rets: Vec<f64> = recs.iter().map(|t| t.ret).collect();
             let oos: Vec<f64> = recs
                 .iter()
@@ -167,13 +235,70 @@ pub fn run(store: &BarStore, symbols: &[String]) -> SimReport {
     }
 }
 
-/// Replay one strategy's rules; returns the full per-trade audit log (net of
-/// cost). Signals evaluate on bar N's features and fill at bar N+1's open —
-/// every timestamp and price below exists in stored market history.
+/// Pooled out-of-sample summary for ONE strategy across the given symbols
+/// under a variant recipe — the AUTORESEARCH ranking metric. Same data, same
+/// costs, same 70/30 walk-forward split and same rules as
+/// [`run_with_params`]; expectancy is the mean net return of OOS trades
+/// (0.0 when there are none — the trade count says whether it means much).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OosSummary {
+    pub trades: u32,
+    pub expectancy: f64,
+}
+
+pub fn evaluate_strategy_params(
+    store: &BarStore,
+    symbols: &[String],
+    strategy: &str,
+    params: &ParamMap,
+) -> OosSummary {
+    let rp = RuleParams::from_map(params);
+    let mut oos: Vec<f64> = Vec::new();
+    for symbol in symbols {
+        let interval = match asset_class_of(symbol) {
+            AssetClass::Crypto => Interval::M1,
+            _ => Interval::D1,
+        };
+        let bars = store.recent(symbol, interval, 1_200);
+        if bars.len() < WARMUP + 20 {
+            continue;
+        }
+        let split_idx = ((bars.len() as f64 * OOS_SPLIT) as usize).min(bars.len() - 1);
+        let split_ts = bars[split_idx].ts_open_ms;
+        for t in backtest_with(strategy, symbol, &bars, rp) {
+            if t.entry_ts >= split_ts && t.ret.is_finite() {
+                oos.push(t.ret);
+            }
+        }
+    }
+    OosSummary {
+        trades: oos.len() as u32,
+        expectancy: if oos.is_empty() {
+            0.0
+        } else {
+            oos.iter().sum::<f64>() / oos.len() as f64
+        },
+    }
+}
+
+/// Replay one strategy's rules under the default parameters.
+#[cfg(test)]
 pub(crate) fn backtest(
     strategy: &str,
     symbol: &str,
     bars: &[cx_core::events::Bar],
+) -> Vec<SimTrade> {
+    backtest_with(strategy, symbol, bars, RuleParams::default())
+}
+
+/// Replay one strategy's rules; returns the full per-trade audit log (net of
+/// cost). Signals evaluate on bar N's features and fill at bar N+1's open —
+/// every timestamp and price below exists in stored market history.
+pub(crate) fn backtest_with(
+    strategy: &str,
+    symbol: &str,
+    bars: &[cx_core::events::Bar],
+    rp: RuleParams,
 ) -> Vec<SimTrade> {
     let mut trades: Vec<SimTrade> = Vec::new();
     let mut pos: i8 = 0; // -1 short, 0 flat, 1 long
@@ -204,7 +329,7 @@ pub(crate) fn backtest(
         if !(next.open.is_finite() && next.open > 0.0) {
             continue;
         }
-        let (want, exit_now) = decide(strategy, &feats, window, pos);
+        let (want, exit_now) = decide(strategy, &feats, window, pos, rp);
 
         if pos != 0 && (exit_now || (want != 0 && want != pos)) {
             close_at(pos, entry_px, entry_ts, next.open, next.ts_open_ms, &mut trades);
@@ -226,12 +351,15 @@ pub(crate) fn backtest(
 }
 
 /// The strategy rules, mirroring cx-strategy's live logic in pure form.
-/// Returns (desired position, exit-now flag).
+/// Entry thresholds come from [`RuleParams`] (defaults = the live defaults,
+/// variants clamped to the live hard bounds). Returns (desired position,
+/// exit-now flag).
 fn decide(
     strategy: &str,
     feats: &std::collections::BTreeMap<String, f64>,
     window: &[cx_core::events::Bar],
     pos: i8,
+    rp: RuleParams,
 ) -> (i8, bool) {
     let g = |k: &str| feats.get(k).copied().unwrap_or(f64::NAN);
     match strategy {
@@ -255,9 +383,9 @@ fn decide(
             if !z.is_finite() {
                 return (0, pos != 0);
             }
-            let want = if z <= -2.0 {
+            let want = if z <= -rp.meanrev_z_entry {
                 1
-            } else if z >= 2.0 {
+            } else if z >= rp.meanrev_z_entry {
                 -1
             } else {
                 0
@@ -272,14 +400,23 @@ fn decide(
             let prior = cx_ta::compute_features(&window[..window.len() - 1]);
             let hi = prior.get("donchian_hi").copied().unwrap_or(f64::NAN);
             let lo = prior.get("donchian_lo").copied().unwrap_or(f64::NAN);
-            let close = window.last().map(|b| b.close).unwrap_or(f64::NAN);
+            let last = &window[window.len() - 1];
+            let close = last.close;
             let mid = g("bb_mid");
             if !(hi.is_finite() && lo.is_finite() && close.is_finite()) {
                 return (0, pos != 0);
             }
-            let want = if close > hi {
+            // Range confirmation, same as the live rule: the breakout bar's
+            // range must be at least min_range_atr * ATR(14).
+            let atr = g("atr_14");
+            let range = last.high - last.low;
+            let confirmed = atr.is_finite()
+                && atr > 0.0
+                && range.is_finite()
+                && range >= rp.breakout_min_range_atr * atr;
+            let want = if confirmed && close > hi {
                 1
-            } else if close < lo {
+            } else if confirmed && close < lo {
                 -1
             } else {
                 0
@@ -305,7 +442,7 @@ fn decide(
             if !(slope.is_finite() && tstat.is_finite() && brk.is_finite()) {
                 return (0, pos != 0);
             }
-            let want = if tstat.abs() >= 2.0 && brk > 10.0 {
+            let want = if tstat.abs() >= rp.kalman_t_entry && brk > 10.0 {
                 if slope > 0.0 {
                     1
                 } else if slope < 0.0 {
@@ -663,5 +800,181 @@ mod tests {
         let report = run(&store, &["BTC-USD".into()]);
         assert!(report.stats.is_empty());
         assert!(report.best.is_none());
+    }
+
+    /// Calm two-tick chop, then one range-confirmed upside donchian break
+    /// whose bar range is ~1.2 ATR — inside the (0.8, 1.5) tunable window,
+    /// so the default gate admits it and the tightest gate rejects it.
+    fn chop_then_confirmed_break() -> Vec<Bar> {
+        let mut bars = Vec::with_capacity(120);
+        let mk = |i: usize, open: f64, high: f64, low: f64, close: f64| Bar {
+            symbol: "T".into(),
+            interval: Interval::M1,
+            ts_open_ms: i as i64 * 60_000,
+            open,
+            high,
+            low,
+            close,
+            volume: 1.0,
+            trade_count: 1,
+            vwap: close,
+            complete: true,
+        };
+        for i in 0..100 {
+            let c = 100.0 + if i % 2 == 0 { 0.02 } else { -0.02 };
+            bars.push(mk(i, c, c + 0.05, c - 0.05, c));
+        }
+        // The breakout bar: close 100.10 clears the prior channel high
+        // (~100.07) with range 0.12 vs ATR ~0.10 -> ~1.2 ATR confirmation.
+        bars.push(mk(100, 99.98, 100.10, 99.98, 100.10));
+        for i in 101..120 {
+            let c = 100.10 + if i % 2 == 0 { 0.02 } else { -0.02 };
+            bars.push(mk(i, c, c + 0.05, c - 0.05, c));
+        }
+        bars
+    }
+
+    #[test]
+    fn rule_params_from_map_clamps_and_ignores_junk() {
+        let mut m = ParamMap::new();
+        m.entry("meanrev_z".into())
+            .or_default()
+            .insert("z_entry".into(), 0.1); // below the floor
+        m.entry("meanrev_z".into())
+            .or_default()
+            .insert("junk".into(), 9.0); // unknown key
+        m.entry("kalman_trend".into())
+            .or_default()
+            .insert("t_entry".into(), f64::NAN); // non-finite
+        m.entry("breakout_d".into())
+            .or_default()
+            .insert("min_range_atr".into(), 99.0); // above the cap
+        let rp = RuleParams::from_map(&m);
+        assert_eq!(rp.meanrev_z_entry, 1.5);
+        assert_eq!(rp.kalman_t_entry, 2.0, "NaN must fall back to the default");
+        assert_eq!(rp.breakout_min_range_atr, 1.5);
+        assert_eq!(RuleParams::from_map(&ParamMap::new()), RuleParams::default());
+    }
+
+    #[test]
+    fn entry_thresholds_come_from_params() {
+        let bars = mk_bars(&[100.0, 100.0]);
+        let z_feats: std::collections::BTreeMap<String, f64> =
+            [("zscore_20".to_string(), 1.7)].into_iter().collect();
+        assert_eq!(
+            decide("meanrev_z", &z_feats, &bars, 0, RuleParams::default()).0,
+            0,
+            "z 1.7 must not enter at the 2.0 default"
+        );
+        let rp = RuleParams {
+            meanrev_z_entry: 1.6,
+            ..RuleParams::default()
+        };
+        assert_eq!(
+            decide("meanrev_z", &z_feats, &bars, 0, rp).0,
+            -1,
+            "z 1.7 must fade short once z_entry drops to 1.6"
+        );
+
+        let k_feats: std::collections::BTreeMap<String, f64> = [
+            ("kalman_slope".to_string(), 0.02),
+            ("kalman_tstat".to_string(), 1.8),
+            ("cusum_break".to_string(), 30.0),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(decide("kalman_trend", &k_feats, &bars, 0, RuleParams::default()).0, 0);
+        let rp = RuleParams {
+            kalman_t_entry: 1.5,
+            ..RuleParams::default()
+        };
+        assert_eq!(decide("kalman_trend", &k_feats, &bars, 0, rp).0, 1);
+    }
+
+    #[test]
+    fn breakout_gate_param_changes_trade_count() {
+        let bars = chop_then_confirmed_break();
+        let default_trades = backtest_with("breakout_d", "T", &bars, RuleParams::default());
+        assert!(
+            !default_trades.is_empty(),
+            "a ~1.2-ATR-range break must trade at the 0.8 default gate"
+        );
+        let tight = RuleParams {
+            breakout_min_range_atr: 1.5,
+            ..RuleParams::default()
+        };
+        let none = backtest_with("breakout_d", "T", &bars, tight);
+        assert!(
+            none.is_empty(),
+            "the 1.5 gate must reject the same break: {} trades",
+            none.len()
+        );
+    }
+
+    #[test]
+    fn run_with_params_variant_changes_trade_count() {
+        let store = BarStore::new();
+        for bar in chop_then_confirmed_break() {
+            store.push(Bar {
+                symbol: "BTC-USD".into(),
+                ..bar
+            });
+        }
+        let symbols = vec!["BTC-USD".to_string()];
+        let count = |r: &SimReport| {
+            r.stats
+                .iter()
+                .find(|s| s.strategy == "breakout_d")
+                .map(|s| s.trades)
+                .unwrap_or(0)
+        };
+        // Empty overrides reproduce run() exactly (same rules, same counts).
+        let base = run(&store, &symbols);
+        let same = run_with_params(&store, &symbols, &ParamMap::new());
+        let rows = |r: &SimReport| {
+            r.stats
+                .iter()
+                .map(|s| (s.strategy.clone(), s.symbol.clone(), s.trades))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(&base), rows(&same));
+        assert!(count(&base) > 0);
+        // A variant recipe replays the SAME rules with a different gate and
+        // the trade count moves.
+        let mut params = ParamMap::new();
+        params
+            .entry("breakout_d".into())
+            .or_default()
+            .insert("min_range_atr".into(), 1.5);
+        let variant = run_with_params(&store, &symbols, &params);
+        assert_eq!(count(&variant), 0, "tight gate must remove the breakout trades");
+    }
+
+    #[test]
+    fn evaluate_strategy_params_pools_oos_trades() {
+        let store = BarStore::new();
+        for bar in chop_then_confirmed_break() {
+            store.push(Bar {
+                symbol: "BTC-USD".into(),
+                ..bar
+            });
+        }
+        let symbols = vec!["BTC-USD".to_string()];
+        // The breakout entry lands in the last 30% of bars, so it is OOS.
+        let base = evaluate_strategy_params(&store, &symbols, "breakout_d", &ParamMap::new());
+        assert!(base.trades >= 1, "expected OOS breakout trades, got {}", base.trades);
+        assert!(base.expectancy.is_finite());
+        let mut params = ParamMap::new();
+        params
+            .entry("breakout_d".into())
+            .or_default()
+            .insert("min_range_atr".into(), 1.5);
+        let tight = evaluate_strategy_params(&store, &symbols, "breakout_d", &params);
+        assert_eq!(tight.trades, 0);
+        assert_eq!(tight.expectancy, 0.0);
+        // No history at all: a zeroed, finite summary — never NaN.
+        let empty = BarStore::new();
+        let none = evaluate_strategy_params(&empty, &symbols, "breakout_d", &ParamMap::new());
+        assert_eq!(none, OosSummary { trades: 0, expectancy: 0.0 });
     }
 }

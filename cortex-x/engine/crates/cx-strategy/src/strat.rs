@@ -26,22 +26,155 @@ const WARMUP_BARS: usize = 300;
 const CONVICTION_DELTA: f64 = 0.15;
 /// Conviction carried by a flat (no-edge) opinion.
 const FLAT_CONVICTION: f64 = 0.3;
-/// meanrev_z opens a fade at this |zscore_20| ...
+/// meanrev_z opens a fade at this |zscore_20| (default; tunable, see
+/// [`PARAM_BOUNDS`]) ...
 const MEANREV_ENTRY_Z: f64 = 2.0;
 /// ... and returns to flat once |zscore_20| decays back inside this band.
 const MEANREV_EXIT_Z: f64 = 0.5;
-/// breakout_d requires bar range >= this fraction of ATR to confirm.
+/// breakout_d requires bar range >= this fraction of ATR to confirm
+/// (default; tunable, see [`PARAM_BOUNDS`]).
 const BREAKOUT_RANGE_ATR: f64 = 0.8;
 /// breakout_d decays to flat after this many bars without a new breakout.
 const BREAKOUT_DECAY_BARS: u32 = 30;
-/// kalman_trend enters at |kalman_tstat| >= this ...
+/// kalman_trend enters at |kalman_tstat| >= this (default; tunable, see
+/// [`PARAM_BOUNDS`]) ...
 const KALMAN_ENTRY_T: f64 = 2.0;
-/// ... maps |t| in [2, 4] onto conviction [0.35, 0.9] ...
+/// ... maps |t| in [entry, 4] onto conviction [0.35, 0.9] ...
 const KALMAN_FULL_T: f64 = 4.0;
 /// ... requires cusum_break > this (no change-point in the last 10 bars) ...
 const KALMAN_QUIET_BARS: f64 = 10.0;
 /// ... and exits on a FRESH change-point (cusum_break <= this).
 const KALMAN_FRESH_BREAK: f64 = 2.0;
+/// Every published built-in signal carries the bar's detected regime in its
+/// features map under this key. Encoding (the contract fusion's
+/// regime-conditional multipliers bucket on): 0 TrendingUp, 1 TrendingDown,
+/// 2 Ranging, 3 HighVol.
+const REGIME_CODE_FEATURE: &str = "regime_code";
+
+// ---- tunable parameters (COMPILED-IN HARD BOUNDS) ---------------------------
+
+/// One runtime-tunable strategy parameter with compiled-in hard bounds. The
+/// AUTORESEARCH loop (via `EngineEvent::ParamUpdate`) and the config hook
+/// `cfg.strategy_params` can move values, but never outside these rails:
+/// out-of-bounds requests are clamped, non-finite requests are dropped,
+/// unknown keys are ignored. Momentum's conviction weights are deliberately
+/// NOT tunable in v1. cx-sim (`RuleParams`) and cx-agents::autoresearch
+/// (`TUNABLES`) carry mirrors of this table — bus-only crates cannot import
+/// each other; keep the three in sync. This table wins on application: even
+/// a drifted mirror can never push a live parameter out of bounds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParamBound {
+    pub strategy: &'static str,
+    pub key: &'static str,
+    pub min: f64,
+    pub max: f64,
+    pub default: f64,
+}
+
+pub(crate) const PARAM_BOUNDS: [ParamBound; 3] = [
+    ParamBound {
+        strategy: "meanrev_z",
+        key: "z_entry",
+        min: 1.5,
+        max: 3.0,
+        default: MEANREV_ENTRY_Z,
+    },
+    ParamBound {
+        strategy: "kalman_trend",
+        key: "t_entry",
+        min: 1.5,
+        max: 3.5,
+        default: KALMAN_ENTRY_T,
+    },
+    ParamBound {
+        strategy: "breakout_d",
+        key: "min_range_atr",
+        min: 0.5,
+        max: 1.5,
+        default: BREAKOUT_RANGE_ATR,
+    },
+];
+
+/// Live values of the tunables. One copy lives in [`Shared`]; the runtime
+/// reads a snapshot once per bar, so an update applies atomically between
+/// bars and never mid-evaluation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct StratParams {
+    pub meanrev_z_entry: f64,
+    pub kalman_t_entry: f64,
+    pub breakout_min_range_atr: f64,
+}
+
+impl Default for StratParams {
+    fn default() -> Self {
+        Self {
+            meanrev_z_entry: default_of("meanrev_z", "z_entry", MEANREV_ENTRY_Z),
+            kalman_t_entry: default_of("kalman_trend", "t_entry", KALMAN_ENTRY_T),
+            breakout_min_range_atr: default_of(
+                "breakout_d",
+                "min_range_atr",
+                BREAKOUT_RANGE_ATR,
+            ),
+        }
+    }
+}
+
+/// The bounds table's default for one tunable; the fallback covers the
+/// impossible miss so this can never panic.
+fn default_of(strategy: &str, key: &str, fallback: f64) -> f64 {
+    PARAM_BOUNDS
+        .iter()
+        .find(|b| b.strategy == strategy && b.key == key)
+        .map(|b| b.default)
+        .unwrap_or(fallback)
+}
+
+/// Clamp a requested tunable to its hard bounds. None for unknown
+/// (strategy, key) pairs or non-finite values — such requests are NEVER
+/// applied.
+pub(crate) fn clamp_param(strategy: &str, key: &str, value: f64) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+    PARAM_BOUNDS
+        .iter()
+        .find(|b| b.strategy == strategy && b.key == key)
+        .map(|b| value.clamp(b.min, b.max))
+}
+
+/// Apply one strategy's requested params into the shared live values,
+/// clamped to [`PARAM_BOUNDS`]. Every applied value is logged alongside the
+/// requested one (auditability); unknown keys and non-finite values only
+/// warn. Used by both the config seed and bus `ParamUpdate` events.
+pub(crate) fn apply_params(
+    shared: &Shared,
+    strategy: &str,
+    params: &BTreeMap<String, f64>,
+    source: &str,
+) {
+    for (key, &requested) in params {
+        let Some(applied) = clamp_param(strategy, key, requested) else {
+            tracing::warn!(
+                strategy,
+                key,
+                requested,
+                source,
+                "ignoring unknown or non-finite strategy param"
+            );
+            continue;
+        };
+        {
+            let mut live = shared.lock_params();
+            match (strategy, key.as_str()) {
+                ("meanrev_z", "z_entry") => live.meanrev_z_entry = applied,
+                ("kalman_trend", "t_entry") => live.kalman_t_entry = applied,
+                ("breakout_d", "min_range_atr") => live.breakout_min_range_atr = applied,
+                _ => continue, // unreachable: clamp_param only admits known pairs
+            }
+        }
+        tracing::info!(strategy, key, requested, applied, source, "strategy param applied");
+    }
+}
 
 /// A strategy's opinion for one symbol on one bar.
 #[derive(Debug, Clone)]
@@ -135,15 +268,20 @@ pub(crate) async fn run(
 
     loop {
         match rx.recv().await {
-            Ok(ev) => {
-                if let EngineEvent::Bar(bar) = ev.as_ref() {
-                    if bar.complete && bar.interval == Interval::M1 {
-                        if let Some(st) = states.get_mut(&bar.symbol) {
-                            on_bar(&bus, &shared, st, bar);
-                        }
+            Ok(ev) => match ev.as_ref() {
+                EngineEvent::Bar(bar) if bar.complete && bar.interval == Interval::M1 => {
+                    if let Some(st) = states.get_mut(&bar.symbol) {
+                        on_bar(&bus, &shared, st, bar);
                     }
                 }
-            }
+                // Tunable recipe updates (AUTORESEARCH adoption rides the
+                // bus): applied atomically, clamped to PARAM_BOUNDS —
+                // out-of-bounds values can never reach a live strategy.
+                EngineEvent::ParamUpdate(p) => {
+                    apply_params(&shared, &p.strategy, &p.params, &p.source);
+                }
+                _ => {}
+            },
             Err(RecvError::Lagged(n)) => {
                 tracing::warn!(lagged = n, "strategy runtime lagged on bus");
             }
@@ -180,13 +318,24 @@ fn on_bar(bus: &Bus, shared: &Shared, st: &mut SymState, bar: &Bar) {
     let feats = compute_features(&st.window);
     let (regime, regime_conf) = detect_regime_with(&feats, &st.window);
 
+    let code = regime_code(regime);
+    // Snapshot the tunables once per bar: an update applies between bars,
+    // never mid-evaluation.
+    let params = *shared.lock_params();
+
     let opinions = [
         eval_momentum(&feats, regime, regime_conf),
-        eval_meanrev(&feats, regime, &mut st.meanrev_open),
-        eval_breakout(bar, st.prev_feats.as_ref(), &feats, &mut st.breakout),
-        eval_kalman(&feats, &mut st.kalman_open),
+        eval_meanrev(&feats, regime, &mut st.meanrev_open, params.meanrev_z_entry),
+        eval_breakout(
+            bar,
+            st.prev_feats.as_ref(),
+            &feats,
+            &mut st.breakout,
+            params.breakout_min_range_atr,
+        ),
+        eval_kalman(&feats, &mut st.kalman_open, params.kalman_t_entry),
     ];
-    for (idx, opinion) in opinions.into_iter().enumerate() {
+    for (idx, mut opinion) in opinions.into_iter().enumerate() {
         if !shared.is_enabled(idx) {
             // Disabled: emit nothing; forget the last publication so a
             // re-enable re-baselines against flat; reset internal state.
@@ -199,9 +348,25 @@ fn on_bar(bus: &Bus, shared: &Shared, st: &mut SymState, bar: &Bar) {
             }
             continue;
         }
+        // Stamp the bar's regime on every emitted signal so fusion can
+        // bucket its regime-conditional multipliers.
+        opinion
+            .features
+            .insert(REGIME_CODE_FEATURE.to_string(), code);
         publish_if_material(bus, idx, &bar.symbol, opinion, &mut st.last_pub[idx]);
     }
     st.prev_feats = Some(feats);
+}
+
+/// Encode a [`Regime`] into the wire feature value (the contract lives at
+/// [`REGIME_CODE_FEATURE`]).
+fn regime_code(regime: Regime) -> f64 {
+    match regime {
+        Regime::TrendingUp => 0.0,
+        Regime::TrendingDown => 1.0,
+        Regime::Ranging => 2.0,
+        Regime::HighVol => 3.0,
+    }
 }
 
 /// Publish the opinion only on a material change: direction sign flip or
@@ -290,9 +455,15 @@ fn eval_momentum(feats: &BTreeMap<String, f64>, regime: Regime, regime_conf: f64
 }
 
 /// "meanrev_z": range fade. Only in Ranging regimes; opens against
-/// |zscore_20| >= 2.0, flips if the extreme reverses, and exits once
-/// |zscore_20| <= 0.5. Conviction maps |z| in [2, 3.5] to [0.35, 0.8].
-fn eval_meanrev(feats: &BTreeMap<String, f64>, regime: Regime, open: &mut i8) -> Opinion {
+/// |zscore_20| >= `z_entry` (tunable, default 2.0, hard bounds [1.5, 3.0]),
+/// flips if the extreme reverses, and exits once |zscore_20| <= 0.5.
+/// Conviction maps |z| in [z_entry, z_entry + 1.5] to [0.35, 0.8].
+fn eval_meanrev(
+    feats: &BTreeMap<String, f64>,
+    regime: Regime,
+    open: &mut i8,
+    z_entry: f64,
+) -> Opinion {
     if regime != Regime::Ranging {
         *open = 0;
         return Opinion::flat("meanrev: regime not ranging");
@@ -301,7 +472,7 @@ fn eval_meanrev(feats: &BTreeMap<String, f64>, regime: Regime, open: &mut i8) ->
         *open = 0;
         return Opinion::flat("meanrev: zscore not warm");
     };
-    if z.abs() >= MEANREV_ENTRY_Z {
+    if z.abs() >= z_entry {
         *open = -sgn(z); // fade the extreme (flips if the extreme reverses)
     } else if z.abs() <= MEANREV_EXIT_Z {
         *open = 0;
@@ -309,7 +480,7 @@ fn eval_meanrev(feats: &BTreeMap<String, f64>, regime: Regime, open: &mut i8) ->
     if *open == 0 {
         return Opinion::flat("meanrev: z inside band, no fade open");
     }
-    let conviction = (0.35 + (z.abs() - MEANREV_ENTRY_Z) / 1.5 * 0.45).clamp(0.35, 0.8);
+    let conviction = (0.35 + (z.abs() - z_entry) / 1.5 * 0.45).clamp(0.35, 0.8);
     let mut features = BTreeMap::new();
     features.insert("zscore_20".to_string(), z);
     for key in ["rsi_14", "bb_width"] {
@@ -329,7 +500,8 @@ fn eval_meanrev(feats: &BTreeMap<String, f64>, regime: Regime, open: &mut i8) ->
 }
 
 /// "breakout_d": donchian channel break. The live close must clear the
-/// PRIOR bar's channel with range confirmation (bar range >= 0.8 * ATR).
+/// PRIOR bar's channel with range confirmation (bar range >=
+/// `min_range_atr` * ATR; tunable, default 0.8, hard bounds [0.5, 1.5]).
 /// Conviction maps breakout distance in ATRs into [0.35, 0.9]. The opinion
 /// decays flat after 30 bars without a fresh breakout, or when the close
 /// crosses back through the channel mid.
@@ -338,6 +510,7 @@ fn eval_breakout(
     prev: Option<&BTreeMap<String, f64>>,
     cur: &BTreeMap<String, f64>,
     st: &mut BreakoutState,
+    min_range_atr: f64,
 ) -> Opinion {
     let atr = cur
         .get("atr_14")
@@ -349,7 +522,7 @@ fn eval_breakout(
     let mut fresh = 0i8;
     if let (Some(atr), Some(hi), Some(lo)) = (atr, prior_hi, prior_lo) {
         let range = bar.high - bar.low;
-        if range.is_finite() && range >= BREAKOUT_RANGE_ATR * atr {
+        if range.is_finite() && range >= min_range_atr * atr {
             let (side, dist) = if bar.close > hi {
                 (1, bar.close - hi)
             } else if bar.close < lo {
@@ -411,13 +584,15 @@ fn eval_breakout(
 }
 
 /// "kalman_trend": statistical trend rider. Enters when the Kalman slope
-/// t-stat clears |t| >= 2.0 AND the CUSUM detector has been quiet for more
-/// than 10 bars (no fresh change-point); direction = sign(kalman_slope).
-/// Conviction maps |t| in [2, 4] onto [0.35, 0.9]. Exits (flat) when the
-/// t-stat sign flips against the held direction, or on a fresh change-point
-/// (cusum_break <= 2). The three inputs come from cx-ta's compute_features
-/// and only appear once the estimators are warm.
-fn eval_kalman(feats: &BTreeMap<String, f64>, open: &mut i8) -> Opinion {
+/// t-stat clears |t| >= `t_entry` (tunable, default 2.0, hard bounds
+/// [1.5, 3.5]) AND the CUSUM detector has been quiet for more than 10 bars
+/// (no fresh change-point); direction = sign(kalman_slope). Conviction maps
+/// |t| in [t_entry, 4] onto [0.35, 0.9] (span floored so the map stays
+/// finite at the upper bound). Exits (flat) when the t-stat sign flips
+/// against the held direction, or on a fresh change-point (cusum_break
+/// <= 2). The three inputs come from cx-ta's compute_features and only
+/// appear once the estimators are warm.
+fn eval_kalman(feats: &BTreeMap<String, f64>, open: &mut i8, t_entry: f64) -> Opinion {
     let (Some(&slope), Some(&tstat), Some(&brk)) = (
         feats.get("kalman_slope"),
         feats.get("kalman_tstat"),
@@ -437,14 +612,14 @@ fn eval_kalman(feats: &BTreeMap<String, f64>, open: &mut i8) -> Opinion {
             });
         }
     }
-    if *open == 0 && tstat.abs() >= KALMAN_ENTRY_T && brk > KALMAN_QUIET_BARS {
+    if *open == 0 && tstat.abs() >= t_entry && brk > KALMAN_QUIET_BARS {
         *open = sgn(slope);
     }
     if *open == 0 {
         return Opinion::flat("kalman: no significant trend");
     }
     let conviction = (0.35
-        + (tstat.abs() - KALMAN_ENTRY_T) / (KALMAN_FULL_T - KALMAN_ENTRY_T) * 0.55)
+        + (tstat.abs() - t_entry) / (KALMAN_FULL_T - t_entry).max(0.5) * 0.55)
         .clamp(0.35, 0.9);
     let mut features = BTreeMap::new();
     features.insert("kalman_slope".to_string(), slope);
@@ -528,22 +703,22 @@ mod tests {
     fn meanrev_opens_fades_and_exits() {
         let mut open = 0i8;
         // Below entry threshold: stays flat.
-        let op = eval_meanrev(&feats(&[("zscore_20", 1.5)]), Regime::Ranging, &mut open);
+        let op = eval_meanrev(&feats(&[("zscore_20", 1.5)]), Regime::Ranging, &mut open, MEANREV_ENTRY_Z);
         assert_eq!(sgn(op.direction), 0);
         // Extreme high z -> fade short.
-        let op = eval_meanrev(&feats(&[("zscore_20", 2.6)]), Regime::Ranging, &mut open);
+        let op = eval_meanrev(&feats(&[("zscore_20", 2.6)]), Regime::Ranging, &mut open, MEANREV_ENTRY_Z);
         assert_eq!(sgn(op.direction), -1);
         assert!((0.35..=0.8).contains(&op.conviction));
         // Holding inside the band keeps the fade at floor conviction.
-        let op = eval_meanrev(&feats(&[("zscore_20", 1.0)]), Regime::Ranging, &mut open);
+        let op = eval_meanrev(&feats(&[("zscore_20", 1.0)]), Regime::Ranging, &mut open, MEANREV_ENTRY_Z);
         assert_eq!(sgn(op.direction), -1);
         assert!((op.conviction - 0.35).abs() < 1e-12);
         // Decay to |z| <= 0.5 closes the fade.
-        let op = eval_meanrev(&feats(&[("zscore_20", 0.3)]), Regime::Ranging, &mut open);
+        let op = eval_meanrev(&feats(&[("zscore_20", 0.3)]), Regime::Ranging, &mut open, MEANREV_ENTRY_Z);
         assert_eq!(sgn(op.direction), 0);
         // Non-ranging regime force-closes.
         open = 1;
-        let op = eval_meanrev(&feats(&[("zscore_20", 3.0)]), Regime::TrendingUp, &mut open);
+        let op = eval_meanrev(&feats(&[("zscore_20", 3.0)]), Regime::TrendingUp, &mut open, MEANREV_ENTRY_Z);
         assert_eq!(sgn(op.direction), 0);
         assert_eq!(open, 0);
     }
@@ -551,9 +726,9 @@ mod tests {
     #[test]
     fn meanrev_conviction_scales_with_z() {
         let mut open = 0i8;
-        let low = eval_meanrev(&feats(&[("zscore_20", -2.0)]), Regime::Ranging, &mut open);
+        let low = eval_meanrev(&feats(&[("zscore_20", -2.0)]), Regime::Ranging, &mut open, MEANREV_ENTRY_Z);
         open = 0;
-        let high = eval_meanrev(&feats(&[("zscore_20", -3.5)]), Regime::Ranging, &mut open);
+        let high = eval_meanrev(&feats(&[("zscore_20", -3.5)]), Regime::Ranging, &mut open, MEANREV_ENTRY_Z);
         assert!((low.conviction - 0.35).abs() < 1e-9);
         assert!((high.conviction - 0.8).abs() < 1e-9);
         assert_eq!(sgn(low.direction), 1); // fade a low extreme = buy
@@ -569,14 +744,14 @@ mod tests {
             ("donchian_lo", 100.0),
         ]);
         // Range-confirmed upside break: 102.5 clears prior hi by 1.5 ATR.
-        let op = eval_breakout(&bar(102.5, 102.6, 100.9), Some(&prior), &cur, &mut st);
+        let op = eval_breakout(&bar(102.5, 102.6, 100.9), Some(&prior), &cur, &mut st, BREAKOUT_RANGE_ATR);
         assert_eq!(sgn(op.direction), 1);
         assert!((op.conviction - 0.9).abs() < 1e-12); // clamped at 0.9
         // Holds while the close stays above the current channel mid.
-        let op = eval_breakout(&bar(102.0, 102.1, 101.9), Some(&prior), &cur, &mut st);
+        let op = eval_breakout(&bar(102.0, 102.1, 101.9), Some(&prior), &cur, &mut st, BREAKOUT_RANGE_ATR);
         assert_eq!(sgn(op.direction), 1);
         // Close back through mid (101.25) -> flat.
-        let op = eval_breakout(&bar(100.5, 100.6, 100.4), Some(&prior), &cur, &mut st);
+        let op = eval_breakout(&bar(100.5, 100.6, 100.4), Some(&prior), &cur, &mut st, BREAKOUT_RANGE_ATR);
         assert_eq!(sgn(op.direction), 0);
         assert_eq!(st.active, 0);
     }
@@ -587,7 +762,7 @@ mod tests {
         let prior = feats(&[("donchian_hi", 101.0), ("donchian_lo", 100.0)]);
         let cur = feats(&[("atr_14", 1.0)]);
         // Close clears the channel but the bar range is too small.
-        let op = eval_breakout(&bar(101.5, 101.55, 101.45), Some(&prior), &cur, &mut st);
+        let op = eval_breakout(&bar(101.5, 101.55, 101.45), Some(&prior), &cur, &mut st, BREAKOUT_RANGE_ATR);
         assert_eq!(sgn(op.direction), 0);
     }
 
@@ -603,7 +778,7 @@ mod tests {
         let cur = feats(&[("atr_14", 1.0)]);
         let mut last_dir = 1;
         for _ in 0..BREAKOUT_DECAY_BARS {
-            let op = eval_breakout(&bar(103.0, 103.05, 102.95), Some(&prior), &cur, &mut st);
+            let op = eval_breakout(&bar(103.0, 103.05, 102.95), Some(&prior), &cur, &mut st, BREAKOUT_RANGE_ATR);
             last_dir = sgn(op.direction);
         }
         assert_eq!(last_dir, 0);
@@ -617,7 +792,7 @@ mod tests {
             ("kalman_tstat", 2.5),
             ("cusum_break", 30.0),
         ]);
-        let op = eval_kalman(&f, &mut open);
+        let op = eval_kalman(&f, &mut open, KALMAN_ENTRY_T);
         assert_eq!(sgn(op.direction), 1);
         // |t| = 2.5 maps to 0.35 + 0.5/2 * 0.55 = 0.4875.
         assert!((op.conviction - 0.4875).abs() < 1e-12);
@@ -630,7 +805,7 @@ mod tests {
             ("kalman_tstat", -3.0),
             ("cusum_break", 20.0),
         ]);
-        let op = eval_kalman(&f, &mut open);
+        let op = eval_kalman(&f, &mut open, KALMAN_ENTRY_T);
         assert_eq!(sgn(op.direction), -1);
     }
 
@@ -643,7 +818,7 @@ mod tests {
                 ("kalman_tstat", t),
                 ("cusum_break", 30.0),
             ]);
-            eval_kalman(&f, &mut open).conviction
+            eval_kalman(&f, &mut open, KALMAN_ENTRY_T).conviction
         };
         assert!((entry(2.0) - 0.35).abs() < 1e-12);
         assert!((entry(4.0) - 0.9).abs() < 1e-12);
@@ -659,14 +834,14 @@ mod tests {
             ("kalman_tstat", 1.5),
             ("cusum_break", 30.0),
         ]);
-        assert_eq!(sgn(eval_kalman(&f, &mut open).direction), 0);
+        assert_eq!(sgn(eval_kalman(&f, &mut open, KALMAN_ENTRY_T).direction), 0);
         // Strong t but a change-point within the last 10 bars -> flat.
         let f = feats(&[
             ("kalman_slope", 0.02),
             ("kalman_tstat", 3.0),
             ("cusum_break", 8.0),
         ]);
-        assert_eq!(sgn(eval_kalman(&f, &mut open).direction), 0);
+        assert_eq!(sgn(eval_kalman(&f, &mut open, KALMAN_ENTRY_T).direction), 0);
         assert_eq!(open, 0);
     }
 
@@ -679,7 +854,7 @@ mod tests {
             ("kalman_tstat", -0.4),
             ("cusum_break", 30.0),
         ]);
-        let op = eval_kalman(&f, &mut open);
+        let op = eval_kalman(&f, &mut open, KALMAN_ENTRY_T);
         assert_eq!(sgn(op.direction), 0);
         assert_eq!(open, 0);
 
@@ -690,7 +865,7 @@ mod tests {
             ("kalman_tstat", 2.5),
             ("cusum_break", 1.0),
         ]);
-        let op = eval_kalman(&f, &mut open);
+        let op = eval_kalman(&f, &mut open, KALMAN_ENTRY_T);
         assert_eq!(sgn(op.direction), 0);
         assert_eq!(open, 0);
 
@@ -702,7 +877,7 @@ mod tests {
             ("kalman_tstat", 1.2),
             ("cusum_break", 40.0),
         ]);
-        let op = eval_kalman(&f, &mut open);
+        let op = eval_kalman(&f, &mut open, KALMAN_ENTRY_T);
         assert_eq!(sgn(op.direction), 1);
         assert!((op.conviction - 0.35).abs() < 1e-12);
     }
@@ -710,9 +885,190 @@ mod tests {
     #[test]
     fn kalman_flat_and_reset_when_features_not_warm() {
         let mut open = 1i8;
-        let op = eval_kalman(&feats(&[("kalman_slope", 0.02)]), &mut open);
+        let op = eval_kalman(&feats(&[("kalman_slope", 0.02)]), &mut open, KALMAN_ENTRY_T);
         assert_eq!(sgn(op.direction), 0);
         assert_eq!(open, 0, "cold features must reset the held side");
+    }
+
+    #[test]
+    fn param_bounds_defaults_are_inside_bounds_and_match_strat_params() {
+        for b in PARAM_BOUNDS {
+            assert!(
+                (b.min..=b.max).contains(&b.default),
+                "{}.{} default {} outside [{}, {}]",
+                b.strategy,
+                b.key,
+                b.default,
+                b.min,
+                b.max
+            );
+        }
+        let p = StratParams::default();
+        assert_eq!(p.meanrev_z_entry, MEANREV_ENTRY_Z);
+        assert_eq!(p.kalman_t_entry, KALMAN_ENTRY_T);
+        assert_eq!(p.breakout_min_range_atr, BREAKOUT_RANGE_ATR);
+    }
+
+    #[test]
+    fn clamp_param_enforces_hard_bounds_and_rejects_junk() {
+        assert_eq!(clamp_param("meanrev_z", "z_entry", 1.75), Some(1.75));
+        assert_eq!(clamp_param("meanrev_z", "z_entry", 0.5), Some(1.5));
+        assert_eq!(clamp_param("meanrev_z", "z_entry", 99.0), Some(3.0));
+        assert_eq!(clamp_param("kalman_trend", "t_entry", 9.9), Some(3.5));
+        assert_eq!(clamp_param("breakout_d", "min_range_atr", 0.2), Some(0.5));
+        assert_eq!(clamp_param("meanrev_z", "z_entry", f64::NAN), None);
+        assert_eq!(clamp_param("meanrev_z", "z_entry", f64::INFINITY), None);
+        assert_eq!(clamp_param("meanrev_z", "bogus_key", 2.0), None);
+        assert_eq!(clamp_param("momentum_x", "z_entry", 2.0), None, "momentum has no tunables in v1");
+    }
+
+    #[test]
+    fn apply_params_clamps_and_ignores_unknown_keys() {
+        let shared = Shared::new();
+        let kv = |pairs: &[(&str, f64)]| -> BTreeMap<String, f64> {
+            pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        // Below the floor: clamped up, never applied raw.
+        apply_params(&shared, "meanrev_z", &kv(&[("z_entry", 0.5)]), "test");
+        assert_eq!(shared.lock_params().meanrev_z_entry, 1.5);
+        // NaN and unknown keys are dropped without touching live values.
+        apply_params(
+            &shared,
+            "meanrev_z",
+            &kv(&[("z_entry", f64::NAN), ("bogus", 1.0)]),
+            "test",
+        );
+        assert_eq!(shared.lock_params().meanrev_z_entry, 1.5);
+        // Above the cap: clamped down.
+        apply_params(&shared, "kalman_trend", &kv(&[("t_entry", 99.0)]), "test");
+        assert_eq!(shared.lock_params().kalman_t_entry, 3.5);
+        apply_params(&shared, "breakout_d", &kv(&[("min_range_atr", 0.2)]), "test");
+        assert_eq!(shared.lock_params().breakout_min_range_atr, 0.5);
+        // In-bounds value applies exactly.
+        apply_params(&shared, "meanrev_z", &kv(&[("z_entry", 1.6)]), "test");
+        assert_eq!(shared.lock_params().meanrev_z_entry, 1.6);
+        // A strategy without tunables changes nothing.
+        let before = *shared.lock_params();
+        apply_params(&shared, "momentum_x", &kv(&[("anything", 1.0)]), "test");
+        assert_eq!(*shared.lock_params(), before);
+    }
+
+    #[test]
+    fn meanrev_entry_param_changes_behavior() {
+        // Default entry 2.0: |z| = 1.7 stays flat...
+        let mut open = 0i8;
+        let op = eval_meanrev(
+            &feats(&[("zscore_20", 1.7)]),
+            Regime::Ranging,
+            &mut open,
+            MEANREV_ENTRY_Z,
+        );
+        assert_eq!(sgn(op.direction), 0, "z 1.7 must not fire at z_entry 2.0");
+        // ... but with z_entry lowered to 1.6 (in bounds) the same bar opens
+        // a fade against the high extreme.
+        let op = eval_meanrev(
+            &feats(&[("zscore_20", 1.7)]),
+            Regime::Ranging,
+            &mut open,
+            1.6,
+        );
+        assert_eq!(sgn(op.direction), -1, "z 1.7 must fade short at z_entry 1.6");
+        assert!((0.35..=0.8).contains(&op.conviction));
+    }
+
+    #[test]
+    fn breakout_range_param_gates_confirmation() {
+        let prior = feats(&[("donchian_hi", 101.0), ("donchian_lo", 100.0)]);
+        let cur = feats(&[("atr_14", 1.0)]);
+        // Bar range 1.2 ATR: fires at the 0.8 default...
+        let mut st = BreakoutState::default();
+        let op = eval_breakout(&bar(101.9, 102.0, 100.8), Some(&prior), &cur, &mut st, 0.8);
+        assert_eq!(sgn(op.direction), 1);
+        // ... but is rejected once the gate tightens to 1.5.
+        let mut st = BreakoutState::default();
+        let op = eval_breakout(&bar(101.9, 102.0, 100.8), Some(&prior), &cur, &mut st, 1.5);
+        assert_eq!(sgn(op.direction), 0);
+    }
+
+    #[test]
+    fn kalman_entry_param_moves_the_bar_and_conviction_stays_bounded() {
+        let f = feats(&[
+            ("kalman_slope", 0.02),
+            ("kalman_tstat", 1.8),
+            ("cusum_break", 30.0),
+        ]);
+        // t = 1.8 is below the 2.0 default...
+        let mut open = 0i8;
+        assert_eq!(sgn(eval_kalman(&f, &mut open, KALMAN_ENTRY_T).direction), 0);
+        // ... but enters at t_entry 1.5; conviction stays in [0.35, 0.9]
+        // even at the 3.5 upper bound (span floored, never divides by ~0).
+        let mut open = 0i8;
+        let op = eval_kalman(&f, &mut open, 1.5);
+        assert_eq!(sgn(op.direction), 1);
+        assert!((0.35..=0.9).contains(&op.conviction));
+        let f_hot = feats(&[
+            ("kalman_slope", 0.02),
+            ("kalman_tstat", 3.6),
+            ("cusum_break", 30.0),
+        ]);
+        let mut open = 0i8;
+        let op = eval_kalman(&f_hot, &mut open, 3.5);
+        assert_eq!(sgn(op.direction), 1);
+        assert!((0.35..=0.9).contains(&op.conviction), "{}", op.conviction);
+    }
+
+    #[test]
+    fn regime_code_encoding_is_stable() {
+        assert_eq!(regime_code(Regime::TrendingUp), 0.0);
+        assert_eq!(regime_code(Regime::TrendingDown), 1.0);
+        assert_eq!(regime_code(Regime::Ranging), 2.0);
+        assert_eq!(regime_code(Regime::HighVol), 3.0);
+    }
+
+    #[test]
+    fn published_signals_carry_the_regime_code() {
+        let bus = Bus::new(1024);
+        let mut rx = bus.subscribe();
+        let shared = Shared::new();
+        let mut st = SymState::new();
+        // A steady +0.2%-per-bar ramp: breakout (and likely momentum /
+        // kalman) must publish, and every published signal must carry the
+        // bar's regime_code feature.
+        let mut close = 100.0;
+        for i in 0..180_i64 {
+            let open = close;
+            close *= 1.002;
+            let b = Bar {
+                symbol: "TST-USD".into(),
+                interval: Interval::M1,
+                ts_open_ms: i * 60_000,
+                open,
+                high: close,
+                low: open,
+                close,
+                volume: 1.0,
+                trade_count: 1,
+                vwap: close,
+                complete: true,
+            };
+            on_bar(&bus, &shared, &mut st, &b);
+        }
+        let mut signals = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let EngineEvent::Signal(s) = ev.as_ref() {
+                signals += 1;
+                let code = s
+                    .features
+                    .get(REGIME_CODE_FEATURE)
+                    .copied()
+                    .expect("every emitted signal must carry regime_code");
+                assert!(
+                    code.is_finite() && (0.0..=3.0).contains(&code) && code.fract() == 0.0,
+                    "regime_code must be an integer bucket 0..=3: {code}"
+                );
+            }
+        }
+        assert!(signals > 0, "the ramp must publish at least one signal");
     }
 
     #[test]

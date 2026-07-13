@@ -586,6 +586,22 @@ pub struct AiAnswer {
     pub ts_ms: i64,
 }
 
+/// A bounded parameter update for one strategy's tunable recipe, produced by
+/// the AUTORESEARCH loop. Advisory by contract: consumers MUST clamp every
+/// value to their own compiled-in hard bounds before applying — an event on
+/// the bus can suggest a parameter, never force an out-of-bounds one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParamUpdate {
+    pub strategy: String,
+    /// Tunable key -> requested value (e.g. "z_entry" -> 1.75).
+    pub params: BTreeMap<String, f64>,
+    /// Who produced the update (e.g. "autoresearch").
+    pub source: String,
+    /// The written justification — every adoption is auditable.
+    pub rationale: String,
+    pub ts_ms: i64,
+}
+
 /// Everything that can cross the bus. `type`-tagged so the Swift client can
 /// switch on one field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -608,6 +624,7 @@ pub enum EngineEvent {
     OptionsChain(OptionsChain),
     Sim(SimReport),
     AiAnswer(AiAnswer),
+    ParamUpdate(ParamUpdate),
     Company(CompanyProfile),
     RegimeMap(RegimeBoard),
     Geo(GeoPulse),
@@ -647,6 +664,7 @@ impl EngineEvent {
             EngineEvent::OptionsChain(_) => "options_chain",
             EngineEvent::Sim(_) => "sim",
             EngineEvent::AiAnswer(_) => "ai_answer",
+            EngineEvent::ParamUpdate(_) => "param_update",
             EngineEvent::Company(_) => "company",
             EngineEvent::RegimeMap(_) => "regime_map",
             EngineEvent::Geo(_) => "geo",
@@ -659,6 +677,25 @@ impl EngineEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn param_update_is_type_tagged_and_not_critical() {
+        let mut params = BTreeMap::new();
+        params.insert("z_entry".to_string(), 1.75);
+        let ev = EngineEvent::ParamUpdate(ParamUpdate {
+            strategy: "meanrev_z".into(),
+            params,
+            source: "autoresearch".into(),
+            rationale: "OOS expectancy +32% over incumbent".into(),
+            ts_ms: 1,
+        });
+        assert_eq!(ev.kind(), "param_update");
+        assert!(!ev.is_critical(), "param updates must never starve ticks");
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"param_update\""));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
 
     #[test]
     fn event_json_is_type_tagged() {

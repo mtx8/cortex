@@ -18,6 +18,20 @@
 //! first squared return. Live weights are surfaced in every fused signal's
 //! `features` map as `w_<strategy>`.
 //!
+//! Layered on the global Hedge is a REGIME-CONDITIONAL multiplier per
+//! (strategy, regime bucket): built-in signals carry a `regime_code`
+//! feature (0 TrendingUp, 1 TrendingDown, 2 Ranging, 3 HighVol — the
+//! contract lives in strat.rs), and the SAME r_hat that moves a strategy's
+//! global weight also moves its live signal's bucket multiplier with a
+//! slower eta (0.10), clamped into [0.25, 2.0] around the neutral 1.0 — a
+//! tilt, not a distribution, so it is never renormalized. A signal's
+//! effective blend weight is global_w * m[(strategy, its regime_code)];
+//! sources that don't stamp regimes (e.g. "llm-strategist") blend at the
+//! neutral 1.0. The map is finite (strategies x 4 buckets, same admission
+//! bound as the weights) and never evicted. The CURRENT bucket's
+//! multipliers are surfaced as `m_<strategy>` alongside `w_*`, plus a
+//! fused `regime_code` feature naming the bucket.
+//!
 //! Fused conviction is the weighted mean conviction scaled by an agreement
 //! factor (1.0 all signs agree -> 0.4 full disagreement). Contributors older
 //! than 30 minutes drop out entirely.
@@ -56,6 +70,16 @@ const WEIGHT_FLOOR: f64 = 0.15;
 const WEIGHT_CAP: f64 = 3.0;
 /// EWMA decay of the per-symbol return-variance estimate (RiskMetrics).
 const VOL_LAMBDA: f64 = 0.94;
+/// Regime-conditional multiplier learning rate — slower than the global
+/// Hedge, so the per-regime tilt trails the headline weight.
+const REGIME_ETA: f64 = 0.10;
+/// No regime multiplier ever tilts below this ...
+const REGIME_MULT_FLOOR: f64 = 0.25;
+/// ... or above this, around the neutral 1.0.
+const REGIME_MULT_CAP: f64 = 2.0;
+/// Regime buckets carried by `regime_code` (see strat.rs: 0 TrendingUp,
+/// 1 TrendingDown, 2 Ranging, 3 HighVol).
+const REGIME_BUCKETS: usize = 4;
 
 /// One remembered contributor opinion (already validated finite).
 #[derive(Debug, Clone)]
@@ -63,6 +87,10 @@ struct Contribution {
     direction: f64,
     conviction: f64,
     ts_ms: i64,
+    /// Regime bucket (0..=3) the signal was formed in, decoded from its
+    /// `regime_code` feature; None when the source doesn't stamp regimes
+    /// (e.g. "llm-strategist") — such signals blend at the neutral 1.0.
+    regime: Option<usize>,
 }
 
 /// Per-symbol EWMA state backing the Hedge vol normalizer.
@@ -86,6 +114,11 @@ pub(crate) struct FusionBook {
     /// Per-symbol return/vol state; keyed only by configured symbols (the
     /// bar path filters), so bounded.
     vol: HashMap<String, VolState>,
+    /// Regime-conditional multipliers per strategy, indexed by regime
+    /// bucket (0 TrendingUp, 1 TrendingDown, 2 Ranging, 3 HighVol).
+    /// Neutral 1.0 until scored; bounded to [`MAX_ENTRIES`] strategies x
+    /// [`REGIME_BUCKETS`] buckets and never evicted — the map is finite.
+    multipliers: HashMap<String, [f64; REGIME_BUCKETS]>,
 }
 
 impl FusionBook {
@@ -104,6 +137,27 @@ impl FusionBook {
             .get(name)
             .copied()
             .unwrap_or_else(|| initial_weight(name))
+    }
+
+    /// The regime-conditional multiplier for (strategy, bucket); neutral
+    /// 1.0 until the pair has been scored.
+    fn multiplier_of(&self, name: &str, bucket: usize) -> f64 {
+        self.multipliers
+            .get(name)
+            .map(|row| row[bucket.min(REGIME_BUCKETS - 1)])
+            .unwrap_or(1.0)
+    }
+}
+
+/// Decode a signal's `regime_code` feature into a bucket index (0..=3).
+/// Anything missing, non-finite, fractional, or out of range reads as None
+/// — the signal then blends and learns at the neutral multiplier.
+fn regime_bucket(features: &BTreeMap<String, f64>) -> Option<usize> {
+    let v = *features.get("regime_code")?;
+    if v.is_finite() && (0.0..=3.0).contains(&v) && v.fract() == 0.0 {
+        Some(v as usize)
+    } else {
+        None
     }
 }
 
@@ -185,6 +239,7 @@ fn on_signal(shared: &Shared, sig: &StrategySignal) {
             direction: sig.direction.clamp(-1.0, 1.0),
             conviction: sig.conviction.clamp(0.0, 1.0),
             ts_ms: sig.ts_ms,
+            regime: regime_bucket(&sig.features),
         },
     );
 }
@@ -248,18 +303,34 @@ fn hedge_on_bar(shared: &Shared, bar: &Bar) {
 
     // --- multiplicative update for active contributors ----------------
     let now = now_ms();
-    let scored: Vec<(String, f64)> = book
+    let scored: Vec<(String, f64, Option<usize>)> = book
         .latest
         .iter()
         .filter(|((_, sym), c)| {
             sym == &bar.symbol && now.saturating_sub(c.ts_ms) <= MAX_AGE_MS
         })
-        .map(|((strat, _), c)| (strat.clone(), c.direction))
+        .map(|((strat, _), c)| (strat.clone(), c.direction, c.regime))
         .collect();
     if scored.is_empty() {
         return;
     }
-    for (strat, direction) in scored {
+    for (strat, direction, bucket) in scored {
+        // Regime-conditional layer: the SAME r_hat, slower eta, clamped
+        // around the neutral 1.0 — only signals that carried a regime
+        // bucket learn, and only their own bucket moves.
+        if let Some(bucket) = bucket {
+            let m = book.multiplier_of(&strat, bucket)
+                * (REGIME_ETA * direction * r_hat).exp();
+            if m.is_finite()
+                && (book.multipliers.contains_key(&strat)
+                    || book.multipliers.len() < MAX_ENTRIES)
+            {
+                book.multipliers
+                    .entry(strat.clone())
+                    .or_insert([1.0; REGIME_BUCKETS])[bucket] =
+                    m.clamp(REGIME_MULT_FLOOR, REGIME_MULT_CAP);
+            }
+        }
         let factor = (HEDGE_ETA * direction * r_hat).exp();
         let w = book.weight_of(&strat) * factor;
         if !w.is_finite() {
@@ -294,14 +365,20 @@ fn fuse_and_publish(bus: &Bus, shared: &Shared, symbol: &str) {
 
     // (strategy, direction, conviction, blend weight), name-sorted for a
     // deterministic rationale. The blend weight folds in the LIVE Hedge
-    // weight for the source strategy.
+    // weight for the source strategy AND the regime-conditional multiplier
+    // for the signal's own regime bucket (neutral 1.0 when unstamped).
     let mut contribs: Vec<(String, f64, f64, f64)> = book
         .latest
         .iter()
         .filter(|((_, sym), _)| sym == symbol)
         .filter_map(|((strat, _), c)| {
             let age_min = (now - c.ts_ms).max(0) as f64 / 60_000.0;
-            let w = c.conviction * (-age_min / DECAY_MINUTES).exp() * book.weight_of(strat);
+            let m = c
+                .regime
+                .map(|b| book.multiplier_of(strat, b))
+                .unwrap_or(1.0);
+            let w =
+                c.conviction * (-age_min / DECAY_MINUTES).exp() * book.weight_of(strat) * m;
             (w.is_finite() && w > 0.0).then(|| (strat.clone(), c.direction, c.conviction, w))
         })
         .collect();
@@ -311,6 +388,24 @@ fn fuse_and_publish(bus: &Bus, shared: &Shared, symbol: &str) {
         .iter()
         .map(|(name, ..)| (name.clone(), book.weight_of(name)))
         .collect();
+    // The CURRENT regime bucket for this symbol — the newest live signal
+    // that carried a regime_code (built-ins stamp every publication) —
+    // and each contributor's multiplier IN that bucket (`m_<strategy>`).
+    let current_bucket = book
+        .latest
+        .iter()
+        .filter(|((_, sym), _)| sym == symbol)
+        .filter_map(|(_, c)| c.regime.map(|b| (c.ts_ms, b)))
+        .max_by_key(|(ts, _)| *ts)
+        .map(|(_, b)| b);
+    let live_mults: Vec<(String, f64)> = current_bucket
+        .map(|b| {
+            contribs
+                .iter()
+                .map(|(name, ..)| (name.clone(), book.multiplier_of(name, b)))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let (direction, conviction) = if contribs.is_empty() {
         (0.0, 0.0)
@@ -361,6 +456,12 @@ fn fuse_and_publish(bus: &Bus, shared: &Shared, symbol: &str) {
     for (name, w) in &live_weights {
         features.insert(format!("w_{name}"), *w);
     }
+    for (name, m) in &live_mults {
+        features.insert(format!("m_{name}"), *m);
+    }
+    if let Some(bucket) = current_bucket {
+        features.insert("regime_code".to_string(), bucket as f64);
+    }
     let ts = now_ms();
     tracing::debug!(symbol, direction, conviction, %rationale, "fusion");
     bus.publish(EngineEvent::Signal(StrategySignal {
@@ -402,6 +503,19 @@ mod tests {
             features: BTreeMap::new(),
             ts_ms,
         }
+    }
+
+    fn sig_in_regime(
+        strategy: &str,
+        symbol: &str,
+        direction: f64,
+        conviction: f64,
+        ts_ms: i64,
+        code: f64,
+    ) -> StrategySignal {
+        let mut s = sig(strategy, symbol, direction, conviction, ts_ms);
+        s.features.insert("regime_code".into(), code);
+        s
     }
 
     fn fused_signal(rx: &mut Receiver<BusEvent>) -> Option<StrategySignal> {
@@ -523,6 +637,136 @@ mod tests {
         let out = fused_signal(&mut rx).expect("fusion");
         assert!((out.features["w_momentum_x"] - 1.0).abs() < 1e-9);
         assert!((out.features["w_llm-strategist"] - 0.6).abs() < 1e-9);
+        // No contributor carried a regime_code: no bucket is current, so
+        // neither m_* nor regime_code may appear.
+        assert!(!out.features.contains_key("regime_code"), "{out:?}");
+        assert!(
+            !out.features.keys().any(|k| k.starts_with("m_")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn regime_bucket_rejects_junk() {
+        let of = |v: f64| {
+            let mut m = BTreeMap::new();
+            m.insert("regime_code".to_string(), v);
+            regime_bucket(&m)
+        };
+        assert_eq!(of(0.0), Some(0));
+        assert_eq!(of(3.0), Some(3));
+        assert_eq!(of(1.5), None);
+        assert_eq!(of(-1.0), None);
+        assert_eq!(of(4.0), None);
+        assert_eq!(of(f64::NAN), None);
+        assert_eq!(of(f64::INFINITY), None);
+        assert_eq!(regime_bucket(&BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn regime_multiplier_learns_only_its_own_bucket() {
+        // "a" is long the whole run, but the tape only rises during
+        // Ranging (code 2) signals and falls during TrendingUp (code 0)
+        // signals: m[a][2] must rise while m[a][0] decays — and neither
+        // phase may leak into the other's bucket.
+        let sh = shared();
+        let mut close = 100.0;
+        for i in 0..60_i64 {
+            let now = now_ms();
+            on_signal(&sh, &sig_in_regime("a", "TST", 1.0, 0.8, now, 2.0));
+            close *= 1.001;
+            hedge_on_bar(&sh, &m1_bar(i, close));
+        }
+        let m_range = sh.lock_fusion().multiplier_of("a", 2);
+        assert!(m_range > 1.0, "right in ranging must rise: {m_range}");
+        assert!(
+            (sh.lock_fusion().multiplier_of("a", 0) - 1.0).abs() < 1e-9,
+            "unscored bucket must stay neutral"
+        );
+
+        for i in 60..120_i64 {
+            let now = now_ms();
+            on_signal(&sh, &sig_in_regime("a", "TST", 1.0, 0.8, now, 0.0));
+            close *= 0.999;
+            hedge_on_bar(&sh, &m1_bar(i, close));
+        }
+        let book = sh.lock_fusion();
+        assert!(
+            book.multiplier_of("a", 0) < 1.0,
+            "wrong in trend-up must decay: {}",
+            book.multiplier_of("a", 0)
+        );
+        assert!(
+            (book.multiplier_of("a", 2) - m_range).abs() < 1e-9,
+            "the ranging bucket must be untouched by trend-up scoring"
+        );
+    }
+
+    #[test]
+    fn regime_multiplier_never_escapes_bounds() {
+        let sh = shared();
+        let mut close = 100.0;
+        for i in 0..400_i64 {
+            let now = now_ms();
+            on_signal(&sh, &sig_in_regime("a", "TST", 1.0, 0.8, now, 3.0));
+            on_signal(&sh, &sig_in_regime("b", "TST", -1.0, 0.8, now, 3.0));
+            close *= 1.001;
+            hedge_on_bar(&sh, &m1_bar(i, close));
+        }
+        let book = sh.lock_fusion();
+        assert!(
+            (book.multiplier_of("a", 3) - REGIME_MULT_CAP).abs() < 1e-9,
+            "hot strategy must pin the cap"
+        );
+        assert!(
+            (book.multiplier_of("b", 3) - REGIME_MULT_FLOOR).abs() < 1e-9,
+            "cold strategy must pin the floor"
+        );
+        for row in book.multipliers.values() {
+            for m in row {
+                assert!(
+                    (REGIME_MULT_FLOOR..=REGIME_MULT_CAP).contains(m),
+                    "multiplier out of bounds: {m}"
+                );
+            }
+        }
+        for w in book.weights.values() {
+            assert!((WEIGHT_FLOOR..=WEIGHT_CAP).contains(w), "out of bounds: {w}");
+        }
+    }
+
+    #[test]
+    fn effective_weight_composes_global_weight_and_regime_multiplier() {
+        let now = now_ms();
+        let bus = Bus::new(64);
+        let mut rx = bus.subscribe();
+        let sh = shared();
+        // "a" long in Ranging with a learned 2.0 range multiplier; "b"
+        // short with no regime_code (llm-style) -> neutral 1.0 fallback.
+        // Equal global weights, convictions and ages, so the fused
+        // direction is exactly (2 - 1) / (2 + 1).
+        on_signal(&sh, &sig_in_regime("a", "TST", 1.0, 0.8, now, 2.0));
+        on_signal(&sh, &sig("b", "TST", -1.0, 0.8, now));
+        {
+            let mut book = sh.lock_fusion();
+            book.weights.insert("a".into(), 1.0);
+            book.weights.insert("b".into(), 1.0);
+            book.multipliers.insert("a".into(), [1.0, 1.0, 2.0, 1.0]);
+        }
+        fuse_and_publish(&bus, &sh, "TST");
+        let out = fused_signal(&mut rx).expect("fusion");
+        assert!(
+            (out.direction - 1.0 / 3.0).abs() < 1e-6,
+            "effective weight must be global_w * m: {}",
+            out.direction
+        );
+        // The CURRENT bucket (range, from the newest regime-stamped
+        // signal) is surfaced with every contributor's multiplier in it.
+        assert!((out.features["regime_code"] - 2.0).abs() < 1e-9);
+        assert!((out.features["m_a"] - 2.0).abs() < 1e-9);
+        assert!((out.features["m_b"] - 1.0).abs() < 1e-9);
+        assert!((out.features["w_a"] - 1.0).abs() < 1e-9);
+        assert!((out.features["w_b"] - 1.0).abs() < 1e-9);
     }
 
     #[test]

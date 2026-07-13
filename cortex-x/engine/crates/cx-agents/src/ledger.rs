@@ -36,6 +36,11 @@ const RENDER_CHAINS: usize = 3;
 const RENDER_CHAIN_ASSETS: usize = 3;
 /// ENSEMBLE render cap: at most this many strategy weights.
 const RENDER_WEIGHTS: usize = 12;
+/// PLAYBOOK bound: at most this many strategies in the regime matrix.
+const MAX_PLAYBOOK: usize = 12;
+/// Regime buckets in the PLAYBOOK matrix, mirroring the fusion layer's
+/// `regime_code` encoding: 0 trend-up, 1 trend-dn, 2 range, 3 high-vol.
+const REGIME_BUCKETS: usize = 4;
 
 /// Last trade price plus the first price seen this UTC day (session open).
 #[derive(Debug, Clone, Copy)]
@@ -67,18 +72,39 @@ pub(crate) struct LedgerState {
     /// Latest fusion Hedge weights keyed by strategy name, from the "w_*"
     /// features of the most recent "fusion" signal. Finite values only.
     pub ensemble: BTreeMap<String, f64>,
+    /// Regime-multiplier matrix accumulated from "fusion" signals: strategy
+    /// -> multiplier per regime bucket. Fusion surfaces only the CURRENT
+    /// bucket's "m_*" values (plus "regime_code" naming the bucket), so the
+    /// matrix fills in over time as regimes rotate — latest value wins per
+    /// (strategy, bucket). Finite values only; bounded to [`MAX_PLAYBOOK`].
+    pub playbook: BTreeMap<String, [f64; REGIME_BUCKETS]>,
 }
 
 pub(crate) struct ContextLedger {
     state: RwLock<LedgerState>,
     store: Arc<BarStore>,
+    /// PALACE closet source: when attached, `render` includes a bounded
+    /// "=== PALACE ===" section so the LLM sees institutional memory every
+    /// cycle. None = a mesh without persistent memory (tests, no home dir).
+    palace: Option<Arc<crate::palace::Palace>>,
 }
 
 impl ContextLedger {
+    /// A ledger without persistent memory (the runtime always attaches the
+    /// palace via [`Self::with_palace`]; tests mostly don't need one).
+    #[cfg(test)]
     pub fn new(store: Arc<BarStore>) -> Arc<Self> {
+        Self::with_palace(store, None)
+    }
+
+    pub fn with_palace(
+        store: Arc<BarStore>,
+        palace: Option<Arc<crate::palace::Palace>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             state: RwLock::new(LedgerState::default()),
             store,
+            palace,
         })
     }
 
@@ -129,6 +155,31 @@ impl ContextLedger {
                         .collect();
                     if !weights.is_empty() {
                         st.ensemble = weights;
+                    }
+                    // PLAYBOOK: fold the current bucket's "m_*" multipliers
+                    // into the matrix (regime_code names the bucket).
+                    let bucket = s
+                        .features
+                        .get("regime_code")
+                        .copied()
+                        .filter(|v| {
+                            v.is_finite() && (0.0..=3.0).contains(v) && v.fract() == 0.0
+                        })
+                        .map(|v| v as usize);
+                    if let Some(bucket) = bucket {
+                        for (k, v) in &s.features {
+                            if !k.starts_with("m_") || !v.is_finite() {
+                                continue;
+                            }
+                            let name = k["m_".len()..].to_string();
+                            if !st.playbook.contains_key(&name)
+                                && st.playbook.len() >= MAX_PLAYBOOK
+                            {
+                                continue;
+                            }
+                            st.playbook.entry(name).or_insert([1.0; REGIME_BUCKETS])
+                                [bucket] = *v;
+                        }
                     }
                 }
                 st.signals.push_back(s.clone());
@@ -446,6 +497,42 @@ impl ContextLedger {
             out.push_str(&format!("strategy weights: {weights}\n"));
         }
 
+        // PLAYBOOK: the learned regime-conditional multiplier matrix. Rows
+        // still all-neutral (every bucket ~1.0) carry no information and
+        // are skipped; the section renders only once something is learned.
+        let learned: Vec<(&String, &[f64; REGIME_BUCKETS])> = st
+            .playbook
+            .iter()
+            .filter(|(_, row)| row.iter().any(|m| (fin(*m) - 1.0).abs() >= 0.005))
+            .collect();
+        if !learned.is_empty() {
+            out.push_str("\n=== PLAYBOOK ===\n");
+            out.push_str(
+                "(regime-conditional strategy multipliers; >1 = realized edge in that regime, <1 = realized drag)\n",
+            );
+            for (name, row) in learned {
+                out.push_str(&format!(
+                    "{}: trend-up {:.2} · trend-dn {:.2} · range {:.2} · high-vol {:.2}\n",
+                    snip(name, 32),
+                    fin(row[0]),
+                    fin(row[1]),
+                    fin(row[2]),
+                    fin(row[3]),
+                ));
+            }
+        }
+
+        // PALACE: the compressed closet of the persistent verbatim memory —
+        // bounded (~15 lines); omitted when absent or empty, costing zero
+        // tokens until something has actually been remembered.
+        if let Some(palace) = &self.palace {
+            let closet = palace.render_closet();
+            if !closet.is_empty() {
+                out.push_str("\n=== PALACE ===\n");
+                out.push_str(&closet);
+            }
+        }
+
         out.push_str("\n=== RECENT AGENT NOTES ===\n");
         if st.thoughts.is_empty() {
             out.push_str("none yet\n");
@@ -704,6 +791,25 @@ mod tests {
         })
     }
 
+    fn fusion_playbook_signal(code: Option<f64>, mults: &[(&str, f64)]) -> EngineEvent {
+        let mut features = BTreeMap::new();
+        if let Some(c) = code {
+            features.insert("regime_code".to_string(), c);
+        }
+        for (name, m) in mults {
+            features.insert(format!("m_{name}"), *m);
+        }
+        EngineEvent::Signal(StrategySignal {
+            strategy: "fusion".into(),
+            symbol: "BTC-USD".into(),
+            direction: 0.1,
+            conviction: 0.5,
+            rationale: "blend".into(),
+            features,
+            ts_ms: 1_000_000,
+        })
+    }
+
     #[test]
     fn intel_sections_render_from_synthetic_events() {
         let store = Arc::new(BarStore::new());
@@ -762,6 +868,93 @@ mod tests {
         assert!(!out.contains("=== REGIMES ==="), "{out}");
         assert!(!out.contains("=== MERIDIAN ==="), "{out}");
         assert!(!out.contains("=== ENSEMBLE ==="), "{out}");
+        assert!(!out.contains("=== PLAYBOOK ==="), "{out}");
+    }
+
+    #[test]
+    fn playbook_renders_and_accumulates_across_buckets() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        // Range bucket first ...
+        ledger.apply(&fusion_playbook_signal(
+            Some(2.0),
+            &[("momentum_x", 0.5), ("meanrev_z", 1.6)],
+        ));
+        // ... then the regime rotates to trend-up: earlier range values
+        // must survive, the new bucket fills in.
+        ledger.apply(&fusion_playbook_signal(
+            Some(0.0),
+            &[("momentum_x", 1.4), ("meanrev_z", 1.0)],
+        ));
+        let out = ledger.render(&["BTC-USD".to_string()]);
+        assert!(out.contains("=== PLAYBOOK ==="), "{out}");
+        assert!(
+            out.contains(
+                "momentum_x: trend-up 1.40 · trend-dn 1.00 · range 0.50 · high-vol 1.00"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "meanrev_z: trend-up 1.00 · trend-dn 1.00 · range 1.60 · high-vol 1.00"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn playbook_omitted_without_learned_multipliers() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        // All-neutral multipliers carry no information: no section.
+        ledger.apply(&fusion_playbook_signal(Some(1.0), &[("momentum_x", 1.0)]));
+        let out = ledger.render(&["BTC-USD".to_string()]);
+        assert!(!out.contains("=== PLAYBOOK ==="), "{out}");
+        // m_* without a regime_code names no bucket: ignored entirely.
+        ledger.apply(&fusion_playbook_signal(None, &[("momentum_x", 1.7)]));
+        // Junk buckets and non-finite multipliers are dropped on ingest.
+        ledger.apply(&fusion_playbook_signal(Some(7.0), &[("momentum_x", 1.7)]));
+        ledger.apply(&fusion_playbook_signal(Some(f64::NAN), &[("momentum_x", 1.7)]));
+        ledger.apply(&fusion_playbook_signal(Some(3.0), &[("kalman_trend", f64::NAN)]));
+        let out = ledger.render(&["BTC-USD".to_string()]);
+        assert!(!out.contains("=== PLAYBOOK ==="), "{out}");
+    }
+
+    #[test]
+    fn playbook_is_bounded() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        for i in 0..(MAX_PLAYBOOK + 10) {
+            ledger.apply(&fusion_playbook_signal(
+                Some(0.0),
+                &[(&format!("s{i:03}"), 1.5)],
+            ));
+        }
+        let st = ledger.snapshot();
+        assert!(st.playbook.len() <= MAX_PLAYBOOK, "{}", st.playbook.len());
+    }
+
+    #[test]
+    fn palace_section_renders_when_attached_and_is_omitted_otherwise() {
+        let store = Arc::new(BarStore::new());
+        // No palace attached: no section, ever.
+        let bare = ContextLedger::new(Arc::clone(&store));
+        assert!(!bare.render(&[]).contains("=== PALACE ==="));
+
+        // Attached but empty: still omitted (zero tokens until memory exists).
+        let dir = crate::palace::test_dir("ledger");
+        let palace = crate::palace::Palace::open(dir.clone()).unwrap();
+        let ledger = ContextLedger::with_palace(Arc::clone(&store), Some(Arc::clone(&palace)));
+        assert!(!ledger.render(&[]).contains("=== PALACE ==="));
+
+        // With memory: the closet renders room counts + newest heads.
+        palace.remember("decisions", "strategist", "we sized down into CPI", vec![], 1);
+        palace.remember("NVDA", "regime", "regime shift ranging -> trending_up", vec![], 2);
+        let out = ledger.render(&[]);
+        assert!(out.contains("=== PALACE ==="), "{out}");
+        assert!(out.contains("- decisions: 1 — we sized down into CPI"), "{out}");
+        assert!(out.contains("- NVDA: 1 — regime shift ranging -> trending_up"), "{out}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

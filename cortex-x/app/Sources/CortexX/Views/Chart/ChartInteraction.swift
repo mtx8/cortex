@@ -5,6 +5,30 @@ import AppKit
 import Observation
 import SwiftUI
 
+/// Drawing tool armed on the chart. Anything but `.cursor` claims clicks
+/// for anchor placement and suppresses pan-dragging.
+enum ChartTool: String, CaseIterable {
+    case cursor, trendline, hline, fib
+
+    var symbolName: String {
+        switch self {
+        case .cursor: "cursorarrow"
+        case .trendline: "line.diagonal"
+        case .hline: "minus"
+        case .fib: "point.topleft.down.curvedto.point.bottomright.up"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .cursor: "cursor"
+        case .trendline: "trendline"
+        case .hline: "horizontal line"
+        case .fib: "fib retracement"
+        }
+    }
+}
+
 @Observable
 final class ChartInteraction {
     /// Window width in bar slots (20...1500).
@@ -21,11 +45,31 @@ final class ChartInteraction {
     var showEMA50 = true
     var showBollinger = true
     var showRSI = true
+    var showMACD = false
+    /// Log10 price axis; the frame falls back to linear when any visible
+    /// low (or overlay value) is <= 0.
+    var logScale = false
+
+    // Drawing tools
+    /// Armed drawing tool; non-cursor tools claim clicks and suppress pan.
+    var activeTool: ChartTool = .cursor
+    /// First anchor of an in-progress two-point drawing (Esc cancels).
+    var pendingAnchor: DrawingPoint?
+    /// Drawing picked with the cursor tool; Delete removes it.
+    var selectedDrawingID: UUID?
 
     private var dragAnchorOffset: Double?
 
     /// Live-follow keeps the right edge pinned to the newest bar.
     var isFollowing: Bool { rightOffset <= 0 }
+
+    /// Arm a tool; clicking the active tool disarms back to cursor. Any
+    /// switch abandons a half-placed anchor, and arming drops selection.
+    func selectTool(_ tool: ChartTool) {
+        activeTool = activeTool == tool ? .cursor : tool
+        pendingAnchor = nil
+        if activeTool != .cursor { selectedDrawingID = nil }
+    }
 
     /// Scroll zoom. Positive delta zooms in. While following, the anchor is
     /// the live edge; otherwise the bar under the cursor holds its position.
@@ -42,9 +86,10 @@ final class ChartInteraction {
     }
 
     /// Drag pans: content follows the pointer, so dragging right walks back
-    /// in time. Disengages live-follow while offset > 0.
+    /// in time. Disengages live-follow while offset > 0. An armed drawing
+    /// tool suppresses panning so anchor clicks stay put.
     func dragChanged(translationX: CGFloat, slotWidth: CGFloat, total: Int) {
-        guard slotWidth > 0, total > 0 else { return }
+        guard slotWidth > 0, total > 0, activeTool == .cursor else { return }
         isDragging = true
         let anchor = dragAnchorOffset ?? rightOffset
         dragAnchorOffset = anchor
@@ -67,10 +112,14 @@ final class ChartInteraction {
         rightOffset = 0
     }
 
-    /// Symbol or interval switched: new series, back to the live edge.
+    /// Symbol or interval switched: new series, back to the live edge with
+    /// no armed tool, pending anchor or (now stale) drawing selection.
     func resetForNewSeries() {
         resetToLive()
         hover = nil
+        activeTool = .cursor
+        pendingAnchor = nil
+        selectedDrawingID = nil
     }
 }
 

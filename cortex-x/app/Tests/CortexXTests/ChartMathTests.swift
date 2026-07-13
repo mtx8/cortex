@@ -1,6 +1,7 @@
 // Hand-computed correctness tests for the chart's pure math layer:
-// EMA / RSI / Bollinger, visible-window arithmetic, nice-tick axis stepping
-// and adaptive price formatting.
+// EMA / RSI / Bollinger / MACD, visible-window arithmetic, nice-tick axis
+// stepping, log price mapping, weekly aggregation and adaptive price
+// formatting.
 
 import XCTest
 @testable import CortexX
@@ -81,6 +82,60 @@ final class ChartMathTests: XCTestCase {
         let p = try XCTUnwrap(b[5]) // window 2...6: mean 4, same sd
         XCTAssertEqual(p.mid, 4.0, accuracy: 1e-12)
         XCTAssertEqual(p.upper, 4.0 + 2 * 2.0.squareRoot(), accuracy: 1e-12)
+    }
+
+    // MARK: - MACD
+
+    func testMACDWarmupNils() {
+        // EMA26 seeds at index 25; EMA9 over the macd line adds 8 -> 33.
+        let closes = (0..<40).map(Double.init)
+        let m = ChartMath.macdSeries(closes: closes)
+        XCTAssertEqual(m.macd.count, 40)
+        XCTAssertEqual(m.signal.count, 40)
+        XCTAssertEqual(m.hist.count, 40)
+        for i in 0..<25 { XCTAssertNil(m.macd[i]) }
+        XCTAssertNotNil(m.macd[25])
+        for i in 0..<33 {
+            XCTAssertNil(m.signal[i])
+            XCTAssertNil(m.hist[i])
+        }
+        XCTAssertNotNil(m.signal[33])
+        XCTAssertNotNil(m.hist[33])
+    }
+
+    func testMACDTooShortIsAllNil() {
+        let m = ChartMath.macdSeries(closes: [1, 2, 3])
+        XCTAssertEqual(m.macd.count, 3)
+        XCTAssertTrue(m.macd.allSatisfy { $0 == nil })
+        XCTAssertTrue(m.signal.allSatisfy { $0 == nil })
+        XCTAssertTrue(m.hist.allSatisfy { $0 == nil })
+    }
+
+    func testMACDMatchesEMADifferenceAndHistRelation() throws {
+        // On a rising ramp the fast EMA leads: EMA12 > EMA26 -> macd > 0.
+        let closes = (1...60).map(Double.init)
+        let m = ChartMath.macdSeries(closes: closes)
+        let e12 = ChartMath.ema(closes, period: 12)
+        let e26 = ChartMath.ema(closes, period: 26)
+        for i in 25..<60 {
+            let macd = try XCTUnwrap(m.macd[i])
+            let fast = try XCTUnwrap(e12[i])
+            let slow = try XCTUnwrap(e26[i])
+            XCTAssertEqual(macd, fast - slow, accuracy: 1e-12)
+            XCTAssertGreaterThan(macd, 0)
+        }
+        // hist = macd - signal wherever all three are defined.
+        for i in 33..<60 {
+            let macd = try XCTUnwrap(m.macd[i])
+            let signal = try XCTUnwrap(m.signal[i])
+            XCTAssertEqual(try XCTUnwrap(m.hist[i]), macd - signal, accuracy: 1e-12)
+        }
+    }
+
+    func testMACDFallingRampIsNegative() throws {
+        let closes = (1...40).map { 100.0 - Double($0) }
+        let m = ChartMath.macdSeries(closes: closes)
+        XCTAssertLessThan(try XCTUnwrap(m.macd[39]), 0)
     }
 
     // MARK: - Visible window
@@ -184,6 +239,83 @@ final class ChartMathTests: XCTestCase {
         XCTAssertTrue(ChartMath.axisTicks(min: 5, max: 5, target: 5).isEmpty)
     }
 
+    // MARK: - Log-axis ticks
+
+    func testLogAxisTicksDecadeSpanProducesOneTwoFive() {
+        // Two decades over 300px: 150px per decade, so the 1/2/5 ladder's
+        // tightest gap (log10(2) ≈ 0.301 decade ≈ 45px) clears 44px.
+        XCTAssertEqual(
+            ChartMath.logAxisTicks(min: 1, max: 100, heightPx: 300),
+            [1, 2, 5, 10, 20, 50, 100]
+        )
+    }
+
+    func testLogAxisTicksThinToBareDecadesWhenTight() {
+        // 50px per decade: the 1/2/5 ladder (~15px gaps) is too dense but
+        // whole decades still fit.
+        XCTAssertEqual(
+            ChartMath.logAxisTicks(min: 1, max: 1_000, heightPx: 150),
+            [1, 10, 100, 1_000]
+        )
+    }
+
+    func testLogAxisTicksSubdivideOnSubDecadeRange() {
+        // Under half a decade with plenty of pixels: a denser mantissa
+        // ladder kicks in so the axis never starves.
+        let ticks = ChartMath.logAxisTicks(min: 101, max: 178, heightPx: 400)
+        XCTAssertEqual(ticks.count, 3)
+        for (t, expected) in zip(ticks, [120.0, 140.0, 160.0]) {
+            XCTAssertEqual(t, expected, accuracy: 1e-9)
+        }
+    }
+
+    func testLogAxisTicksUnsupportedOrDegenerateAxisIsEmpty() {
+        XCTAssertTrue(ChartMath.logAxisTicks(min: 0, max: 10, heightPx: 300).isEmpty)
+        XCTAssertTrue(ChartMath.logAxisTicks(min: -5, max: 10, heightPx: 300).isEmpty)
+        XCTAssertTrue(ChartMath.logAxisTicks(min: 5, max: 5, heightPx: 300).isEmpty)
+    }
+
+    // MARK: - Price-axis mapping (linear / log)
+
+    func testPriceFractionLogMonotonicWithKnownMidpoint() {
+        // log10 axis over [1, 100]: 10 sits exactly halfway.
+        XCTAssertEqual(ChartMath.priceFraction(1, lo: 1, hi: 100, log: true), 0, accuracy: 1e-12)
+        XCTAssertEqual(ChartMath.priceFraction(10, lo: 1, hi: 100, log: true), 0.5, accuracy: 1e-12)
+        XCTAssertEqual(ChartMath.priceFraction(100, lo: 1, hi: 100, log: true), 1, accuracy: 1e-12)
+        var prev = -Double.infinity
+        for p in [1.0, 2, 5, 10, 50, 99] {
+            let f = ChartMath.priceFraction(p, lo: 1, hi: 100, log: true)
+            XCTAssertGreaterThan(f, prev)
+            prev = f
+        }
+    }
+
+    func testPriceFractionLogFallsBackToLinearAtOrBelowZero() {
+        // lo <= 0 cannot support a log axis -> linear mapping.
+        XCTAssertEqual(ChartMath.priceFraction(5, lo: 0, hi: 10, log: true), 0.5, accuracy: 1e-12)
+        XCTAssertEqual(
+            ChartMath.priceFraction(-5, lo: -10, hi: 10, log: true), 0.25, accuracy: 1e-12
+        )
+    }
+
+    func testPriceFractionDegenerateRangeIsZero() {
+        XCTAssertEqual(ChartMath.priceFraction(5, lo: 5, hi: 5, log: true), 0, accuracy: 1e-12)
+        XCTAssertEqual(ChartMath.priceFraction(5, lo: 5, hi: 5, log: false), 0, accuracy: 1e-12)
+    }
+
+    func testPriceAtFractionRoundtrips() {
+        for p in [1.5, 12.0, 87.3] {
+            let logF = ChartMath.priceFraction(p, lo: 1, hi: 100, log: true)
+            XCTAssertEqual(
+                ChartMath.priceAtFraction(logF, lo: 1, hi: 100, log: true), p, accuracy: 1e-9
+            )
+            let linF = ChartMath.priceFraction(p, lo: 1, hi: 100, log: false)
+            XCTAssertEqual(
+                ChartMath.priceAtFraction(linF, lo: 1, hi: 100, log: false), p, accuracy: 1e-9
+            )
+        }
+    }
+
     // MARK: - Buckets
 
     func testBucketFloorsToBarOpen() {
@@ -191,6 +323,119 @@ final class ChartMathTests: XCTestCase {
         XCTAssertEqual(ChartMath.bucket(59_999, .s1), 59_000)
         XCTAssertEqual(ChartMath.bucket(899_999_999, .m15), 899_100_000)
         XCTAssertEqual(ChartMath.bucket(60_000, .m1), 60_000) // exact open unchanged
+    }
+
+    func testWeekFloorIsMondayAnchored() {
+        // The epoch (day 0) is a Thursday, so day 4 (1970-01-05) is the
+        // first Monday. A Wednesday (day 6) floors to that Monday; a Sunday
+        // (day 10) still belongs to the PRIOR Monday's week; the next
+        // Monday (day 11) opens a fresh one.
+        XCTAssertEqual(ChartMath.weekFloor(4 * Self.dayMs), 4 * Self.dayMs)
+        XCTAssertEqual(ChartMath.weekFloor(6 * Self.dayMs + 3_600_000), 4 * Self.dayMs)
+        XCTAssertEqual(ChartMath.weekFloor(10 * Self.dayMs + 12 * 3_600_000), 4 * Self.dayMs)
+        XCTAssertEqual(ChartMath.weekFloor(11 * Self.dayMs), 11 * Self.dayMs)
+        // Modern timestamp: Wednesday 2026-07-08 floors to Monday
+        // 2026-07-06 00:00 UTC (day 20640).
+        let monday: Int64 = 20_640 * Self.dayMs
+        XCTAssertEqual(ChartMath.weekFloor(monday + 2 * Self.dayMs + 1), monday)
+        XCTAssertEqual(ChartMath.weekFloor(monday), monday)
+    }
+
+    func testSpanBucketWeeklyUsesMondayFloorElseEpoch() {
+        // The weekly span routes through the Monday-anchored week floor…
+        XCTAssertEqual(
+            ChartMath.bucket(6 * Self.dayMs, spanMs: ChartMath.weekMs), 4 * Self.dayMs
+        )
+        // …every other span floors from the epoch, matching the interval form.
+        XCTAssertEqual(ChartMath.bucket(61_500, spanMs: Interval.m1.ms), 60_000)
+        XCTAssertEqual(
+            ChartMath.bucket(90 * Self.dayMs + 5, spanMs: Interval.d1.ms), 90 * Self.dayMs
+        )
+    }
+
+    // MARK: - Weekly aggregation
+
+    private static let dayMs: Int64 = 86_400_000
+
+    private func dayBar(
+        day: Int64, o: Double, h: Double, l: Double, c: Double, v: Double,
+        complete: Bool = true
+    ) -> Bar {
+        Bar(
+            symbol: "TEST", interval: .d1, ts_open_ms: day * Self.dayMs,
+            open: o, high: h, low: l, close: c, volume: v,
+            trade_count: 1, vwap: (h + l) / 2, complete: complete
+        )
+    }
+
+    func testAggregateWeeklyMergesOHLCV() {
+        // Days 4..6 (Mon..Wed) share the Monday-anchored bucket at day 4.
+        let w = ChartMath.aggregateWeekly([
+            dayBar(day: 4, o: 10, h: 12, l: 9, c: 11, v: 100),
+            dayBar(day: 5, o: 11, h: 15, l: 10, c: 14, v: 50),
+            dayBar(day: 6, o: 14, h: 14.5, l: 8, c: 9, v: 25),
+        ])
+        XCTAssertEqual(w.count, 1)
+        XCTAssertEqual(w[0].ts_open_ms, 4 * Self.dayMs)
+        XCTAssertEqual(w[0].open, 10)      // first open
+        XCTAssertEqual(w[0].high, 15)      // max high
+        XCTAssertEqual(w[0].low, 8)        // min low
+        XCTAssertEqual(w[0].close, 9)      // last close
+        XCTAssertEqual(w[0].volume, 175)   // summed
+        XCTAssertEqual(w[0].vwap, 9)       // vwap = close by contract
+        XCTAssertEqual(w[0].trade_count, 3)
+        XCTAssertTrue(w[0].complete)
+        XCTAssertEqual(w[0].symbol, "TEST")
+        XCTAssertEqual(w[0].interval, .d1)
+    }
+
+    func testAggregateWeeklyBucketAlignment() {
+        // Monday-anchored buckets: days 5-7 (Tue-Thu) join the Monday at
+        // day 4; day 10 (Sun) would close that week; days 13-14 (Wed-Thu)
+        // fall under the next Monday at day 11.
+        let w = ChartMath.aggregateWeekly([
+            dayBar(day: 5, o: 1, h: 2, l: 1, c: 2, v: 10),
+            dayBar(day: 6, o: 2, h: 3, l: 2, c: 3, v: 10),
+            dayBar(day: 7, o: 3, h: 4, l: 3, c: 4, v: 10),
+            dayBar(day: 13, o: 4, h: 5, l: 4, c: 5, v: 10),
+            dayBar(day: 14, o: 5, h: 6, l: 5, c: 6, v: 10),
+        ])
+        XCTAssertEqual(w.map(\.ts_open_ms), [4 * Self.dayMs, 11 * Self.dayMs])
+        XCTAssertEqual(w[0].open, 1)
+        XCTAssertEqual(w[0].close, 4)
+        XCTAssertEqual(w[0].volume, 30)
+        XCTAssertEqual(w[1].open, 4)
+        XCTAssertEqual(w[1].close, 6)
+        XCTAssertEqual(w[1].volume, 20)
+    }
+
+    func testAggregateWeeklySundayJoinsPriorMondayBucket() {
+        // A Sunday bar (day 10) merges into the prior Monday's bucket
+        // (day 4), never a bucket of its own.
+        let w = ChartMath.aggregateWeekly([
+            dayBar(day: 6, o: 1, h: 2, l: 1, c: 2, v: 10),
+            dayBar(day: 10, o: 2, h: 3, l: 2, c: 3, v: 10),
+            dayBar(day: 11, o: 3, h: 4, l: 3, c: 4, v: 10),
+        ])
+        XCTAssertEqual(w.map(\.ts_open_ms), [4 * Self.dayMs, 11 * Self.dayMs])
+        XCTAssertEqual(w[0].close, 3)
+        XCTAssertEqual(w[0].volume, 20)
+        XCTAssertEqual(w[1].open, 3)
+    }
+
+    func testAggregateWeeklyPartialLastBucketStaysForming() {
+        // A forming daily bar leaves its (partial) weekly bucket forming too.
+        let w = ChartMath.aggregateWeekly([
+            dayBar(day: 7, o: 1, h: 2, l: 1, c: 2, v: 10),
+            dayBar(day: 8, o: 2, h: 3, l: 2, c: 3, v: 10, complete: false),
+        ])
+        XCTAssertEqual(w.count, 1)
+        XCTAssertEqual(w[0].ts_open_ms, 4 * Self.dayMs)
+        XCTAssertFalse(w[0].complete)
+    }
+
+    func testAggregateWeeklyEmpty() {
+        XCTAssertTrue(ChartMath.aggregateWeekly([]).isEmpty)
     }
 
     // MARK: - Price formatting

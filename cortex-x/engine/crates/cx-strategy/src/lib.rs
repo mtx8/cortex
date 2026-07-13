@@ -18,10 +18,15 @@
 //! - Disabling a built-in silences it immediately and removes its latest
 //!   signals from fusion state — disabling can only remove opinions from
 //!   the fused view, never invent them.
+//! - Tunable params are HARD-BOUNDED: `cfg.strategy_params` seeds and bus
+//!   `ParamUpdate` events move the entry thresholds, but always clamped to
+//!   the compiled-in bounds table in strat.rs — no event can push a live
+//!   strategy outside its rails.
 
 mod fusion;
 mod strat;
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -51,6 +56,9 @@ pub(crate) struct Shared {
     pub(crate) enabled: [AtomicBool; 4],
     /// Fusion contributor book; the handle purges disabled built-ins here.
     pub(crate) fusion: Mutex<fusion::FusionBook>,
+    /// Live tunable params (hard-bounded on every write; see strat.rs
+    /// PARAM_BOUNDS). Same shared-state pattern as the enable flags.
+    pub(crate) params: Mutex<strat::StratParams>,
 }
 
 impl Shared {
@@ -63,6 +71,7 @@ impl Shared {
                 AtomicBool::new(true),
             ],
             fusion: Mutex::new(fusion::FusionBook::default()),
+            params: Mutex::new(strat::StratParams::default()),
         }
     }
 
@@ -74,15 +83,34 @@ impl Shared {
     pub(crate) fn lock_fusion(&self) -> MutexGuard<'_, fusion::FusionBook> {
         self.fusion.lock().unwrap_or_else(|p| p.into_inner())
     }
+
+    /// Poison-proof lock over the live tunables.
+    pub(crate) fn lock_params(&self) -> MutexGuard<'_, strat::StratParams> {
+        self.params.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 /// Cheap shared-state handle over the strategy runtime. Owned by cortexd's
-/// command loop; dropping it does NOT stop the tasks (the bus does).
+/// command loop (clones are cheap Arc copies — the AUTORESEARCH runner
+/// holds one); dropping it does NOT stop the tasks (the bus does).
+#[derive(Clone)]
 pub struct StrategyHandle {
     shared: Arc<Shared>,
 }
 
 impl StrategyHandle {
+    /// Apply one strategy's tunable params directly — the SAME clamping
+    /// path bus `ParamUpdate` events take (strat.rs `PARAM_BOUNDS`):
+    /// unknown keys and non-finite values are ignored with a warn,
+    /// everything else is clamped to the compiled-in rails. cortexd calls
+    /// this at AUTORESEARCH adoption time so an adopted recipe can never be
+    /// lost to broadcast-bus lag; the published `ParamUpdate` remains on
+    /// the bus purely as the audit/palace/UI record (re-applying it is
+    /// idempotent).
+    pub fn apply_params(&self, strategy: &str, params: &BTreeMap<String, f64>) {
+        strat::apply_params(&self.shared, strategy, params, "direct");
+    }
+
     /// Enable/disable a built-in strategy by name. Disabling silences it on
     /// the next bar and removes its latest signals from fusion state.
     /// Returns false for unknown names (only the four built-ins are known).
@@ -111,6 +139,11 @@ impl StrategyHandle {
 /// `store.recent(symbol, M1, 300)` at task startup.
 pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> StrategyHandle {
     let shared = Arc::new(Shared::new());
+    // Seed the tunables from the config hook (finally consumed): every
+    // value is clamped to the compiled-in hard bounds, junk is ignored.
+    for (strategy, kv) in &cfg.strategy_params {
+        strat::apply_params(&shared, strategy, kv, "config");
+    }
     let rx_strat = bus.subscribe();
     let rx_fusion = bus.subscribe();
     tokio::spawn(strat::run(
@@ -149,5 +182,101 @@ mod tests {
         assert!(handle.set_enabled("momentum_x", false));
         assert!(handle.set_enabled("momentum_x", true));
         assert!(!handle.set_enabled("no_such_strategy", true));
+    }
+
+    #[tokio::test]
+    async fn config_strategy_params_seed_clamped() {
+        let bus = Bus::new(64);
+        let store = Arc::new(BarStore::new());
+        let mut cfg = Config::default();
+        cfg.strategy_params.insert(
+            "meanrev_z".into(),
+            [("z_entry".to_string(), 1.75)].into_iter().collect(),
+        );
+        cfg.strategy_params.insert(
+            "kalman_trend".into(),
+            // Out of bounds: must seed at the 3.5 cap, never raw.
+            [("t_entry".to_string(), 99.0)].into_iter().collect(),
+        );
+        let handle = start(bus, store, cfg);
+        let p = *handle.shared.lock_params();
+        assert_eq!(p.meanrev_z_entry, 1.75);
+        assert_eq!(p.kalman_t_entry, 3.5);
+        assert_eq!(p.breakout_min_range_atr, 0.8, "untouched param keeps its default");
+    }
+
+    #[tokio::test]
+    async fn apply_params_direct_path_applies_clamped_without_the_bus() {
+        let bus = Bus::new(64);
+        let store = Arc::new(BarStore::new());
+        let handle = start(bus, store, Config::default());
+        let kv = |v: f64| -> BTreeMap<String, f64> {
+            [("z_entry".to_string(), v)].into_iter().collect()
+        };
+        // Direct = synchronous: applied before the call returns, no bus
+        // round-trip to lose to lag.
+        handle.apply_params("meanrev_z", &kv(1.6));
+        assert_eq!(handle.shared.lock_params().meanrev_z_entry, 1.6);
+        // Out-of-bounds clamps to the rail, exactly like the bus route.
+        handle.apply_params("meanrev_z", &kv(99.0));
+        assert_eq!(handle.shared.lock_params().meanrev_z_entry, 3.0);
+        // Junk is ignored, never applied.
+        handle.apply_params("meanrev_z", &kv(f64::NAN));
+        assert_eq!(handle.shared.lock_params().meanrev_z_entry, 3.0);
+        handle.apply_params("no_such_strategy", &kv(1.6));
+        assert_eq!(handle.shared.lock_params().meanrev_z_entry, 3.0);
+        // The handle clones cheaply and acts on the same shared state.
+        let clone = handle.clone();
+        clone.apply_params("meanrev_z", &kv(2.25));
+        assert_eq!(handle.shared.lock_params().meanrev_z_entry, 2.25);
+    }
+
+    #[tokio::test]
+    async fn param_update_on_the_bus_is_applied_clamped() {
+        use cx_core::events::{EngineEvent, ParamUpdate};
+        use std::time::Duration;
+
+        let bus = Bus::new(256);
+        let store = Arc::new(BarStore::new());
+        let handle = start(Arc::clone(&bus), store, Config::default());
+        assert_eq!(handle.shared.lock_params().meanrev_z_entry, 2.0);
+
+        let update = |value: f64| {
+            EngineEvent::ParamUpdate(ParamUpdate {
+                strategy: "meanrev_z".into(),
+                params: [("z_entry".to_string(), value)].into_iter().collect(),
+                source: "autoresearch".into(),
+                rationale: "test adoption".into(),
+                ts_ms: 1,
+            })
+        };
+        // In-bounds adoption applies exactly.
+        bus.publish(update(1.6));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if (handle.shared.lock_params().meanrev_z_entry - 1.6).abs() < 1e-12 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "ParamUpdate was never applied"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Out-of-bounds request is clamped to the hard cap, never applied raw.
+        bus.publish(update(99.0));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let v = handle.shared.lock_params().meanrev_z_entry;
+            assert!(v <= 3.0, "out-of-bounds value leaked into a live strategy: {v}");
+            if (v - 3.0).abs() < 1e-12 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "clamped ParamUpdate was never applied"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }

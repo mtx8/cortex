@@ -6,6 +6,10 @@ import SwiftUI
 struct ChartPanel: View {
     @Environment(AppModel.self) private var model
     @State private var interaction = ChartInteraction()
+    @State private var drawingStore = DrawingStore()
+    /// View-level weekly bars: aggregates the 1d series on the fly. Not a
+    /// wire interval, so AppModel stays untouched.
+    @State private var weeklyMode = false
     @State private var flashDirection = 0
     @State private var flashToken = 0
     @State private var flashSymbol = ""
@@ -20,14 +24,17 @@ struct ChartPanel: View {
                 .fill(Theme.line)
                 .frame(height: Theme.hairline)
             CandleChart(
-                bars: model.bars(model.selectedSymbol, model.selectedInterval),
-                interval: model.selectedInterval,
+                symbol: model.selectedSymbol,
+                bars: chartBars,
+                interval: weeklyMode ? .d1 : model.selectedInterval,
+                barSpanMs: weeklyMode ? ChartMath.weekMs : model.selectedInterval.ms,
                 signals: model.signals.filter { $0.symbol == model.selectedSymbol },
                 thoughts: model.thoughts.filter {
                     $0.symbol == model.selectedSymbol && $0.severity >= .warning
                 },
                 feeds: model.feeds.values.sorted { $0.feed < $1.feed },
-                interaction: interaction
+                interaction: interaction,
+                drawingStore: drawingStore
             )
         }
         .panel()
@@ -39,9 +46,18 @@ struct ChartPanel: View {
         .onChange(of: model.selectedInterval) { _, _ in
             interaction.resetForNewSeries()
         }
+        .onChange(of: weeklyMode) { _, _ in
+            interaction.resetForNewSeries()
+        }
         .onChange(of: model.lastPrice(model.selectedSymbol)) { old, new in
             handleTick(old, new)
         }
+    }
+
+    private var chartBars: [Bar] {
+        weeklyMode
+            ? ChartMath.aggregateWeekly(model.bars(model.selectedSymbol, .d1))
+            : model.bars(model.selectedSymbol, model.selectedInterval)
     }
 
     // MARK: - Header
@@ -147,19 +163,15 @@ struct ChartPanel: View {
     private func intervalPicker(_ selection: Binding<Interval>) -> some View {
         HStack(spacing: 2) {
             ForEach(Interval.allCases) { iv in
-                Button {
+                intervalChip(iv.label, isOn: !weeklyMode && selection.wrappedValue == iv) {
+                    weeklyMode = false
                     selection.wrappedValue = iv
-                } label: {
-                    Text(iv.label)
-                        .font(.system(size: 10, weight: .semibold))
-                        .monospacedDigit()
-                        .foregroundStyle(selection.wrappedValue == iv ? Theme.bone : Theme.dim)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(selection.wrappedValue == iv ? Theme.panelHi : Color.clear)
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
                 }
-                .buttonStyle(.plain)
+            }
+            // Weekly rides on the 1d feed; the 1d chip deselects while on.
+            intervalChip("1w", isOn: weeklyMode) {
+                selection.wrappedValue = .d1
+                weeklyMode = true
             }
         }
         .padding(2)
@@ -169,6 +181,22 @@ struct ChartPanel: View {
             RoundedRectangle(cornerRadius: Theme.chipRadius)
                 .strokeBorder(Theme.line, lineWidth: Theme.hairline)
         )
+    }
+
+    private func intervalChip(
+        _ label: String, isOn: Bool, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(isOn ? Theme.bone : Theme.dim)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(isOn ? Theme.panelHi : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - Feed health
