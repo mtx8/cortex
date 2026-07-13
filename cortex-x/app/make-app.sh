@@ -42,3 +42,8 @@ PLIST
 
 codesign --force --sign - "$APP" 2>/dev/null || true
 echo "built $APP"
+
+# Deploy copies where the operator double-clicks: cortex folder root + /Applications.
+for DEST in ../../CortexX.app /Applications/CortexX.app; do
+  rm -rf "$DEST" && ditto "$APP" "$DEST" && echo "deployed $DEST" || echo "deploy skipped: $DEST"
+done
