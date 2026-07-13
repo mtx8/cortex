@@ -77,6 +77,9 @@ struct Watchlist: View {
                     if let hit = (cryptoSymbols + equitySymbols + universeMatches).first {
                         model.selectSymbol(hit)
                     } else {
+                        // Unknown ticker: chart via on-demand D1 history AND
+                        // open the COMPANY board (EDGAR resolves any filer).
+                        model.selectSymbol(query)
                         model.openCompany(query)
                     }
                     searchText = ""

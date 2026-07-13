@@ -98,6 +98,29 @@ pub fn universe(cfg: &Config) -> Vec<String> {
     out
 }
 
+/// On-demand D1 backfill for ONE symbol (searched tickers outside the
+/// configured set): fetches 5y of Yahoo daily bars into the shared store
+/// when history is thin, then returns whatever the store now holds.
+pub async fn backfill_symbol_d1(egress: &Egress, store: &BarStore, symbol: &str) -> Vec<Bar> {
+    let symbol = symbol.trim().to_uppercase();
+    if store.recent(&symbol, Interval::D1, MIN_BARS + 50).len() < MIN_BARS {
+        let url = format!(
+            "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=5y&interval=1d"
+        );
+        match egress.get_text(&url).await {
+            Ok(raw) => {
+                for bar in parse_yahoo_d1(&symbol, &raw, 1_300) {
+                    store.push(bar);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "cx_intel::regimes", symbol = %symbol, error = %e, "on-demand D1 backfill failed");
+            }
+        }
+    }
+    store.recent(&symbol, Interval::D1, 1_300)
+}
+
 /// Backfill D1 history for any symbol short of `MIN_BARS`, via the Yahoo v8
 /// chart endpoint (same shape cx-md's equity backfill uses; query1 host is
 /// allowlisted). Failures degrade to a skipped symbol, never a crash.

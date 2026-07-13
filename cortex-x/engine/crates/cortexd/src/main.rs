@@ -146,6 +146,24 @@ async fn main() -> anyhow::Result<()> {
             Command::GetCompany { symbol } => {
                 cx_intel::serve_company(Arc::clone(&bus), symbol, cfg.intel.enable_company);
             }
+            Command::GetHistory { symbol } => {
+                let bus = Arc::clone(&bus);
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    let egress = cx_core::egress::Egress::new();
+                    let bars =
+                        cx_intel::regimes::backfill_symbol_d1(&egress, &store, &symbol).await;
+                    // Always answer — an empty slice tells the client the
+                    // lookup found nothing rather than leaving it waiting.
+                    bus.publish(cx_core::EngineEvent::History(cx_core::events::HistorySlice {
+                        symbol: symbol.trim().to_uppercase(),
+                        interval: cx_core::types::Interval::D1,
+                        bars,
+                        source: "yahoo D1 (delayed, on demand)".into(),
+                        ts_ms: cx_core::time::now_ms(),
+                    }));
+                });
+            }
             other => pipeline.handle_command(other).await,
         }
     }

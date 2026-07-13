@@ -613,6 +613,15 @@ struct ScanBoard: Codable, Equatable {
     var ts_ms: Int64
 }
 
+/// On-demand history for a searched symbol: one interval, whole series.
+struct HistorySlice: Codable, Equatable {
+    var symbol: String
+    var interval: Interval
+    var bars: [Bar]
+    var source: String
+    var ts_ms: Int64
+}
+
 // MARK: - Snapshot (initial state replay from cortexd)
 
 struct EngineSnapshot: Codable {
@@ -659,6 +668,7 @@ enum ServerFrame {
     case regimeMap(RegimeBoard)
     case geo(GeoPulse)
     case scan(ScanBoard)
+    case history(HistorySlice)
     case gap(dropped: Int)
     case error(detail: String)
     case unknown(type: String)
@@ -696,6 +706,7 @@ enum ServerFrame {
         case "regime_map": return .regimeMap(try dec.decode(RegimeBoard.self, from: data))
         case "geo": return .geo(try dec.decode(GeoPulse.self, from: data))
         case "scan": return .scan(try dec.decode(ScanBoard.self, from: data))
+        case "history": return .history(try dec.decode(HistorySlice.self, from: data))
         case "gap":
             struct Gap: Codable { var dropped: Int }
             return .gap(dropped: try dec.decode(Gap.self, from: data).dropped)
@@ -722,6 +733,7 @@ enum Command {
     case getOptionsChain(underlying: String, expiry: String?)
     case runSimulation
     case getCompany(symbol: String)
+    case getHistory(symbol: String)
 
     func encoded() throws -> Data {
         var obj: [String: Any]
@@ -753,6 +765,8 @@ enum Command {
             obj = ["cmd": "run_simulation"]
         case let .getCompany(symbol):
             obj = ["cmd": "get_company", "symbol": symbol]
+        case let .getHistory(symbol):
+            obj = ["cmd": "get_history", "symbol": symbol]
         }
         return try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
     }

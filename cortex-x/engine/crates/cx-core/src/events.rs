@@ -564,6 +564,18 @@ pub struct ScanBoard {
     pub ts_ms: i64,
 }
 
+/// On-demand history answer (`Command::GetHistory`): one symbol, one
+/// interval, the whole series in a single frame so ad-hoc searched tickers
+/// can chart without being part of the configured feed set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistorySlice {
+    pub symbol: String,
+    pub interval: Interval,
+    pub bars: Vec<Bar>,
+    pub source: String,
+    pub ts_ms: i64,
+}
+
 /// Answer to an `AskAi` command — the copilot channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiAnswer {
@@ -600,6 +612,7 @@ pub enum EngineEvent {
     RegimeMap(RegimeBoard),
     Geo(GeoPulse),
     Scan(ScanBoard),
+    History(HistorySlice),
 }
 
 impl EngineEvent {
@@ -638,6 +651,7 @@ impl EngineEvent {
             EngineEvent::RegimeMap(_) => "regime_map",
             EngineEvent::Geo(_) => "geo",
             EngineEvent::Scan(_) => "scan",
+            EngineEvent::History(_) => "history",
         }
     }
 }

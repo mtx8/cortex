@@ -57,4 +57,9 @@ pub enum Command {
     GetCompany {
         symbol: String,
     },
+    /// Fetch daily history for any symbol (searched tickers outside the
+    /// configured feed set). Answered via `EngineEvent::History`.
+    GetHistory {
+        symbol: String,
+    },
 }

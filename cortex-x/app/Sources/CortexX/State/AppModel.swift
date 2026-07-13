@@ -129,8 +129,10 @@ final class AppModel {
 
     /// Select a symbol for the chart/watchlist context. If the current
     /// interval has almost no bars for it (equities barely tick M1), jump to
-    /// the densest interval so the chart never opens near-empty.
+    /// the densest interval so the chart never opens near-empty. Symbols
+    /// with no history at all (ad-hoc searches) get an on-demand D1 fetch.
     func selectSymbol(_ symbol: String) {
+        let symbol = symbol.uppercased()
         selectedSymbol = symbol
         if bars(symbol, selectedInterval).count < 30 {
             let densest = Interval.allCases
@@ -138,6 +140,8 @@ final class AppModel {
                 .max { $0.1 < $1.1 }
             if let (interval, count) = densest, count >= 30 {
                 selectedInterval = interval
+            } else {
+                send(.getHistory(symbol: symbol))
             }
         }
     }
@@ -249,6 +253,18 @@ final class AppModel {
             geoPulse = pulse
         case .scan(let board):
             scanBoard = board
+        case .history(let slice):
+            guard !slice.bars.isEmpty else { break }
+            bars[slice.symbol, default: [:]][slice.interval] =
+                slice.bars.sorted { $0.ts_open_ms < $1.ts_open_ms }
+            // If the operator is waiting on this exact chart, switch to the
+            // interval the history arrived on.
+            if selectedSymbol == slice.symbol, bars(slice.symbol, selectedInterval).count < 30 {
+                selectedInterval = slice.interval
+            }
+            if sessionOpen[slice.symbol] == nil {
+                sessionOpen[slice.symbol] = slice.bars.last?.close
+            }
         case .gap, .error, .unknown:
             break
         }
