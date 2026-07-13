@@ -582,6 +582,37 @@ struct GeoPulse: Codable, Equatable {
     var ts_ms: Int64
 }
 
+// MARK: - Intel: SCANNER (cross-sectional relative-value screen)
+
+struct ScanRow: Codable, Equatable, Identifiable {
+    var symbol: String
+    var asset_class: String
+    var composite: Double
+    var momentum: Double
+    var trend: Double
+    var breakout: Double
+    var meanrev: Double
+    var vol_state: Double
+    var rsi_14: Double?
+    var zscore_20: Double?
+    var kalman_tstat: Double?
+    var ret_1w: Double?
+    var ret_1m: Double?
+    var ret_3m: Double?
+    var dist_52w_high: Double?
+    var vol_surge: Double?
+    var regime: RegimeState?
+    var flags: [String]
+    var last_close: Double
+    var id: String { symbol }
+}
+
+struct ScanBoard: Codable, Equatable {
+    var rows: [ScanRow]
+    var source: String
+    var ts_ms: Int64
+}
+
 // MARK: - Snapshot (initial state replay from cortexd)
 
 struct EngineSnapshot: Codable {
@@ -597,6 +628,9 @@ struct EngineSnapshot: Codable {
     var feeds: [FeedStatus]?
     var regimes: RegimeBoard?
     var geo: GeoPulse?
+    var scan: ScanBoard?
+    /// Scan-universe symbols beyond the watchlist (D1 charts + search).
+    var search_universe: [String]?
 }
 
 // MARK: - Inbound frame (server -> client), tag field "type"
@@ -624,6 +658,7 @@ enum ServerFrame {
     case company(CompanyProfile)
     case regimeMap(RegimeBoard)
     case geo(GeoPulse)
+    case scan(ScanBoard)
     case gap(dropped: Int)
     case error(detail: String)
     case unknown(type: String)
@@ -660,6 +695,7 @@ enum ServerFrame {
         case "company": return .company(try dec.decode(CompanyProfile.self, from: data))
         case "regime_map": return .regimeMap(try dec.decode(RegimeBoard.self, from: data))
         case "geo": return .geo(try dec.decode(GeoPulse.self, from: data))
+        case "scan": return .scan(try dec.decode(ScanBoard.self, from: data))
         case "gap":
             struct Gap: Codable { var dropped: Int }
             return .gap(dropped: try dec.decode(Gap.self, from: data).dropped)

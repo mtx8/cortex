@@ -46,7 +46,7 @@ final class AppModel {
     private(set) var feeds: [String: FeedStatus] = [:]
 
     // MARK: Center sections
-    enum CenterMode: String, CaseIterable { case chart, company, options, foundry, regimes, meridian }
+    enum CenterMode: String, CaseIterable { case chart, scanner, company, options, foundry, regimes, meridian }
     var centerMode: CenterMode = .chart
     private(set) var optionsChain: OptionsChain?
     private(set) var chainLoading = false
@@ -64,6 +64,9 @@ final class AppModel {
     private var pendingCompany: String?
     private(set) var regimeBoard: RegimeBoard?
     private(set) var geoPulse: GeoPulse?
+    private(set) var scanBoard: ScanBoard?
+    /// Universe symbols beyond the watchlist — searchable, D1-chartable.
+    private(set) var searchUniverse: [String] = []
 
     // MARK: Copilot
     private(set) var copilot: [CopilotMessage] = []
@@ -90,7 +93,8 @@ final class AppModel {
 
     func lastPrice(_ symbol: String) -> Double? {
         if let t = lastTick[symbol] { return t.price }
-        return bars[symbol]?[.m1]?.last?.close
+        // Universe symbols carry D1-only history — fall through to it.
+        return bars[symbol]?[.m1]?.last?.close ?? bars[symbol]?[.d1]?.last?.close
     }
 
     func sessionChangePct(_ symbol: String) -> Double? {
@@ -243,6 +247,8 @@ final class AppModel {
             regimeBoard = board
         case .geo(let pulse):
             geoPulse = pulse
+        case .scan(let board):
+            scanBoard = board
         case .gap, .error, .unknown:
             break
         }
@@ -272,6 +278,8 @@ final class AppModel {
         for f in snap.feeds ?? [] { feeds[f.feed] = f }
         if let r = snap.regimes { regimeBoard = r }
         if let g = snap.geo { geoPulse = g }
+        if let s = snap.scan { scanBoard = s }
+        if let u = snap.search_universe { searchUniverse = u }
         for (symbol, byInterval) in rebuilt {
             if sessionOpen[symbol] == nil {
                 sessionOpen[symbol] = byInterval[.m1]?.last?.close ?? byInterval[.h1]?.last?.close

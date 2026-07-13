@@ -6,10 +6,10 @@ import XCTest
 
 @MainActor
 final class ShellTests: XCTestCase {
-    func testCenterModeHasSixCasesInRailOrder() {
+    func testCenterModeHasSevenCasesInRailOrder() {
         XCTAssertEqual(
             AppModel.CenterMode.allCases,
-            [.chart, .company, .options, .foundry, .regimes, .meridian]
+            [.chart, .scanner, .company, .options, .foundry, .regimes, .meridian]
         )
     }
 

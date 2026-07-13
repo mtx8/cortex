@@ -4,24 +4,48 @@ import SwiftUI
 
 struct Watchlist: View {
     @Environment(AppModel.self) private var model
+    @State private var searchText = ""
+
+    private var query: String {
+        searchText.trimmingCharacters(in: .whitespaces).uppercased()
+    }
+
+    private func matches(_ symbol: String) -> Bool {
+        query.isEmpty || symbol.uppercased().contains(query)
+    }
 
     // Asset-class groups (order within each group preserved from the engine).
     private var cryptoSymbols: [String] {
-        model.symbols.filter { !AppModel.isEquity($0) }
+        model.symbols.filter { !AppModel.isEquity($0) && matches($0) }
     }
     private var equitySymbols: [String] {
-        model.symbols.filter { AppModel.isEquity($0) }
+        model.symbols.filter { AppModel.isEquity($0) && matches($0) }
+    }
+    /// Search hits from the scan universe (D1-chartable), watchlist excluded.
+    private var universeMatches: [String] {
+        guard !query.isEmpty else { return [] }
+        return model.searchUniverse.filter { $0.uppercased().contains(query) }.prefix(12).map { $0 }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionLabel(text: "watchlist")
                 .padding(.horizontal, 4)
+            searchField
             if !cryptoSymbols.isEmpty {
                 symbolGroup(label: "crypto", symbols: cryptoSymbols)
             }
             if !equitySymbols.isEmpty {
                 symbolGroup(label: "equities", symbols: equitySymbols)
+            }
+            if !universeMatches.isEmpty {
+                symbolGroup(label: "universe", symbols: universeMatches)
+            }
+            if !query.isEmpty, cryptoSymbols.isEmpty, equitySymbols.isEmpty, universeMatches.isEmpty {
+                Text("no match — return opens \(query) in COMPANY")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.dim)
+                    .padding(.horizontal, 4)
             }
             if model.symbols.isEmpty {
                 Text("waiting for engine")
@@ -34,6 +58,48 @@ struct Watchlist: View {
         }
         .padding(12)
         .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    /// Search across the watchlist + scan universe. Return selects the first
+    /// visible match; an unknown ticker opens the COMPANY board (EDGAR
+    /// resolves any US filer, so lookups are never a dead end).
+    private var searchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Theme.dim)
+            TextField("search symbols", text: $searchText)
+                .textFieldStyle(.plain)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Theme.bone)
+                .onSubmit {
+                    guard !query.isEmpty else { return }
+                    if let hit = (cryptoSymbols + equitySymbols + universeMatches).first {
+                        model.selectSymbol(hit)
+                    } else {
+                        model.openCompany(query)
+                    }
+                    searchText = ""
+                }
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.dim)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Theme.panel)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.chipRadius)
+                .strokeBorder(Theme.line, lineWidth: 1)
+        )
     }
 
     private func symbolGroup(label: String, symbols: [String]) -> some View {

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use cx_core::events::{
     AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, OrderUpdate, RegimeBoard,
+    ScanBoard,
 };
 use cx_core::store::BarStore;
 use cx_core::types::Interval;
@@ -23,6 +24,9 @@ const ORDER_RING: usize = 100;
 
 pub struct SnapshotSrc {
     symbols: Vec<String>,
+    /// Scan-universe symbols beyond the configured set: D1-only history in
+    /// snapshots so any of them can chart + be searched client-side.
+    universe: Vec<String>,
     store: Arc<BarStore>,
     oms: Arc<Oms>,
     risk: Arc<RiskEngine>,
@@ -33,18 +37,25 @@ pub struct SnapshotSrc {
     feeds: Mutex<HashMap<String, FeedStatus>>,
     regimes_last: Mutex<Option<RegimeBoard>>,
     geo_last: Mutex<Option<GeoPulse>>,
+    scan_last: Mutex<Option<ScanBoard>>,
 }
 
 impl SnapshotSrc {
     pub fn new(
         symbols: Vec<String>,
+        universe: Vec<String>,
         store: Arc<BarStore>,
         oms: Arc<Oms>,
         risk: Arc<RiskEngine>,
         dial: Arc<AutonomyDial>,
     ) -> Arc<Self> {
+        let universe: Vec<String> = universe
+            .into_iter()
+            .filter(|u| !symbols.contains(u))
+            .collect();
         Arc::new(Self {
             symbols,
+            universe,
             store,
             oms,
             risk,
@@ -55,6 +66,7 @@ impl SnapshotSrc {
             feeds: Mutex::new(HashMap::new()),
             regimes_last: Mutex::new(None),
             geo_last: Mutex::new(None),
+            scan_last: Mutex::new(None),
         })
     }
 
@@ -113,6 +125,10 @@ impl SnapshotSrc {
                             *this.geo_last.lock().unwrap_or_else(|p| p.into_inner()) =
                                 Some(g.clone());
                         }
+                        EngineEvent::Scan(s) => {
+                            *this.scan_last.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(s.clone());
+                        }
                         _ => {}
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -141,6 +157,15 @@ impl SnapshotSource for SnapshotSrc {
                 }
             }
             bars.insert(symbol.clone(), serde_json::Value::Object(per_interval));
+        }
+        // Universe symbols: D1 only (delayed research history, not live feeds).
+        for symbol in &self.universe {
+            let series = self.store.recent(symbol, Interval::D1, n);
+            if !series.is_empty() {
+                let mut per_interval = serde_json::Map::new();
+                per_interval.insert("d1".into(), serde_json::to_value(&series).unwrap_or_default());
+                bars.insert(symbol.clone(), serde_json::Value::Object(per_interval));
+            }
         }
         let thoughts: Vec<AgentThought> = self
             .thoughts
@@ -176,6 +201,7 @@ impl SnapshotSource for SnapshotSrc {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         let geo_last = self.geo_last.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let scan_last = self.scan_last.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
         serde_json::json!({
             "symbols": self.symbols,
@@ -189,6 +215,8 @@ impl SnapshotSource for SnapshotSrc {
             "feeds": feeds,
             "regimes": regimes_last,
             "geo": geo_last,
+            "scan": scan_last,
+            "search_universe": self.universe,
         })
     }
 }

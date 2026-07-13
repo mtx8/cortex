@@ -10,6 +10,7 @@ pub mod causal_rules;
 pub mod company;
 pub mod meridian;
 pub mod regimes;
+pub mod scanner;
 pub mod splc_data;
 
 use std::sync::Arc;
@@ -29,6 +30,9 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) {
     }
     if cfg.intel.enable_meridian {
         meridian::spawn_poller(Arc::clone(&bus), cfg.clone());
+    }
+    if cfg.intel.enable_scanner {
+        scanner::spawn_scanner(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
     }
 }
 

@@ -523,6 +523,47 @@ pub struct GeoPulse {
     pub ts_ms: i64,
 }
 
+/// One SCANNER row: cross-sectional percentile scores (0-100, ranked
+/// against the rest of the scan universe on the same cycle) plus the raw
+/// readings behind them. Absent data is None — never a fake zero.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanRow {
+    pub symbol: String,
+    /// "equity" | "crypto".
+    pub asset_class: String,
+    /// Weighted blend of the percentile scores (documented in cx-intel).
+    pub composite: f64,
+    pub momentum: f64,
+    pub trend: f64,
+    pub breakout: f64,
+    pub meanrev: f64,
+    pub vol_state: f64,
+    pub rsi_14: Option<f64>,
+    pub zscore_20: Option<f64>,
+    pub kalman_tstat: Option<f64>,
+    /// Simple returns over ~1w/1m/3m of D1 bars.
+    pub ret_1w: Option<f64>,
+    pub ret_1m: Option<f64>,
+    pub ret_3m: Option<f64>,
+    /// Fraction below the 252d high (0 = at the high).
+    pub dist_52w_high: Option<f64>,
+    /// Latest volume vs its 20d average (1.0 = normal).
+    pub vol_surge: Option<f64>,
+    pub regime: Option<RegimeState>,
+    /// Event flags: "new 52w high", "golden cross", "volume spike",
+    /// "breakout setup", "oversold bounce", "vol expansion".
+    pub flags: Vec<String>,
+    pub last_close: f64,
+}
+
+/// The SCANNER board, republished every scan cycle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanBoard {
+    pub rows: Vec<ScanRow>,
+    pub source: String,
+    pub ts_ms: i64,
+}
+
 /// Answer to an `AskAi` command — the copilot channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AiAnswer {
@@ -558,6 +599,7 @@ pub enum EngineEvent {
     Company(CompanyProfile),
     RegimeMap(RegimeBoard),
     Geo(GeoPulse),
+    Scan(ScanBoard),
 }
 
 impl EngineEvent {
@@ -595,6 +637,7 @@ impl EngineEvent {
             EngineEvent::Company(_) => "company",
             EngineEvent::RegimeMap(_) => "regime_map",
             EngineEvent::Geo(_) => "geo",
+            EngineEvent::Scan(_) => "scan",
         }
     }
 }

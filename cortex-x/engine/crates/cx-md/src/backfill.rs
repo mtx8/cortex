@@ -57,6 +57,58 @@ pub(crate) async fn run(egress: &Egress, store: &BarStore, symbols: &[String], m
             }
             tokio::time::sleep(REQUEST_GAP).await;
         }
+        deep_d1(egress, store, symbol).await;
+    }
+}
+
+/// Coinbase caps one candles response at ~300 rows, which limits plain D1
+/// backfill to ~10 months. Page backwards with explicit start/end windows
+/// until ~5 years of daily bars are in the store (or history runs out).
+const DEEP_D1_PAGES: usize = 6;
+const DAY_SECS: i64 = 86_400;
+
+async fn deep_d1(egress: &Egress, store: &BarStore, symbol: &str) {
+    let mut oldest_ms = store
+        .recent(symbol, Interval::D1, 4_000)
+        .first()
+        .map(|b| b.ts_open_ms);
+    for _ in 0..DEEP_D1_PAGES {
+        let Some(end_ms) = oldest_ms else { return };
+        let end_sec = end_ms / 1_000 - DAY_SECS;
+        let start_sec = end_sec - 299 * DAY_SECS;
+        if end_sec <= 0 {
+            return;
+        }
+        // Coinbase documents ISO 8601 for start/end.
+        let (Some(start_iso), Some(end_iso)) = (
+            chrono::DateTime::from_timestamp(start_sec, 0).map(|d| d.to_rfc3339()),
+            chrono::DateTime::from_timestamp(end_sec, 0).map(|d| d.to_rfc3339()),
+        ) else {
+            return;
+        };
+        let url = format!(
+            "https://api.exchange.coinbase.com/products/{symbol}/candles?granularity=86400&start={start_iso}&end={end_iso}"
+        );
+        match egress.get_text(&url).await {
+            Ok(body) => {
+                let bars = parse_candles(symbol, Interval::D1, &body, 320);
+                if bars.is_empty() {
+                    return; // history exhausted — listing date reached
+                }
+                let page_oldest = bars.first().map(|b| b.ts_open_ms);
+                let n = bars.len();
+                for bar in bars {
+                    store.push(bar);
+                }
+                tracing::info!(target: "cx_md::backfill", symbol, bars = n, "deep D1 page");
+                oldest_ms = page_oldest;
+            }
+            Err(e) => {
+                tracing::warn!(target: "cx_md::backfill", symbol, error = %e, "deep D1 page failed; stopping");
+                return;
+            }
+        }
+        tokio::time::sleep(REQUEST_GAP).await;
     }
 }
 

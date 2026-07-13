@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
     // Snapshot assembly + websocket gateway.
     let snap = SnapshotSrc::new(
         cfg.symbols.clone(),
+        cx_intel::regimes::universe(&cfg),
         Arc::clone(&store),
         Arc::clone(&oms),
         Arc::clone(&risk),

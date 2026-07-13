@@ -153,6 +153,9 @@ pub struct IntelConfig {
     pub gdelt_poll_secs: u64,
     /// REGIMES scan cadence (seconds, floor 300).
     pub regime_scan_secs: u64,
+    /// SCANNER recompute cadence (seconds, floor 60).
+    pub scanner_secs: u64,
+    pub enable_scanner: bool,
     pub enable_company: bool,
     pub enable_regimes: bool,
     pub enable_meridian: bool,
@@ -173,6 +176,8 @@ impl Default for IntelConfig {
             universe: DEFAULT_UNIVERSE.iter().map(|s| s.to_string()).collect(),
             gdelt_poll_secs: 900,
             regime_scan_secs: 1_800,
+            scanner_secs: 300,
+            enable_scanner: true,
             enable_company: true,
             enable_regimes: true,
             enable_meridian: true,
@@ -308,6 +313,9 @@ impl Config {
         }
         if self.intel.regime_scan_secs < 300 {
             return Err(CxError::Config("intel.regime_scan_secs must be >= 300".into()));
+        }
+        if self.intel.scanner_secs < 60 {
+            return Err(CxError::Config("intel.scanner_secs must be >= 60".into()));
         }
         Ok(())
     }
