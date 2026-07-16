@@ -68,6 +68,11 @@ final class ChartInteraction {
     /// Log10 price axis; the frame falls back to linear when any visible
     /// low (or overlay value) is <= 0.
     var logScale = false
+    /// Pre-market / after-hours background wash. A mode like the overlay
+    /// toggles (not a tool) so it survives series switches; only the ext
+    /// chip on equity intraday charts exposes it, and the frame ignores it
+    /// off those charts.
+    var showExtendedHours = true
 
     // Drawing tools
     /// Armed drawing tool; non-cursor tools claim clicks and suppress pan.
@@ -142,6 +147,15 @@ final class ChartInteraction {
         dragAnchorOffset = nil
         isDragging = false
         rightOffset = 0
+    }
+
+    /// Manual interval / weekly switch drops back to the default zoom so a
+    /// prior range preset's wide window doesn't linger into a sub-daily view.
+    /// Range presets set their own width through `applyRange` and reach the
+    /// live edge via `resetForNewSeries`, so this stays deliberately separate
+    /// from that path (which the range flow also triggers).
+    func resetZoomToDefault() {
+        barsVisible = ChartMath.defaultVisibleBars
     }
 
     /// Symbol or interval switched: new series, back to the live edge with

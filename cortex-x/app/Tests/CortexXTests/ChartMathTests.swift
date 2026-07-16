@@ -529,6 +529,67 @@ extension ChartMathTests {
         XCTAssertTrue(ChartMath.isExtendedHours(try ts("2026-07-15T00:00:00Z")))
     }
 
+    // MARK: - Equity intraday gate (ext chip + no-data notice)
+
+    func testIsEquityIntradayTrueForBareTickerSubDaily() {
+        // Every sub-daily interval on a bare ticker qualifies — this drives
+        // both the ext toggle and the "no <interval> bars" notice.
+        for iv in [Interval.s1, .m1, .m5, .m15, .h1] {
+            XCTAssertTrue(
+                ChartMath.isEquityIntraday(symbol: "AAPL", interval: iv, weekly: false),
+                "\(iv) should be equity-intraday"
+            )
+        }
+    }
+
+    func testIsEquityIntradayFalseForDailyOrWeekly() {
+        // Daily bars are whole sessions; weekly rides .d1 with a weekly flag.
+        XCTAssertFalse(ChartMath.isEquityIntraday(symbol: "AAPL", interval: .d1, weekly: false))
+        XCTAssertFalse(ChartMath.isEquityIntraday(symbol: "AAPL", interval: .d1, weekly: true))
+        // A weekly view never shades even if the interval reads sub-daily.
+        XCTAssertFalse(ChartMath.isEquityIntraday(symbol: "AAPL", interval: .h1, weekly: true))
+    }
+
+    func testIsEquityIntradayFalseForCryptoPairs() {
+        // "-" pairs are crypto (AppModel.isEquity rule): 24/7, nothing to
+        // shade, and an empty series there is a load state, not a feed gap.
+        for iv in [Interval.s1, .m1, .h1, .d1] {
+            XCTAssertFalse(
+                ChartMath.isEquityIntraday(symbol: "BTC-USD", interval: iv, weekly: false),
+                "\(iv) on a crypto pair is not equity-intraday"
+            )
+        }
+    }
+
+    // MARK: - No-intraday-data notice gate
+
+    func testNoDataNoticeOnlyForSubFiveMinuteEquity() {
+        // s1 / m1 aren't in the delayed feed — an empty series is a feed gap,
+        // so the "no <interval> bars" notice fires.
+        for iv in [Interval.s1, .m1] {
+            XCTAssertTrue(
+                ChartMath.showsNoIntradayDataNotice(symbol: "AAPL", interval: iv, weekly: false),
+                "\(iv) empties should show the no-data notice"
+            )
+        }
+        // m5 / m15 / h1 ARE supplied (m5 is named in the notice copy), so an
+        // empty series there is still loading — fall back to the waiting state.
+        for iv in [Interval.m5, .m15, .h1] {
+            XCTAssertFalse(
+                ChartMath.showsNoIntradayDataNotice(symbol: "AAPL", interval: iv, weekly: false),
+                "\(iv) empties should read as loading, not a feed gap"
+            )
+        }
+    }
+
+    func testNoDataNoticeFalseForDailyWeeklyAndCrypto() {
+        // Daily / weekly are whole sessions; crypto trades 24/7 — none route
+        // to the feed-gap notice regardless of interval.
+        XCTAssertFalse(ChartMath.showsNoIntradayDataNotice(symbol: "AAPL", interval: .d1, weekly: false))
+        XCTAssertFalse(ChartMath.showsNoIntradayDataNotice(symbol: "AAPL", interval: .s1, weekly: true))
+        XCTAssertFalse(ChartMath.showsNoIntradayDataNotice(symbol: "BTC-USD", interval: .m1, weekly: false))
+    }
+
     func testDayKeysEasternVsUTC() throws {
         // Midday: both calendars agree on the date.
         XCTAssertEqual(ChartMath.easternDayKey(try ts("2026-07-15T12:00:00Z")), 20_260_715)

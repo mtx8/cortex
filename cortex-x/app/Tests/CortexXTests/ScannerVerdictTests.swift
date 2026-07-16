@@ -285,6 +285,19 @@ final class ScannerVerdictTests: XCTestCase {
         XCTAssertFalse(ScanSummary.Column.flag.sortable)
     }
 
+    func testExactlyOneColumnFillsWidthAndItIsFlag() {
+        // The calm summary table spans the pane by letting FLAG (the last
+        // content column) absorb the leftover width. Exactly one column flexes;
+        // every other holds its fixed width — otherwise the row layout drifts.
+        XCTAssertTrue(ScanSummary.Column.flag.fillsWidth)
+        XCTAssertEqual(ScanSummary.Column.allCases.filter(\.fillsWidth), [.flag])
+        XCTAssertFalse(ScanSummary.Column.symbol.fillsWidth)
+        XCTAssertFalse(ScanSummary.Column.price.fillsWidth)
+        XCTAssertFalse(ScanSummary.Column.change.fillsWidth)
+        XCTAssertFalse(ScanSummary.Column.composite.fillsWidth)
+        XCTAssertFalse(ScanSummary.Column.setup.fillsWidth)
+    }
+
     // MARK: - Summary sort
 
     private func priceMap(_ px: [String: Double]) -> (ScanRow) -> Double? { { px[$0.symbol] } }

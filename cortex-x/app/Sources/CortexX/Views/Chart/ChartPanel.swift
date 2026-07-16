@@ -54,6 +54,7 @@ struct ChartPanel: View {
                 bars: bars,
                 interval: weeklyMode ? .d1 : displayInterval,
                 barSpanMs: weeklyMode ? ChartMath.weekMs : displayInterval.ms,
+                weekly: weeklyMode,
                 signals: signals,
                 thoughts: thoughts,
                 feeds: feeds,
@@ -347,14 +348,19 @@ struct ChartPanel: View {
         HStack(spacing: 2) {
             ForEach(Interval.allCases) { iv in
                 intervalChip(iv.label, isOn: !weeklyMode && selection.wrappedValue == iv) {
+                    // A manual interval pick drops any range preset's wide
+                    // window back to the default zoom (the range flow sets its
+                    // own width through applyRange, so it stays untouched).
                     selectedRange = nil
                     weeklyMode = false
+                    interaction.resetZoomToDefault()
                     selection.wrappedValue = iv
                 }
             }
             // Weekly rides on the 1d feed; the 1d chip deselects while on.
             intervalChip("1w", isOn: weeklyMode) {
                 selectedRange = nil
+                interaction.resetZoomToDefault()
                 selection.wrappedValue = .d1
                 weeklyMode = true
             }

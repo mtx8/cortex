@@ -25,6 +25,9 @@ struct CandleChart: View {
     /// `interval.ms`. Weekly bars keep `.d1` on the wire, so timestamp
     /// bucketing and intra-gap fractions must use this, not the interval.
     let barSpanMs: Int64
+    /// View-level weekly aggregation is on (bars ride the `.d1` interval).
+    /// Passed through so the equity-intraday gate reads correctly.
+    let weekly: Bool
     let signals: [StrategySignal]
     let thoughts: [AgentThought]
     let feeds: [FeedStatus]
@@ -32,6 +35,16 @@ struct CandleChart: View {
     let drawingStore: DrawingStore
 
     @FocusState private var focused: Bool
+
+    /// Equity intraday chart: enables the ext toggle + its wash, and turns an
+    /// empty series into a clear "no bars" notice rather than a load spinner.
+    private var equityIntraday: Bool {
+        ChartMath.isEquityIntraday(symbol: symbol, interval: interval, weekly: weekly)
+    }
+
+    private var showsNoIntradayDataNotice: Bool {
+        ChartMath.showsNoIntradayDataNotice(symbol: symbol, interval: interval, weekly: weekly)
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -44,10 +57,10 @@ struct CandleChart: View {
                         signals: signals, thoughts: thoughts,
                         drawings: drawingStore.drawings(for: symbol),
                         size: geo.size, interaction: interaction,
-                        // Equity intraday only: bare ticker = equity (the
-                        // AppModel.isEquity rule), and D1/weekly bars are
-                        // whole RTH sessions — nothing to shade there.
-                        shadeExtendedHours: interval != .d1 && !symbol.contains("-")
+                        // Equity intraday only, and only while the ext toggle
+                        // is on: D1/weekly bars are whole RTH sessions and
+                        // crypto trades 24/7 — nothing to shade there.
+                        shadeExtendedHours: equityIntraday && interaction.showExtendedHours
                     )
                 )
             }
@@ -59,6 +72,22 @@ struct CandleChart: View {
 
     private func chartBody(_ frame: ChartFrame?) -> some View {
         ZStack(alignment: .topLeading) {
+            plotLayer(frame)
+            // Control layer sits ABOVE the gesture layer so the legend chips,
+            // tool strip and live chip receive their own taps — the chart-wide
+            // pan / tap gestures on `plotLayer` no longer swallow them.
+            if let frame {
+                overlays(frame)
+            }
+        }
+    }
+
+    /// Canvas + scroll-wheel bridge carrying every chart-wide gesture: pan,
+    /// zoom, crosshair hover, drawing-anchor clicks and the Esc / Delete keys.
+    /// Isolated as its own layer (below the control chips) so those gestures
+    /// only claim clicks that land on the plot itself.
+    private func plotLayer(_ frame: ChartFrame?) -> some View {
+        ZStack {
             Canvas(opaque: true, rendersAsynchronously: false) { ctx, canvasSize in
                 if let frame {
                     frame.draw(in: ctx)
@@ -76,9 +105,6 @@ struct CandleChart: View {
                     anchorFraction: Double(location.x / max(frame.plotWidth, 1)),
                     total: bars.count
                 )
-            }
-            if let frame {
-                overlays(frame)
             }
         }
         .contentShape(Rectangle())
@@ -223,6 +249,14 @@ struct CandleChart: View {
                 label: "log", value: nil,
                 color: Theme.bone.opacity(0.55), isOn: interaction.logScale
             ) { interaction.logScale.toggle() }
+            // Pre-market / after-hours shading toggle — only meaningful on an
+            // equity's intraday chart, so it stays out of the strip otherwise.
+            if equityIntraday {
+                LegendChip(
+                    label: "ext", value: nil,
+                    color: Theme.bone.opacity(0.55), isOn: interaction.showExtendedHours
+                ) { interaction.showExtendedHours.toggle() }
+            }
             toolStrip
         }
     }
@@ -290,7 +324,31 @@ struct CandleChart: View {
 
     // MARK: - Empty state
 
+    @ViewBuilder
     private var emptyState: some View {
+        if showsNoIntradayDataNotice {
+            noIntradayDataState
+        } else {
+            waitingState
+        }
+    }
+
+    /// Equity intraday with no bars is a feed limitation, not a load stall:
+    /// the delayed CBOE feed only carries daily / hourly / 5-min. Name the
+    /// missing interval + symbol so s1 / m1 don't read as a frozen chart.
+    private var noIntradayDataState: some View {
+        VStack(spacing: 6) {
+            Text("no \(interval.label) bars for \(symbol)")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.dim)
+            Text("delayed feed provides daily / hourly / 5-min")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.dim.opacity(0.7))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var waitingState: some View {
         VStack(spacing: 10) {
             Text("waiting for market data")
                 .font(.system(size: 12))

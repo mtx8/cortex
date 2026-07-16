@@ -238,6 +238,32 @@ enum ScanFormat {
     }
 }
 
+/// Discriminates the scanner's two empty states. A genuinely empty board (no
+/// scan yet) shows the first-scan-pending copy; a board WITH rows whose active
+/// preset + filters + search matched none shows a "no rows match this screen"
+/// message naming the screen — never a blank void. Pure so both the branch and
+/// the copy are testable.
+enum ScanEmptyState {
+    /// True only when the board has rows but the visible (post preset / filter
+    /// / search) set is empty — the screen filtered everything out.
+    static func isScreenedEmpty(boardRowCount: Int, visibleRowCount: Int) -> Bool {
+        boardRowCount > 0 && visibleRowCount == 0
+    }
+
+    /// One quiet line naming the active screen so the operator knows what to
+    /// relax: the preset, plus any filter count and (trimmed) symbol query.
+    static func detail(preset: String, filterCount: Int, query: String) -> String {
+        var parts = ["'\(preset)'"]
+        if filterCount > 0 {
+            parts.append("\(filterCount) filter\(filterCount == 1 ? "" : "s")")
+        }
+        let q = query.trimmingCharacters(in: .whitespaces)
+        if !q.isEmpty { parts.append("symbol '\(q)'") }
+        return "nothing passes " + parts.joined(separator: " + ")
+            + " right now — relax the screen or clear filters"
+    }
+}
+
 // MARK: - Column layout (fixed widths so header and rows stay aligned)
 
 private enum ScanCol {
@@ -331,7 +357,10 @@ struct ScannerView: View {
                         emptyState
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // topLeading so a table shorter/narrower than the pane hugs the
+                // corner and grows from there — never floats dead-center in a
+                // void. The tables themselves fill; this pins whatever doesn't.
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 if showAlerts {
                     Divider().overlay(Theme.line)
                     alertStrip
@@ -834,15 +863,20 @@ struct ScannerView: View {
 
     // MARK: Summary table (the calm default — six readable columns)
 
+    @ViewBuilder
     private func summaryTable(_ board: ScanBoard) -> some View {
         let rows = displayRows(board)
-        let news = headlines
-        return ScrollView([.horizontal, .vertical]) {
-            LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
-                Section {
-                    if rows.isEmpty {
-                        noRows
-                    } else {
+        if ScanEmptyState.isScreenedEmpty(boardRowCount: board.rows.count, visibleRowCount: rows.count) {
+            noRowsForScreen
+        } else {
+            let news = headlines
+            // Vertical-only scroll: the six calm columns fit any standard pane,
+            // so rows and header span its full width (one column flexes) rather
+            // than riding a narrow, horizontally scrolling island. The dense
+            // 16-column details grid keeps its two-axis scroll — it earns it.
+            ScrollView(.vertical) {
+                LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                    Section {
                         ForEach(rows) { row in
                             ScanSummaryRowView(
                                 row: row,
@@ -866,12 +900,11 @@ struct ScannerView: View {
                                 }
                             )
                         }
+                    } header: {
+                        summaryHeaderRow
                     }
-                } header: {
-                    summaryHeaderRow
                 }
             }
-            .frame(minWidth: ScanSummaryCol.minWidth, alignment: .leading)
         }
     }
 
@@ -880,10 +913,13 @@ struct ScannerView: View {
             ForEach(ScanSummary.columns, id: \.self) { col in
                 summaryHeaderCell(col)
             }
-            Spacer(minLength: ScanSummaryCol.action)
+            // A fixed reservation for the per-row action glyph — NOT a flexible
+            // Spacer, which would fight the flag column for the leftover width.
+            Color.clear.frame(width: ScanSummaryCol.action, height: 0)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Theme.ink)
         .deckRowRule(1)
     }
@@ -907,7 +943,13 @@ struct ScannerView: View {
                 }
                 if col.alignment == .leading { Spacer(minLength: 0) }
             }
-            .frame(width: ScanSummaryCol.width(col))
+            // The one flexing column grows from its fixed width to the leftover
+            // pane width; every other column is pinned. Row cells mirror this so
+            // header and body stay column-aligned.
+            .frame(
+                minWidth: ScanSummaryCol.width(col),
+                maxWidth: col.fillsWidth ? .infinity : ScanSummaryCol.width(col)
+            )
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -915,25 +957,35 @@ struct ScannerView: View {
         .animation(DeckMotion.ease(), value: active)
     }
 
-    private var noRows: some View {
-        Text("no rows match")
-            .font(.system(size: 11))
-            .foregroundStyle(Theme.dim)
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
+    /// The board HAS rows, but the active preset + filters + search matched
+    /// none. Named so the operator knows WHICH screen to relax — centered in
+    /// the pane, one dim voice, never a blank void.
+    private var noRowsForScreen: some View {
+        VStack(spacing: 8) {
+            Text("no rows match this screen")
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.dim)
+            Text(ScanEmptyState.detail(preset: preset.title, filterCount: filters.count, query: search))
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.dim)
+                .multilineTextAlignment(.center)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: Details table (the opt-in full percentile grid)
 
+    @ViewBuilder
     private func detailsTable(_ board: ScanBoard) -> some View {
         let rows = displayRows(board)
-        let news = headlines
-        return ScrollView([.horizontal, .vertical]) {
-            LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
-                Section {
-                    if rows.isEmpty {
-                        noRows
-                    } else {
+        if ScanEmptyState.isScreenedEmpty(boardRowCount: board.rows.count, visibleRowCount: rows.count) {
+            noRowsForScreen
+        } else {
+            let news = headlines
+            ScrollView([.horizontal, .vertical]) {
+                LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                    Section {
                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                             ScanRowView(
                                 row: row,
@@ -950,12 +1002,12 @@ struct ScannerView: View {
                                 }
                             )
                         }
+                    } header: {
+                        headerRow
                     }
-                } header: {
-                    headerRow
                 }
+                .frame(minWidth: ScanCol.minWidth, alignment: .leading)
             }
-            .frame(minWidth: ScanCol.minWidth, alignment: .leading)
         }
     }
 
@@ -1193,8 +1245,12 @@ private struct ScanSummaryRowView: View {
                         .foregroundStyle(Theme.dim)
                 }
             }
+            Spacer(minLength: 0)
         }
-        .frame(width: ScanSummaryCol.flag, alignment: .leading)
+        // FLAG is the flexing column: it grows from its fixed floor to the
+        // pane's leftover width, spanning the row left-to-right and pushing the
+        // trailing action to the right edge. The header cell mirrors this.
+        .frame(minWidth: ScanSummaryCol.flag, maxWidth: .infinity, alignment: .leading)
         .help(row.flags.isEmpty ? "no flags" : row.flags.joined(separator: " · "))
     }
 }
@@ -1220,11 +1276,6 @@ private enum ScanSummaryCol {
         case .setup: setup
         case .flag: flag
         }
-    }
-
-    static var minWidth: CGFloat {
-        let cols = ScanSummary.columns.map(width).reduce(0, +)
-        return cols + gap * CGFloat(ScanSummary.columns.count) + action + 24
     }
 }
 

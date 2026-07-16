@@ -319,6 +319,29 @@ enum ChartMath {
         return (ymd.year ?? 0) * 10_000 + (ymd.month ?? 0) * 100 + (ymd.day ?? 0)
     }
 
+    /// Extended-hours shading (and its ext toggle) apply only to an equity's
+    /// intraday chart: a bare ticker (no "-" pair ⇒ equity, matching
+    /// `AppModel.isEquity`), a sub-daily interval, and not the weekly view.
+    /// D1 and weekly bars are whole RTH sessions with nothing to shade, and
+    /// crypto ("-" pairs) trades round the clock. Drives the extended-hours
+    /// toggle for every sub-daily equity interval; the narrower
+    /// `showsNoIntradayDataNotice` gate decides when an empty series is a
+    /// feed gap rather than a still-loading state.
+    static func isEquityIntraday(symbol: String, interval: Interval, weekly: Bool) -> Bool {
+        !weekly && interval != .d1 && !symbol.contains("-")
+    }
+
+    /// Gates the "no <interval> bars" notice. The delayed CBOE feed carries
+    /// only D1 / H1 / M5, so an empty *sub-5-minute* equity series (s1 / m1)
+    /// is a missing-feed state that must not read as a frozen chart. M5 / M15
+    /// / H1 empties are still forming and fall back to the waiting state —
+    /// naming them here would contradict the notice copy, which lists 5-min
+    /// among the provided intervals.
+    static func showsNoIntradayDataNotice(symbol: String, interval: Interval, weekly: Bool) -> Bool {
+        isEquityIntraday(symbol: symbol, interval: interval, weekly: weekly)
+            && interval.ms < Interval.m5.ms
+    }
+
     // MARK: - Time & buckets
 
     /// One 7-day bar span in milliseconds — the view-level weekly bar width.

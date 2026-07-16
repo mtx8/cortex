@@ -306,4 +306,40 @@ final class ScannerViewTests: XCTestCase {
         XCTAssertEqual(four.shown, ["a", "b"])
         XCTAssertEqual(four.overflow, 2)
     }
+
+    // MARK: - Empty-preset state (board non-empty, screen filtered to nothing)
+
+    func testScreenedEmptyOnlyWhenBoardHasRowsButNoneVisible() {
+        // A board WITH rows whose screen matched none — the "no rows match this
+        // screen" case.
+        XCTAssertTrue(ScanEmptyState.isScreenedEmpty(boardRowCount: 40, visibleRowCount: 0))
+        // Some rows survive the screen — not empty.
+        XCTAssertFalse(ScanEmptyState.isScreenedEmpty(boardRowCount: 40, visibleRowCount: 2))
+        // A genuinely empty board is the first-scan-pending state, NOT this one.
+        XCTAssertFalse(ScanEmptyState.isScreenedEmpty(boardRowCount: 0, visibleRowCount: 0))
+    }
+
+    func testScreenEmptyDetailNamesPresetOnly() {
+        XCTAssertEqual(
+            ScanEmptyState.detail(preset: "top momentum", filterCount: 0, query: ""),
+            "nothing passes 'top momentum' right now — relax the screen or clear filters"
+        )
+    }
+
+    func testScreenEmptyDetailPluralizesFiltersAndAddsQuery() {
+        XCTAssertEqual(
+            ScanEmptyState.detail(preset: "all", filterCount: 1, query: ""),
+            "nothing passes 'all' + 1 filter right now — relax the screen or clear filters"
+        )
+        // Filters pluralize; a trimmed query is named too.
+        XCTAssertEqual(
+            ScanEmptyState.detail(preset: "oversold", filterCount: 3, query: "  nvda "),
+            "nothing passes 'oversold' + 3 filters + symbol 'nvda' right now — relax the screen or clear filters"
+        )
+        // A whitespace-only query is dropped.
+        XCTAssertEqual(
+            ScanEmptyState.detail(preset: "crypto", filterCount: 0, query: "   "),
+            "nothing passes 'crypto' right now — relax the screen or clear filters"
+        )
+    }
 }

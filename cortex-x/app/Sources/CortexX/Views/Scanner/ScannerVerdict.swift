@@ -181,6 +181,15 @@ enum ScanSummary {
             default: .leading
             }
         }
+
+        /// The one column that flexes to absorb the pane's remaining width so
+        /// the calm summary table spans it left-to-right instead of floating at
+        /// its natural width. FLAG is the last content column, so its growth
+        /// pushes the trailing row action to the right edge. Every other column
+        /// holds its fixed width; exactly one column fills.
+        var fillsWidth: Bool {
+            self == .flag
+        }
     }
 
     /// The default column set, in display order.
