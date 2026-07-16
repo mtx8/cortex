@@ -220,7 +220,10 @@ struct CompanyView: View {
                 }
                 segmentsSection(p.segments)
                 fundamentalsSection(p)
+                statisticsSection(p)
+                filingsSection(p)
                 competitorsSection(p.competitors)
+                newsSection(p)
             }
             .padding(.vertical, 2)
         }
@@ -310,6 +313,105 @@ struct CompanyView: View {
         }
     }
 
+    // MARK: Statistics (client-side market cap + honest labels)
+
+    /// Market cap (shares × last price, computed here), shares outstanding, and
+    /// public float. Renders only when the engine supplied a share count or a
+    /// float figure — older engines omit both, so the block simply disappears
+    /// rather than showing an all-dash panel. Absent sub-values show "—".
+    @ViewBuilder
+    private func statisticsSection(_ p: CompanyProfile) -> some View {
+        let f = p.fundamentals
+        if f?.shares_outstanding != nil || f?.public_float_usd != nil {
+            let cap = CompanyStats.marketCap(
+                shares: f?.shares_outstanding, lastPrice: model.lastPrice(p.symbol)
+            )
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(text: "statistics")
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.flexible(), spacing: 10, alignment: .leading), count: 3),
+                    alignment: .leading, spacing: 12
+                ) {
+                    CompanyStatCell(
+                        label: CompanyStats.marketCapLabel,
+                        value: CompanyFormat.abbrevMoney(cap),
+                        note: CompanyStats.marketCapNote
+                    )
+                    CompanyStatCell(
+                        label: CompanyStats.sharesLabel,
+                        value: CompanyStats.abbrevCount(f?.shares_outstanding),
+                        note: CompanyStats.sharesNote
+                    )
+                    CompanyStatCell(
+                        label: CompanyStats.floatLabel,
+                        value: CompanyFormat.abbrevMoney(f?.public_float_usd),
+                        note: CompanyStats.floatNote
+                    )
+                }
+                .padding(12)
+                .panel()
+            }
+        }
+    }
+
+    // MARK: Latest filings (SEC EDGAR)
+
+    /// Recent EDGAR filings, sorted newest-first defensively. Shown for equities
+    /// (where the honest empty state — "no filings from EDGAR" — is meaningful)
+    /// or whenever any filing is present; skipped for crypto/uncurated assets.
+    @ViewBuilder
+    private func filingsSection(_ p: CompanyProfile) -> some View {
+        if AppModel.isEquity(p.symbol) || !p.filings.isEmpty {
+            let ordered = CompanyFilings.ordered(p.filings)
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    SectionLabel(text: "latest filings")
+                    if !ordered.isEmpty {
+                        Text("\(ordered.count)")
+                            .numeric(size: 10)
+                            .foregroundStyle(Theme.dim)
+                    }
+                }
+                if ordered.isEmpty {
+                    Text("no filings from EDGAR")
+                        .font(.system(size: 10))
+                        .foregroundStyle(Theme.dim)
+                } else {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(ordered) { CompanyFilingRow(filing: $0) }
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: Company news
+
+    /// Headlines filtered to this company (symbol tag or name mention), newest-
+    /// first and capped, in the shared NEWS row grammar. Honest empty state.
+    @ViewBuilder
+    private func newsSection(_ p: CompanyProfile) -> some View {
+        let items = CompanyNews.filter(
+            model.newsBoard?.items ?? [], symbol: p.symbol, name: p.name
+        )
+        VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(text: "news")
+            if items.isEmpty {
+                Text(model.newsBoard == nil
+                    ? "waiting for the first wire"
+                    : "no headlines tagged \(p.symbol)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.dim)
+            } else {
+                TimelineView(.periodic(from: .now, by: 30)) { context in
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(items) { CompanyNewsRow(item: $0, now: context.date) }
+                    }
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     private func competitorsSection(_ competitors: [String]) -> some View {
         if !competitors.isEmpty {
@@ -347,7 +449,10 @@ struct CompanyView: View {
                     .font(.system(size: 10))
                     .foregroundStyle(Theme.dim)
                 fundamentalsSection(p)
+                statisticsSection(p)
+                filingsSection(p)
                 competitorsSection(p.competitors)
+                newsSection(p)
             }
             .frame(maxWidth: 560, alignment: .leading)
             .padding(16)

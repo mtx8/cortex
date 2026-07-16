@@ -471,8 +471,26 @@ struct Fundamentals: Codable, Equatable {
     var equity: Double?
     var ocf: Double?
     var cash: Double?
+    /// NEW OPTIONAL wire field — the diluted/basic share COUNT (not money).
+    /// Older engines omit it (decodes nil); the STATISTICS block shows "—".
+    var shares_outstanding: Double? = nil
+    /// NEW OPTIONAL wire field — aggregate public float in USD, as reported on
+    /// the 10-K cover page. A DOLLAR value, never a share count. Absent → nil.
+    var public_float_usd: Double? = nil
     var period: String
     var fiscal_year: String
+}
+
+/// One SEC EDGAR filing reference: the form type, the filed date, and the
+/// primary document URL. Mirror of the engine `Filing` contract type.
+struct Filing: Codable, Equatable, Identifiable {
+    /// The form type — "10-K", "10-Q", "8-K", "S-1", …
+    var form: String
+    /// Filed date, "YYYY-MM-DD".
+    var filed: String
+    /// Direct link to the primary document (opened through the http(s) guard).
+    var primary_doc_url: String
+    var id: String { "\(form)-\(filed)-\(primary_doc_url)" }
 }
 
 struct CompanyProfile: Codable, Equatable {
@@ -487,9 +505,44 @@ struct CompanyProfile: Codable, Equatable {
     var customers: [Relation]
     var competitors: [String]
     var fundamentals: Fundamentals?
+    /// NEW OPTIONAL wire field — recent SEC EDGAR filings, newest-first. Older
+    /// engines omit the key entirely, so it defaults to [] (a custom decoder
+    /// tolerates the absence) rather than failing the whole frame.
+    var filings: [Filing] = []
     var graph_source: String
     var fundamentals_source: String
     var ts_ms: Int64
+}
+
+extension CompanyProfile {
+    enum CodingKeys: String, CodingKey {
+        case symbol, name, sector, industry, country, description
+        case segments, suppliers, customers, competitors
+        case fundamentals, filings, graph_source, fundamentals_source, ts_ms
+    }
+
+    // Custom decode so `filings` defaults to [] when the key is absent (older
+    // engines). Every other field decodes exactly as the synthesized memberwise
+    // path would; `encode(to:)` stays synthesized. Declared in an extension so
+    // the memberwise initializer is preserved for construction/tests.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        symbol = try c.decode(String.self, forKey: .symbol)
+        name = try c.decode(String.self, forKey: .name)
+        sector = try c.decode(String.self, forKey: .sector)
+        industry = try c.decode(String.self, forKey: .industry)
+        country = try c.decode(String.self, forKey: .country)
+        description = try c.decode(String.self, forKey: .description)
+        segments = try c.decode([Segment].self, forKey: .segments)
+        suppliers = try c.decode([Relation].self, forKey: .suppliers)
+        customers = try c.decode([Relation].self, forKey: .customers)
+        competitors = try c.decode([String].self, forKey: .competitors)
+        fundamentals = try c.decodeIfPresent(Fundamentals.self, forKey: .fundamentals)
+        filings = try c.decodeIfPresent([Filing].self, forKey: .filings) ?? []
+        graph_source = try c.decode(String.self, forKey: .graph_source)
+        fundamentals_source = try c.decode(String.self, forKey: .fundamentals_source)
+        ts_ms = try c.decode(Int64.self, forKey: .ts_ms)
+    }
 }
 
 // MARK: - Intel: REGIMES (bull/bear board)

@@ -376,6 +376,18 @@ pub struct Relation {
     pub via: String,
 }
 
+/// One recent SEC filing (EDGAR submissions), enough to link out to its
+/// primary document on sec.gov. `filed` is "YYYY-MM-DD".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Filing {
+    /// Filing form type, e.g. "10-K", "10-Q", "8-K", "S-1", "DEF 14A".
+    pub form: String,
+    /// Filing date, "YYYY-MM-DD".
+    pub filed: String,
+    /// Direct link to the primary document on www.sec.gov.
+    pub primary_doc_url: String,
+}
+
 /// Latest reported fundamentals extracted from SEC EDGAR XBRL company facts.
 /// Everything optional: filings vary, and absence is more honest than zero.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -392,6 +404,13 @@ pub struct Fundamentals {
     pub equity: Option<f64>,
     pub ocf: Option<f64>,
     pub cash: Option<f64>,
+    /// Latest cover-page common shares outstanding (dei
+    /// `EntityCommonStockSharesOutstanding`). A SHARE COUNT, not dollars —
+    /// market cap needs a live price and is left to the client.
+    pub shares_outstanding: Option<f64>,
+    /// Public float as a DOLLAR amount from the latest 10-K cover (dei
+    /// `EntityPublicFloat`) — NOT a share count. Honestly a $ value.
+    pub public_float_usd: Option<f64>,
     /// e.g. "FY" or "Q2"; `fiscal_year` e.g. "2026".
     pub period: String,
     pub fiscal_year: String,
@@ -412,10 +431,23 @@ pub struct CompanyProfile {
     pub customers: Vec<Relation>,
     pub competitors: Vec<String>,
     pub fundamentals: Option<Fundamentals>,
+    /// Recent SEC filings (newest first, capped ~12) from EDGAR submissions.
+    ///
+    /// WIRE COMPAT: additive `#[serde(default)]` field — payloads without it
+    /// still decode (empty), and clients (Swift) must treat it as
+    /// optional-with-default, never required.
+    #[serde(default)]
+    pub filings: Vec<Filing>,
     /// e.g. "curated graph (MTX Labs, 2026-07)" or "no curated graph".
     pub graph_source: String,
     /// e.g. "sec-edgar (10-K/10-Q)" or "unavailable".
     pub fundamentals_source: String,
+    /// e.g. "sec-edgar submissions" or "unavailable".
+    ///
+    /// WIRE COMPAT: additive `#[serde(default)]` field — old payloads decode
+    /// to "" and clients must treat it as optional-with-default.
+    #[serde(default)]
+    pub filings_source: String,
     pub ts_ms: i64,
 }
 
@@ -864,6 +896,72 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"type\":\"scan\""));
         assert!(json.contains("\"flag\":\"breakout setup\""));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn company_profile_new_fields_are_additive_and_default() {
+        // A pre-filings CompanyProfile frame (no `filings`, no
+        // `filings_source`, and a `fundamentals` lacking the dei fields) must
+        // still decode — every added field is additive with a default, so an
+        // old engine's frame or a stored snapshot never breaks a client.
+        let old = r#"{"type":"company","symbol":"NVDA","name":"NVIDIA Corporation",
+            "sector":"Technology","industry":"Semiconductors","country":"United States",
+            "description":"","segments":[],"suppliers":[],"customers":[],"competitors":[],
+            "fundamentals":{"revenue":1.0,"revenue_yoy":null,"gross_margin":null,
+              "op_margin":null,"net_income":null,"net_margin":null,"eps":null,"assets":null,
+              "liabilities":null,"equity":null,"ocf":null,"cash":null,"period":"FY",
+              "fiscal_year":"2024"},
+            "graph_source":"curated graph","fundamentals_source":"unavailable","ts_ms":5}"#;
+        let ev: EngineEvent = serde_json::from_str(old).unwrap();
+        let EngineEvent::Company(p) = &ev else {
+            panic!("decoded wrong variant");
+        };
+        assert!(p.filings.is_empty());
+        assert_eq!(p.filings_source, "");
+        let f = p.fundamentals.as_ref().unwrap();
+        // Missing dei fields decode to None (serde treats absent Options).
+        assert_eq!(f.shares_outstanding, None);
+        assert_eq!(f.public_float_usd, None);
+        assert!(!ev.is_critical(), "company profiles must never starve ticks");
+
+        // Populated new fields round-trip.
+        let ev = EngineEvent::Company(CompanyProfile {
+            symbol: "NVDA".into(),
+            name: "NVIDIA Corporation".into(),
+            sector: "Technology".into(),
+            industry: "Semiconductors".into(),
+            country: "United States".into(),
+            description: String::new(),
+            segments: vec![],
+            suppliers: vec![],
+            customers: vec![],
+            competitors: vec![],
+            fundamentals: Some(Fundamentals {
+                revenue: Some(391_035_000_000.0),
+                shares_outstanding: Some(15_115_823_000.0),
+                public_float_usd: Some(2_600_000_000_000.0),
+                period: "FY".into(),
+                fiscal_year: "2024".into(),
+                ..Default::default()
+            }),
+            filings: vec![Filing {
+                form: "10-K".into(),
+                filed: "2026-02-26".into(),
+                primary_doc_url:
+                    "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000012/nvda-20260126.htm"
+                        .into(),
+            }],
+            graph_source: "curated graph".into(),
+            fundamentals_source: "sec-edgar (10-K/20-F)".into(),
+            filings_source: "sec-edgar submissions".into(),
+            ts_ms: 6,
+        });
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"company\""));
+        assert!(json.contains("\"public_float_usd\":2600000000000.0"));
+        assert!(json.contains("\"filings_source\":\"sec-edgar submissions\""));
         let back: EngineEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
     }

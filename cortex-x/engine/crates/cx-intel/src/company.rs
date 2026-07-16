@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use cx_core::egress::Egress;
 use cx_core::error::CxError;
-use cx_core::events::{CompanyProfile, Fundamentals};
+use cx_core::events::{CompanyProfile, Filing, Fundamentals};
 use cx_core::time::now_ms;
 
 use crate::splc_data;
@@ -29,6 +29,11 @@ const TICKER_MAP_CAP: usize = 8 * 1024 * 1024;
 /// and money-center banks (JPM, BAC) carry the largest XBRL fact sets of
 /// all — keep headroom well above their current payload sizes.
 const COMPANYFACTS_CAP: usize = 48 * 1024 * 1024;
+/// EDGAR submissions payloads run ~1-2 MB for the largest filers.
+const SUBMISSIONS_CAP: usize = 16 * 1024 * 1024;
+/// Keep the most recent dozen filings — enough to show cadence without
+/// bloating the on-demand profile payload.
+const MAX_FILINGS: usize = 12;
 const CIK_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// Ticker -> CIK map, parsed once and reused for 24h. The SEC file changes
@@ -56,6 +61,20 @@ pub async fn fetch_company(egress: &Egress, symbol: &str) -> CompanyProfile {
             Err(e) => {
                 tracing::warn!(symbol = %symbol, error = %e, "edgar fetch failed");
                 profile.fundamentals_source = "unavailable (fetch failed)".into();
+            }
+        }
+
+        // One more egress call: the recent-filings list. Fully independent of
+        // fundamentals — it degrades to empty on any failure, never panics.
+        match fetch_filings(egress, &symbol).await {
+            Ok(filings) if !filings.is_empty() => {
+                profile.filings = filings;
+                profile.filings_source = "sec-edgar submissions".into();
+            }
+            Ok(_) => profile.filings_source = "unavailable".into(),
+            Err(e) => {
+                tracing::warn!(symbol = %symbol, error = %e, "edgar submissions fetch failed");
+                profile.filings_source = "unavailable (fetch failed)".into();
             }
         }
     }
@@ -86,8 +105,10 @@ fn minimal_profile(symbol: &str) -> CompanyProfile {
         customers: Vec::new(),
         competitors: Vec::new(),
         fundamentals: None,
+        filings: Vec::new(),
         graph_source: "no curated graph".into(),
         fundamentals_source: "unavailable".into(),
+        filings_source: "unavailable".into(),
         ts_ms: 0,
     }
 }
@@ -99,6 +120,7 @@ pub fn disabled_profile(symbol: &str) -> CompanyProfile {
     p.description = "COMPANY intelligence is disabled (intel.enable_company = false).".into();
     p.graph_source = "disabled".into();
     p.fundamentals_source = "disabled".into();
+    p.filings_source = "disabled".into();
     p.ts_ms = now_ms();
     p
 }
@@ -137,6 +159,73 @@ pub async fn fetch_fundamentals(
 /// EDGAR requires the 10-digit zero-padded CIK in the path.
 pub(crate) fn companyfacts_url(cik: u64) -> String {
     format!("https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010}.json")
+}
+
+/// Recent SEC filings (newest first, capped at [`MAX_FILINGS`]) from EDGAR
+/// submissions. `Ok(Vec::new())` for non-filers or filers with no usable
+/// rows; a fetch failure is an `Err` the caller labels honestly. One egress
+/// call (the shared ticker map is cached from the fundamentals lookup).
+pub async fn fetch_filings(egress: &Egress, symbol: &str) -> Result<Vec<Filing>, CxError> {
+    let Some(cik) = cik_for(egress, symbol).await? else {
+        return Ok(Vec::new());
+    };
+    let raw = egress
+        .get_text_with_cap(&crate::news::submissions_url(cik), SUBMISSIONS_CAP)
+        .await?;
+    Ok(parse_submissions_filings(cik, &raw))
+}
+
+/// Build the recent-filings list from an EDGAR submissions payload. Parses the
+/// parallel `recent` arrays (form / filingDate / accessionNumber /
+/// primaryDocument) into archive-linked [`Filing`]s, preserving EDGAR's
+/// newest-first order and capping at [`MAX_FILINGS`]. Rows missing any field,
+/// carrying a malformed date, or lacking a primary document are skipped; a
+/// malformed body yields an empty list. Never panics.
+pub(crate) fn parse_submissions_filings(cik: u64, raw: &str) -> Vec<Filing> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(recent) = v.get("filings").and_then(|f| f.get("recent")) else {
+        return Vec::new();
+    };
+    let (Some(forms), Some(dates), Some(accns), Some(docs)) = (
+        recent.get("form").and_then(|x| x.as_array()),
+        recent.get("filingDate").and_then(|x| x.as_array()),
+        recent.get("accessionNumber").and_then(|x| x.as_array()),
+        recent.get("primaryDocument").and_then(|x| x.as_array()),
+    ) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(MAX_FILINGS);
+    for (((form, date), accn), doc) in forms.iter().zip(dates).zip(accns).zip(docs) {
+        if out.len() >= MAX_FILINGS {
+            break;
+        }
+        let (Some(form), Some(date), Some(accn), Some(doc)) =
+            (form.as_str(), date.as_str(), accn.as_str(), doc.as_str())
+        else {
+            continue;
+        };
+        if form.is_empty() || accn.is_empty() || doc.is_empty() {
+            continue;
+        }
+        // Honest date: skip rows whose filingDate isn't a real YYYY-MM-DD.
+        if chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+            continue;
+        }
+        // EDGAR archive paths use the non-padded CIK and the dash-free
+        // accession number, e.g. 0001045810-26-000012 -> 000104581026000012.
+        let accn_no_dashes = accn.replace('-', "");
+        out.push(Filing {
+            form: form.to_string(),
+            filed: date.to_string(),
+            primary_doc_url: format!(
+                "https://www.sec.gov/Archives/edgar/data/{cik}/{accn_no_dashes}/{doc}"
+            ),
+        });
+    }
+    out
 }
 
 /// Resolve a ticker to its CIK, refreshing the shared map at most once
@@ -256,6 +345,14 @@ pub(crate) fn parse_companyfacts(raw: &str) -> Result<Option<Fundamentals>, CxEr
         .and_then(fin);
     let val = |t: &Option<TagLatest>| t.as_ref().and_then(|x| fin(x.val));
 
+    // dei cover-page facts live under facts["dei"] alongside us-gaap: the
+    // latest common shares outstanding (a share COUNT) and public float
+    // (a USD DOLLAR amount, not shares). Both degrade to None independently.
+    let dei = v.get("facts").and_then(|f| f.get("dei")).and_then(|d| d.as_object());
+    let shares_outstanding =
+        dei.and_then(|d| latest_dei(d, "EntityCommonStockSharesOutstanding", "shares"));
+    let public_float_usd = dei.and_then(|d| latest_dei(d, "EntityPublicFloat", "USD"));
+
     Ok(Some(Fundamentals {
         revenue: rev_val,
         revenue_yoy,
@@ -269,6 +366,8 @@ pub(crate) fn parse_companyfacts(raw: &str) -> Result<Option<Fundamentals>, CxEr
         equity: val(&equity),
         ocf: val(&ocf),
         cash: val(&cash),
+        shares_outstanding,
+        public_float_usd,
         period: "FY".into(),
         fiscal_year,
     }))
@@ -350,6 +449,36 @@ fn annual_points(
     by_end.into_iter().map(|(end, (fy, val))| (end, fy, val)).collect()
 }
 
+/// Latest value for one dei tag/unit, chosen by most-recent period `end`.
+/// dei cover-page facts (shares outstanding, public float) appear across
+/// 10-K and 10-Q filings; we take the freshest by end date (ISO dates order
+/// correctly as strings). Non-finite values are skipped (NaN firewall); None
+/// when the tag/unit is absent or holds no usable entry.
+fn latest_dei(
+    dei: &serde_json::Map<String, serde_json::Value>,
+    tag: &str,
+    unit: &str,
+) -> Option<f64> {
+    let entries = dei
+        .get(tag)
+        .and_then(|t| t.get("units"))
+        .and_then(|u| u.get(unit))
+        .and_then(|a| a.as_array())?;
+    let mut best_end = String::new();
+    let mut best_val: Option<f64> = None;
+    for e in entries {
+        let Some(end) = e.get("end").and_then(|x| x.as_str()) else { continue };
+        let Some(val) = e.get("val").and_then(|x| x.as_f64()).filter(|v| v.is_finite()) else {
+            continue;
+        };
+        if best_val.is_none() || end > best_end.as_str() {
+            best_end = end.to_string();
+            best_val = Some(val);
+        }
+    }
+    best_val
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,7 +490,15 @@ mod tests {
       "cik": 320193,
       "entityName": "APPLE INC",
       "facts": {
-        "dei": { "EntityCommonStockSharesOutstanding": { "units": { "shares": [] } } },
+        "dei": {
+          "EntityCommonStockSharesOutstanding": { "units": { "shares": [
+            {"end":"2024-01-19","val":14700000000,"fy":2024,"fp":"Q1","form":"10-Q","filed":"2024-02-01"},
+            {"end":"2024-10-18","val":15115823000,"fy":2024,"fp":"FY","form":"10-K","filed":"2024-11-01"}
+          ]}},
+          "EntityPublicFloat": { "units": { "USD": [
+            {"end":"2024-03-29","val":2600000000000,"fy":2024,"fp":"FY","form":"10-K","filed":"2024-11-01"}
+          ]}}
+        },
         "us-gaap": {
           "RevenueFromContractWithCustomerExcludingAssessedTax": { "units": { "USD": [
             {"start":"2022-09-25","end":"2023-09-30","val":383285000000,"fy":2023,"fp":"FY","form":"10-K","filed":"2023-11-03","frame":"CY2023"},
@@ -427,6 +564,10 @@ mod tests {
         approx(f.equity.unwrap(), 56_950_000_000.0);
         approx(f.cash.unwrap(), 29_943_000_000.0);
         approx(f.ocf.unwrap(), 118_254_000_000.0);
+        // dei: latest shares outstanding by end-date (2024-10-18 beats the
+        // Q1 cover), and public float as a USD DOLLAR amount (not shares).
+        approx(f.shares_outstanding.unwrap(), 15_115_823_000.0);
+        approx(f.public_float_usd.unwrap(), 2_600_000_000_000.0);
         assert_eq!(f.period, "FY");
         assert_eq!(f.fiscal_year, "2024");
         // NaN firewall: everything extracted is finite.
@@ -502,6 +643,106 @@ mod tests {
         approx(f.eps.unwrap(), 2.5);
         assert_eq!(f.fiscal_year, "2023");
         assert_eq!(f.revenue, None);
+    }
+
+    #[test]
+    fn dei_latest_by_end_date_and_dollar_float_degrade_cleanly() {
+        let facts: serde_json::Value = serde_json::from_str(
+            r#"{
+                "EntityCommonStockSharesOutstanding": { "units": { "shares": [
+                    {"end":"2023-10-20","val":100},
+                    {"end":"2024-10-18","val":200},
+                    {"end":"2024-01-05","val":150}
+                ]}},
+                "EntityPublicFloat": { "units": { "USD": [
+                    {"end":"2024-03-29","val":2600000000000}
+                ]}}
+            }"#,
+        )
+        .unwrap();
+        let dei = facts.as_object().unwrap();
+        // Latest period end wins regardless of array order; the float is a
+        // USD dollar amount, honestly a $ value (not a share count).
+        assert_eq!(
+            latest_dei(dei, "EntityCommonStockSharesOutstanding", "shares"),
+            Some(200.0)
+        );
+        assert_eq!(latest_dei(dei, "EntityPublicFloat", "USD"), Some(2_600_000_000_000.0));
+        // Absent tag / wrong unit -> None.
+        assert_eq!(latest_dei(dei, "NoSuchTag", "shares"), None);
+        assert_eq!(latest_dei(dei, "EntityPublicFloat", "shares"), None);
+        // Entries lacking `end` or a finite `val` are skipped -> None.
+        let junk: serde_json::Value = serde_json::from_str(
+            r#"{"T":{"units":{"shares":[{"end":"2024-01-01"},{"val":5},{"end":"2024-02-01","val":"x"}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(latest_dei(junk.as_object().unwrap(), "T", "shares"), None);
+    }
+
+    /// Shape-faithful EDGAR submissions payload: parallel `recent` arrays,
+    /// newest first, with rows that must be skipped (empty primary doc, bad
+    /// filing date).
+    const SUBMISSIONS_FILINGS_FIXTURE: &str = r#"{
+      "cik": 1045810,
+      "name": "NVIDIA CORP",
+      "filings": { "recent": {
+        "form":            ["10-K",                 "8-K",                  "10-Q",                 "4",                    "S-1"],
+        "filingDate":      ["2026-02-26",           "2026-02-01",           "not-a-date",           "2026-01-15",           "2025-12-01"],
+        "accessionNumber": ["0001045810-26-000012", "0001045810-26-000009", "0001045810-26-000005", "0001045810-26-000003", "0001045810-25-000200"],
+        "primaryDocument": ["nvda-20260126.htm",    "",                     "nvda-q.htm",           "xslF345/form4.xml",    "s1.htm"]
+      }}
+    }"#;
+
+    #[test]
+    fn submissions_fixture_builds_filings_with_urls_dates_and_skips() {
+        let filings = parse_submissions_filings(1045810, SUBMISSIONS_FILINGS_FIXTURE);
+        // 8-K (empty primary doc) and the 10-Q (bad date) are skipped; the
+        // 10-K, form 4, and S-1 survive, newest first.
+        assert_eq!(filings.len(), 3);
+        assert_eq!(filings[0].form, "10-K");
+        assert_eq!(filings[0].filed, "2026-02-26");
+        // Archive URL: non-padded CIK, dash-free accession, primary document.
+        assert_eq!(
+            filings[0].primary_doc_url,
+            "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000012/nvda-20260126.htm"
+        );
+        assert_eq!(filings[1].form, "4");
+        assert_eq!(
+            filings[1].primary_doc_url,
+            "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000003/xslF345/form4.xml"
+        );
+        assert_eq!(filings[2].form, "S-1");
+        // Every surviving row carries a real date and a resolvable doc URL.
+        assert!(filings.iter().all(|f| f.filed.len() == 10 && !f.primary_doc_url.ends_with('/')));
+
+        // Malformed / empty / partial bodies degrade to an empty list.
+        assert!(parse_submissions_filings(320193, "junk").is_empty());
+        assert!(parse_submissions_filings(320193, "{}").is_empty());
+        assert!(parse_submissions_filings(320193, r#"{"filings":{"recent":{}}}"#).is_empty());
+    }
+
+    #[test]
+    fn filings_list_is_capped_at_twelve_newest_first() {
+        // 15 valid rows (newest first): only the latest MAX_FILINGS survive.
+        let n = 15usize;
+        let forms: Vec<String> = (0..n).map(|_| "10-Q".to_string()).collect();
+        let dates: Vec<String> = (0..n).map(|i| format!("2026-{:02}-01", (i % 12) + 1)).collect();
+        let accns: Vec<String> = (0..n).map(|i| format!("0001045810-26-{i:06}")).collect();
+        let docs: Vec<String> = (0..n).map(|i| format!("doc{i}.htm")).collect();
+        let body = serde_json::json!({
+            "filings": { "recent": {
+                "form": forms, "filingDate": dates,
+                "accessionNumber": accns, "primaryDocument": docs
+            }}
+        })
+        .to_string();
+        let filings = parse_submissions_filings(1045810, &body);
+        assert_eq!(filings.len(), MAX_FILINGS);
+        // The first array row (newest) is kept and correctly linked.
+        assert_eq!(
+            filings[0].primary_doc_url,
+            "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000000/doc0.htm"
+        );
     }
 
     #[test]

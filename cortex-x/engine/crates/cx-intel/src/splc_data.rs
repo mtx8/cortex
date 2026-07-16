@@ -73,8 +73,10 @@ fn p(
         customers: rels(customers),
         competitors: competitors.iter().map(|c| (*c).to_string()).collect(),
         fundamentals: None,
+        filings: Vec::new(),
         graph_source: GRAPH_SOURCE.to_string(),
         fundamentals_source: "unavailable".to_string(),
+        filings_source: "unavailable".to_string(),
         ts_ms: 0,
     }
 }
