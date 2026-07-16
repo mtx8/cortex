@@ -251,12 +251,9 @@ private enum ScanCol {
     static let ratio: CGFloat = 48
     static let regime: CGFloat = 92
     static let flags: CGFloat = 200
-    static let news: CGFloat = 16
-    static let ai: CGFloat = 18
-    static let company: CGFloat = 18
     static let gap: CGFloat = 8
-    /// Trailing affordance cluster: news glyph + AI explain + company.
-    static let trailing: CGFloat = news + ai + company + gap * 2
+    /// The single trailing row-action affordance (hover/selected ellipsis).
+    static let trailing: CGFloat = 24
 
     static func width(_ column: ScanColumn) -> CGFloat {
         switch column {
@@ -293,24 +290,31 @@ struct ScannerView: View {
     @Environment(AppModel.self) private var model
     @State private var search = ""
     @State private var preset: ScanPreset = .all
+    // Column sort: `sort` for the details grid, `summarySort` for the default
+    // six-column table. Each mode keeps its own so switching never surprises.
     @State private var sort: ScanSort?
+    @State private var summarySort: ScanSummary.Sort?
     // Filter builder + saved screens.
     @State private var filters: [ScanFilter] = []
     @State private var filtersOpen = false
     @State private var screens = ScreenStore()
     @State private var screenName = ""
     // Alert stream.
-    @State private var alertsOpen = true
     @State private var lastSeenAlertID: String?
     // Copilot request id whose answer renders inline; nil = dismissed.
     @State private var aiRequestId: String?
+    // Persisted view posture. The calm defaults hold: the summary table,
+    // no alert strip, no AI-picks action — the operator opts each in.
+    @AppStorage(ScanPrefs.details) private var showDetails = false
+    @AppStorage(ScanPrefs.showAlerts) private var showAlerts = false
+    @AppStorage(ScanPrefs.showAIPicks) private var showAIPicks = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
+            legend
             Divider().overlay(Theme.line)
             presetRow
-            Divider().overlay(Theme.line)
             filterBar
             Divider().overlay(Theme.line)
             if let message = aiMessage {
@@ -322,13 +326,13 @@ struct ScannerView: View {
             HStack(alignment: .top, spacing: 0) {
                 Group {
                     if let board = model.scanBoard, !board.rows.isEmpty {
-                        table(board)
+                        if showDetails { detailsTable(board) } else { summaryTable(board) }
                     } else {
                         emptyState
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                if alertsOpen {
+                if showAlerts {
                     Divider().overlay(Theme.line)
                     alertStrip
                 }
@@ -336,6 +340,16 @@ struct ScannerView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.ink)
+    }
+
+    /// One quiet line that demystifies every score in the table.
+    private var legend: some View {
+        Text("scores are 0-100 percentile ranks vs the universe today · higher = stronger")
+            .font(.system(size: 10))
+            .foregroundStyle(Theme.dim)
+            .lineLimit(1)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
     }
 
     // MARK: Header
@@ -351,28 +365,57 @@ struct ScannerView: View {
                         .foregroundStyle(Theme.dim)
                         .lineLimit(1)
                 }
+                // The composite weights ride behind a quiet "i" — hover to
+                // read them, never a standing chip.
                 if let weights = ScanWeights.summary(board.weights_used) {
-                    Text("weights")
-                        .font(.system(size: 9))
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 10))
                         .foregroundStyle(Theme.dim)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: Theme.chipRadius)
-                                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
-                        )
                         .help(weights)
                 }
             }
             Spacer()
-            if let board = model.scanBoard, !board.rows.isEmpty {
+            if showAIPicks, let board = model.scanBoard, !board.rows.isEmpty {
                 aiPicksChip(board)
             }
             searchField
+            detailsToggle
+            aiToggle
             alertsToggle
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
+    }
+
+    /// Swap the calm six-column summary for the full percentile grid.
+    private var detailsToggle: some View {
+        Button {
+            showDetails.toggle()
+        } label: {
+            Image(systemName: "tablecells")
+                .font(.system(size: 11))
+                .foregroundStyle(showDetails ? Theme.ember : Theme.dim)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(showDetails ? "show the summary table" : "show the full percentile grid")
+        .animation(DeckMotion.ease(), value: showDetails)
+    }
+
+    /// Reveal the header AI-PICKS action (off by default).
+    private var aiToggle: some View {
+        Button {
+            showAIPicks.toggle()
+        } label: {
+            Image(systemName: "wand.and.stars")
+                .font(.system(size: 11))
+                .foregroundStyle(showAIPicks ? Theme.ember : Theme.dim)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(showAIPicks ? "hide AI picks" : "show AI picks")
+        .animation(DeckMotion.ease(), value: showAIPicks)
     }
 
     // MARK: AI (copilot) affordances
@@ -462,13 +505,13 @@ struct ScannerView: View {
     /// Strip toggle; while collapsed it carries the unseen-alert ember dot.
     private var alertsToggle: some View {
         Button {
-            alertsOpen.toggle()
+            showAlerts.toggle()
         } label: {
             Image(systemName: "sidebar.right")
                 .font(.system(size: 11))
-                .foregroundStyle(alertsOpen ? Theme.ember : Theme.dim)
+                .foregroundStyle(showAlerts ? Theme.ember : Theme.dim)
                 .overlay(alignment: .topTrailing) {
-                    if !alertsOpen && hasUnseenAlerts {
+                    if !showAlerts && hasUnseenAlerts {
                         Circle()
                             .fill(Theme.ember)
                             .frame(width: 4, height: 4)
@@ -478,8 +521,8 @@ struct ScannerView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help(alertsOpen ? "hide alert stream" : "show alert stream")
-        .animation(DeckMotion.ease(), value: alertsOpen)
+        .help(showAlerts ? "hide alert stream" : "show alert stream")
+        .animation(DeckMotion.ease(), value: showAlerts)
     }
 
     private var alertStrip: some View {
@@ -487,7 +530,13 @@ struct ScannerView: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 6) {
                     SectionLabel(text: "alerts")
-                    if hasUnseenAlerts { ScanPulseDot() }
+                    if hasUnseenAlerts {
+                        // Quiet static ember dot — the same unseen marker the
+                        // toggle uses; no standing animation (design law).
+                        Circle()
+                            .fill(Theme.ember)
+                            .frame(width: 4, height: 4)
+                    }
                     Spacer()
                     if !model.scanAlerts.isEmpty {
                         Text("\(model.scanAlerts.count)")
@@ -745,50 +794,155 @@ struct ScannerView: View {
 
     // MARK: Table
 
-    private func displayRows(_ board: ScanBoard) -> [ScanRow] {
+    /// Preset + filters + search, WITHOUT a column sort — the shared base for
+    /// both modes. Each table then applies its own sort.
+    private func baseRows(_ board: ScanBoard) -> [ScanRow] {
         var rows = preset.apply(board.rows, lastPrice: { model.lastPrice($0) })
         rows = ScanFilter.apply(filters, to: rows)
         let query = search.trimmingCharacters(in: .whitespaces)
         if !query.isEmpty {
             rows = rows.filter { $0.symbol.localizedCaseInsensitiveContains(query) }
         }
-        if let sort {
-            rows = sort.apply(rows)
-        }
         return rows
     }
 
-    private func table(_ board: ScanBoard) -> some View {
-        let rows = displayRows(board)
-        let headlines = ScanNews.latestHeadlines(
+    /// The rows the operator actually sees, in the active mode's order — the
+    /// basis for the row count and the AI-picks prompt.
+    private func displayRows(_ board: ScanBoard) -> [ScanRow] {
+        let rows = baseRows(board)
+        if showDetails {
+            return sort.map { $0.apply(rows) } ?? rows
+        }
+        return ScanSummary.sorted(
+            rows, by: summarySort,
+            price: { model.lastPrice($0.symbol) },
+            change: { model.sessionChangePct($0.symbol) }
+        )
+    }
+
+    private func openChart(_ row: ScanRow) {
+        model.selectSymbol(row.symbol)
+        model.centerMode = .chart
+    }
+
+    private var headlines: [String: String] {
+        ScanNews.latestHeadlines(
             model.newsBoard?.items ?? [],
             nowMs: Int64(Date().timeIntervalSince1970 * 1000)
         )
+    }
+
+    // MARK: Summary table (the calm default — six readable columns)
+
+    private func summaryTable(_ board: ScanBoard) -> some View {
+        let rows = displayRows(board)
+        let news = headlines
         return ScrollView([.horizontal, .vertical]) {
             LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
                 Section {
                     if rows.isEmpty {
-                        Text("no rows match")
-                            .font(.system(size: 11))
-                            .foregroundStyle(Theme.dim)
-                            .padding(16)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        noRows
+                    } else {
+                        ForEach(rows) { row in
+                            ScanSummaryRowView(
+                                row: row,
+                                verdict: ScanVerdict.classify(row),
+                                price: model.lastPrice(row.symbol),
+                                change: model.sessionChangePct(row.symbol),
+                                headline: news[row.symbol],
+                                aiDisabled: aiDisabled,
+                                selected: model.selectedSymbol == row.symbol,
+                                openChart: { openChart(row) },
+                                openCompany: { model.openCompany(row.symbol) },
+                                openNews: { model.centerMode = .news },
+                                explain: {
+                                    aiRequestId = model.askCopilot(
+                                        ScanAI.explainPrompt(
+                                            row: row,
+                                            rank: (rows.firstIndex(of: row) ?? 0) + 1,
+                                            of: rows.count
+                                        )
+                                    )
+                                }
+                            )
+                        }
+                    }
+                } header: {
+                    summaryHeaderRow
+                }
+            }
+            .frame(minWidth: ScanSummaryCol.minWidth, alignment: .leading)
+        }
+    }
+
+    private var summaryHeaderRow: some View {
+        HStack(spacing: ScanSummaryCol.gap) {
+            ForEach(ScanSummary.columns, id: \.self) { col in
+                summaryHeaderCell(col)
+            }
+            Spacer(minLength: ScanSummaryCol.action)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(Theme.ink)
+        .deckRowRule(1)
+    }
+
+    private func summaryHeaderCell(_ col: ScanSummary.Column) -> some View {
+        let active = summarySort?.column == col
+        return Button {
+            summarySort = ScanSummary.Sort.toggling(summarySort, column: col)
+        } label: {
+            HStack(spacing: 3) {
+                if col.alignment == .trailing { Spacer(minLength: 0) }
+                Text(col.title.uppercased())
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(1.0)
+                    .foregroundStyle(active ? Theme.ember : Theme.dim)
+                    .lineLimit(1)
+                if active, let summarySort {
+                    Image(systemName: summarySort.ascending ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundStyle(Theme.ember)
+                }
+                if col.alignment == .leading { Spacer(minLength: 0) }
+            }
+            .frame(width: ScanSummaryCol.width(col))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!col.sortable)
+        .animation(DeckMotion.ease(), value: active)
+    }
+
+    private var noRows: some View {
+        Text("no rows match")
+            .font(.system(size: 11))
+            .foregroundStyle(Theme.dim)
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: Details table (the opt-in full percentile grid)
+
+    private func detailsTable(_ board: ScanBoard) -> some View {
+        let rows = displayRows(board)
+        let news = headlines
+        return ScrollView([.horizontal, .vertical]) {
+            LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                Section {
+                    if rows.isEmpty {
+                        noRows
                     } else {
                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                             ScanRowView(
                                 row: row,
-                                headline: headlines[row.symbol],
+                                headline: news[row.symbol],
                                 aiDisabled: aiDisabled,
-                                openChart: {
-                                    model.selectSymbol(row.symbol)
-                                    model.centerMode = .chart
-                                },
-                                openCompany: {
-                                    model.openCompany(row.symbol)
-                                },
-                                openNews: {
-                                    model.centerMode = .news
-                                },
+                                selected: model.selectedSymbol == row.symbol,
+                                openChart: { openChart(row) },
+                                openCompany: { model.openCompany(row.symbol) },
+                                openNews: { model.centerMode = .news },
                                 explain: {
                                     aiRequestId = model.askCopilot(
                                         ScanAI.explainPrompt(row: row, rank: index + 1, of: rows.count)
@@ -850,9 +1004,10 @@ struct ScannerView: View {
 
 private struct ScanRowView: View {
     let row: ScanRow
-    /// Latest in-window headline title for this symbol; nil = no news glyph.
+    /// Latest in-window headline title for this symbol; nil = no news action.
     let headline: String?
     let aiDisabled: Bool
+    let selected: Bool
     let openChart: () -> Void
     let openCompany: () -> Void
     let openNews: () -> Void
@@ -878,15 +1033,18 @@ private struct ScanRowView: View {
                 rawCell(ScanFormat.ratio(row.vol_surge), present: row.vol_surge != nil, width: ScanCol.ratio)
                 regimeCell
                 flagsCell
-                newsCell
-                aiCell
-                companyCell
+                ScanRowActionsMenu(
+                    symbol: row.symbol, headline: headline, aiDisabled: aiDisabled,
+                    visible: hovering || selected,
+                    openChart: openChart, explain: explain,
+                    openCompany: openCompany, openNews: openNews
+                )
             }
             .padding(.horizontal, 12)
             .frame(height: 25)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
-            .background(hovering ? Theme.panelHi : .clear)
+            .background(hovering || selected ? Theme.panelHi : .clear)
             .deckRowRule()
         }
         .buttonStyle(.plain)
@@ -960,62 +1118,113 @@ private struct ScanRowView: View {
         .frame(width: ScanCol.flags, alignment: .leading)
         .help(row.flags.isEmpty ? "no flags" : row.flags.joined(separator: " · "))
     }
+}
 
-    /// News-aware marker: shown whenever the symbol has a headline in the
-    /// trailing 24h. Tooltip = the latest title; click jumps to NEWS.
-    /// Always visible (it signals data, not an action). Fixed width.
-    private var newsCell: some View {
-        Group {
-            if let headline {
-                Button(action: openNews) {
-                    Image(systemName: "newspaper")
-                        .font(.system(size: 9))
-                        .foregroundStyle(Theme.dim)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(headline)
-            } else {
-                Color.clear
+// MARK: - Summary row (the calm default table)
+
+/// One row of the six-column summary: symbol · price · session change ·
+/// composite strength bar · plain-language setup · top flag. A single quiet
+/// ellipsis action rides in on hover / selection.
+private struct ScanSummaryRowView: View {
+    let row: ScanRow
+    let verdict: ScanVerdict
+    let price: Double?
+    let change: Double?
+    let headline: String?
+    let aiDisabled: Bool
+    let selected: Bool
+    let openChart: () -> Void
+    let openCompany: () -> Void
+    let openNews: () -> Void
+    let explain: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: openChart) {
+            HStack(spacing: ScanSummaryCol.gap) {
+                Text(row.symbol)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Theme.bone)
+                    .lineLimit(1)
+                    .frame(width: ScanSummaryCol.symbol, alignment: .leading)
+                Text(price.flatMap { $0.isFinite ? Fmt.price($0) : nil } ?? "—")
+                    .numeric(size: 11)
+                    .foregroundStyle(price.flatMap { $0.isFinite ? Theme.bone : nil } ?? Theme.dim)
+                    .lineLimit(1)
+                    .frame(width: ScanSummaryCol.price, alignment: .trailing)
+                Text(change.flatMap { $0.isFinite ? Fmt.signedPct($0) : nil } ?? "—")
+                    .numeric(size: 11)
+                    .foregroundStyle(change.flatMap { $0.isFinite ? Theme.pnlColor($0) : nil } ?? Theme.dim)
+                    .lineLimit(1)
+                    .frame(width: ScanSummaryCol.change, alignment: .trailing)
+                ScanCompositeCell(composite: row.composite)
+                    .frame(width: ScanSummaryCol.composite, alignment: .trailing)
+                ScanVerdictLabel(verdict: verdict)
+                    .frame(width: ScanSummaryCol.setup, alignment: .leading)
+                flagCell
+                ScanRowActionsMenu(
+                    symbol: row.symbol, headline: headline, aiDisabled: aiDisabled,
+                    visible: hovering || selected,
+                    openChart: openChart, explain: explain,
+                    openCompany: openCompany, openNews: openNews
+                )
             }
-        }
-        .frame(width: ScanCol.news, height: 12)
-    }
-
-    /// Hover affordance: ask cortex to explain this row's rank inline.
-    private var aiCell: some View {
-        Button(action: explain) {
-            Image(systemName: "wand.and.stars")
-                .font(.system(size: 9))
-                .foregroundStyle(aiDisabled ? Theme.dim : Theme.ember)
-                .contentShape(Rectangle())
+            .padding(.horizontal, 12)
+            .frame(height: 28)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(hovering || selected ? Theme.panelHi : .clear)
+            .deckRowRule()
         }
         .buttonStyle(.plain)
-        .disabled(aiDisabled)
-        .help("ask cortex why this ranks here")
-        .opacity(hovering ? 1 : 0)
-        .frame(width: ScanCol.ai, height: 12)
+        .onHover { hovering = $0 }
+        .animation(DeckMotion.ease(), value: hovering)
     }
 
-    /// Hover affordance into COMPANY intelligence — equities only, matching
-    /// the REGIMES row affordance. Fixed width so columns never shift.
-    private var companyCell: some View {
-        Group {
-            if AppModel.isEquity(row.symbol) {
-                Button(action: openCompany) {
-                    Image(systemName: "building.2")
-                        .font(.system(size: 9))
-                        .foregroundStyle(Theme.ember)
-                        .contentShape(Rectangle())
+    /// The single most relevant flag (with a quiet "+n" when more exist).
+    private var flagCell: some View {
+        HStack(spacing: 4) {
+            if let flag = row.flags.first {
+                ScanFlagChip(text: flag)
+                if row.flags.count > 1 {
+                    Text("+\(row.flags.count - 1)")
+                        .font(.system(size: 8, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(Theme.dim)
                 }
-                .buttonStyle(.plain)
-                .help("open company intelligence")
-                .opacity(hovering ? 1 : 0)
-            } else {
-                Color.clear
             }
         }
-        .frame(width: ScanCol.company, height: 12)
+        .frame(width: ScanSummaryCol.flag, alignment: .leading)
+        .help(row.flags.isEmpty ? "no flags" : row.flags.joined(separator: " · "))
+    }
+}
+
+// MARK: - Summary column layout (fixed widths keep header + rows aligned)
+
+private enum ScanSummaryCol {
+    static let symbol: CGFloat = 64
+    static let price: CGFloat = 84
+    static let change: CGFloat = 72
+    static let composite: CGFloat = 104
+    static let setup: CGFloat = 148
+    static let flag: CGFloat = 150
+    static let action: CGFloat = 24
+    static let gap: CGFloat = 12
+
+    static func width(_ column: ScanSummary.Column) -> CGFloat {
+        switch column {
+        case .symbol: symbol
+        case .price: price
+        case .change: change
+        case .composite: composite
+        case .setup: setup
+        case .flag: flag
+        }
+    }
+
+    static var minWidth: CGFloat {
+        let cols = ScanSummary.columns.map(width).reduce(0, +)
+        return cols + gap * CGFloat(ScanSummary.columns.count) + action + 24
     }
 }
 

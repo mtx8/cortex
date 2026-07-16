@@ -245,8 +245,9 @@ enum ScanWeights {
 
 // MARK: - Shared scanner chrome
 
-/// The ember-outline flag chip (the table's flag grammar, reused by the
-/// alert stream).
+/// The flag chip (the table's flag grammar, reused by the alert stream).
+/// Ember text carries the accent; the outline is the standard #26262E
+/// hairline (design law reserves colored borders for nothing).
 struct ScanFlagChip: View {
     let text: String
 
@@ -259,22 +260,81 @@ struct ScanFlagChip: View {
             .padding(.vertical, 2)
             .overlay(
                 RoundedRectangle(cornerRadius: Theme.chipRadius)
-                    .strokeBorder(Theme.ember.opacity(0.45), lineWidth: Theme.hairline)
+                    .strokeBorder(Theme.line, lineWidth: Theme.hairline)
             )
     }
 }
 
-/// Small pulsing ember dot — new arrivals in the alert stream.
-struct ScanPulseDot: View {
-    @State private var pulsing = false
+/// A row's plain-language verdict. Under design law the label stays bone (a
+/// real setup) or dim (the noise-band Neutral) — the tone's up/down never
+/// colors the text.
+struct ScanVerdictLabel: View {
+    let verdict: ScanVerdict
+    var size: CGFloat = 11
 
     var body: some View {
-        Circle()
-            .fill(Theme.ember)
-            .frame(width: 5, height: 5)
-            .opacity(pulsing ? 1 : 0.3)
-            .animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: pulsing)
-            .onAppear { pulsing = true }
+        Text(verdict.label)
+            .font(.system(size: size, weight: .medium))
+            .foregroundStyle(verdict.tone.labelColor)
+            .lineLimit(1)
+    }
+}
+
+/// The composite strength read: a 4px ember gauge with the 0-100 number
+/// beside it. Shared by the summary table and anywhere composite is shown.
+struct ScanCompositeCell: View {
+    let composite: Double
+    var barWidth: CGFloat = 40
+
+    var body: some View {
+        HStack(spacing: 6) {
+            DeckGaugeBar(fraction: composite / 100, color: Theme.ember)
+                .frame(width: barWidth)
+            Text(ScanFormat.score(composite))
+                .numeric(size: 11, weight: .semibold)
+                .foregroundStyle(Theme.bone)
+        }
+    }
+}
+
+/// The single per-row action affordance — one quiet ellipsis menu that
+/// replaces the old always-on news + AI + company glyph cluster. It rides in
+/// only on the hovered OR selected row; the row's own click still selects +
+/// charts. Menu items adapt to the row (company for equities, news when a
+/// headline exists, explain-rank gated on the copilot's availability).
+struct ScanRowActionsMenu: View {
+    let symbol: String
+    let headline: String?
+    let aiDisabled: Bool
+    let visible: Bool
+    let openChart: () -> Void
+    let explain: () -> Void
+    let openCompany: () -> Void
+    let openNews: () -> Void
+
+    var body: some View {
+        Menu {
+            Button("open chart", action: openChart)
+            Button("explain rank", action: explain).disabled(aiDisabled)
+            if AppModel.isEquity(symbol) {
+                Button("company", action: openCompany)
+            }
+            if headline != nil {
+                Button("news", action: openNews)
+            }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Theme.dim)
+                .frame(width: 20, height: 16)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("row actions")
+        .opacity(visible ? 1 : 0)
+        .allowsHitTesting(visible)
     }
 }
 
