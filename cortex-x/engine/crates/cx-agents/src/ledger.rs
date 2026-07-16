@@ -36,6 +36,8 @@ const RENDER_CHAINS: usize = 3;
 const RENDER_CHAIN_ASSETS: usize = 3;
 /// ENSEMBLE render cap: at most this many strategy weights.
 const RENDER_WEIGHTS: usize = 12;
+/// DESKS bound: at most this many "desk-*" squadrons keep a latest note.
+const MAX_DESKS: usize = 6;
 /// PLAYBOOK bound: at most this many strategies in the regime matrix.
 const MAX_PLAYBOOK: usize = 12;
 /// Regime buckets in the PLAYBOOK matrix, mirroring the fusion layer's
@@ -78,6 +80,10 @@ pub(crate) struct LedgerState {
     /// matrix fills in over time as regimes rotate — latest value wins per
     /// (strategy, bucket). Finite values only; bounded to [`MAX_PLAYBOOK`].
     pub playbook: BTreeMap<String, [f64; REGIME_BUCKETS]>,
+    /// Latest thought per asset-class desk, keyed by its "desk-*" squadron
+    /// (desks throttle to notable changes, so this is the freshest reading
+    /// each desk has published). Admission-bounded to [`MAX_DESKS`].
+    pub desks: BTreeMap<String, AgentThought>,
 }
 
 pub(crate) struct ContextLedger {
@@ -140,6 +146,11 @@ impl ContextLedger {
                 st.positions.insert(p.symbol.clone(), p.clone());
             }
             EngineEvent::Thought(t) => {
+                if t.squadron.starts_with("desk-")
+                    && (st.desks.contains_key(&t.squadron) || st.desks.len() < MAX_DESKS)
+                {
+                    st.desks.insert(t.squadron.clone(), t.clone());
+                }
                 st.thoughts.push_back(t.clone());
                 while st.thoughts.len() > MAX_THOUGHTS {
                     st.thoughts.pop_front();
@@ -518,6 +529,23 @@ impl ContextLedger {
                     fin(row[1]),
                     fin(row[2]),
                     fin(row[3]),
+                ));
+            }
+        }
+
+        // DESKS: the latest note from each asset-class desk — one bounded
+        // line per desk; omitted until a desk has actually spoken, costing
+        // zero tokens while every desk is still silent.
+        if !st.desks.is_empty() {
+            out.push_str("\n=== DESKS ===\n");
+            for (desk, t) in &st.desks {
+                out.push_str(&format!(
+                    "- {desk}{}: {}\n",
+                    t.symbol
+                        .as_deref()
+                        .map(|s| format!(" {s}"))
+                        .unwrap_or_default(),
+                    snip(&t.text, 160),
                 ));
             }
         }
@@ -932,6 +960,71 @@ mod tests {
         }
         let st = ledger.snapshot();
         assert!(st.playbook.len() <= MAX_PLAYBOOK, "{}", st.playbook.len());
+    }
+
+    fn desk_thought(squadron: &str, symbol: Option<&str>, text: &str) -> EngineEvent {
+        EngineEvent::Thought(AgentThought {
+            agent: squadron.into(),
+            squadron: squadron.into(),
+            severity: Severity::Insight,
+            text: text.into(),
+            tags: vec![squadron.into()],
+            confidence: 0.7,
+            symbol: symbol.map(String::from),
+            ts_ms: 1_000_000,
+        })
+    }
+
+    #[test]
+    fn desks_section_renders_latest_note_per_desk() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        // No desk has spoken: no section, zero tokens.
+        assert!(!ledger.render(&[]).contains("=== DESKS ==="));
+
+        ledger.apply(&desk_thought("desk-crypto", None, "weekend liquidity window"));
+        ledger.apply(&desk_thought("desk-options", Some("AAPL"), "IV spike: 1.80x realized"));
+        // The newest note per desk wins.
+        ledger.apply(&desk_thought(
+            "desk-crypto",
+            Some("BTC-USD"),
+            "vol regime shift: normal -> high",
+        ));
+        // Non-desk squadrons never enter the section.
+        ledger.apply(&desk_thought("analysis", Some("BTC-USD"), "rsi crossing"));
+
+        let out = ledger.render(&[]);
+        assert!(out.contains("=== DESKS ==="), "{out}");
+        assert!(
+            out.contains("- desk-crypto BTC-USD: vol regime shift: normal -> high"),
+            "{out}"
+        );
+        assert!(
+            out.contains("- desk-options AAPL: IV spike: 1.80x realized"),
+            "{out}"
+        );
+        // The superseded note survives only in RECENT AGENT NOTES — the
+        // DESKS section keeps exactly one (fresh) line per desk.
+        assert!(
+            !out.contains("- desk-crypto: weekend liquidity window"),
+            "stale desk line kept: {out}"
+        );
+        assert!(!out.contains("- analysis BTC-USD: rsi"), "non-desk squadron leaked: {out}");
+    }
+
+    #[test]
+    fn desks_section_is_bounded() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        for i in 0..(MAX_DESKS + 4) {
+            ledger.apply(&desk_thought(&format!("desk-x{i:02}"), None, "note"));
+        }
+        let st = ledger.snapshot();
+        assert!(st.desks.len() <= MAX_DESKS, "{}", st.desks.len());
+        // Known desks keep updating even at the bound.
+        ledger.apply(&desk_thought("desk-x00", None, "fresh reading"));
+        let st = ledger.snapshot();
+        assert_eq!(st.desks["desk-x00"].text, "fresh reading");
     }
 
     #[test]

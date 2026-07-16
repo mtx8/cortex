@@ -1,12 +1,25 @@
 // Flagship chart panel: header (symbol, live price, session change, spread,
-// interval picker, feed health) over the Canvas candle chart.
+// interval picker, feed health) over the Canvas candle chart. Renders as
+// the classic global-selection chart, or as one fixed pane of the
+// multi-chart grid (see ChartGrid) with its own symbol and interval.
 
 import SwiftUI
 
 struct ChartPanel: View {
     @Environment(AppModel.self) private var model
+    /// Fixed pane context from ChartGrid. nil (the default) — and a pane
+    /// whose symbol is nil — follow the global selection exactly as the
+    /// classic single chart does; a set pane symbol makes this panel
+    /// independent of it.
+    var pane: Binding<ChartPaneState>? = nil
+    /// Drawing persistence. ChartGrid injects ONE shared store into every
+    /// pane — private stores would let two panes on the same symbol clobber
+    /// each other's persisted drawings (commits rewrite the whole list from
+    /// a stale cache). The default instance covers standalone use.
+    var drawingStore = DrawingStore()
+    // Interaction state is per-instance @State, so every grid pane pans,
+    // zooms, and draws on its own.
     @State private var interaction = ChartInteraction()
-    @State private var drawingStore = DrawingStore()
     /// View-level weekly bars: aggregates the 1d series on the fly. Not a
     /// wire interval, so AppModel stays untouched.
     @State private var weeklyMode = false
@@ -18,6 +31,17 @@ struct ChartPanel: View {
     @State private var symbolHovering = false
 
     var body: some View {
+        // Evaluated once per body: the bars array plus the marker filters /
+        // feed sort feed both CandleChart and the onChange observations, so
+        // the quad layout never duplicates this work within one pass.
+        let symbol = displaySymbol
+        let bars = chartBars
+        let signals = model.signals.filter { $0.symbol == symbol }
+        let thoughts = model.thoughts.filter {
+            $0.symbol == symbol && $0.severity >= .warning
+        }
+        let feeds = model.feeds.values.sorted { $0.feed < $1.feed }
+
         VStack(spacing: 0) {
             header
                 .padding(.horizontal, 12)
@@ -26,54 +50,98 @@ struct ChartPanel: View {
                 .fill(Theme.line)
                 .frame(height: Theme.hairline)
             CandleChart(
-                symbol: model.selectedSymbol,
-                bars: chartBars,
-                interval: weeklyMode ? .d1 : model.selectedInterval,
-                barSpanMs: weeklyMode ? ChartMath.weekMs : model.selectedInterval.ms,
-                signals: model.signals.filter { $0.symbol == model.selectedSymbol },
-                thoughts: model.thoughts.filter {
-                    $0.symbol == model.selectedSymbol && $0.severity >= .warning
-                },
-                feeds: model.feeds.values.sorted { $0.feed < $1.feed },
+                symbol: symbol,
+                bars: bars,
+                interval: weeklyMode ? .d1 : displayInterval,
+                barSpanMs: weeklyMode ? ChartMath.weekMs : displayInterval.ms,
+                signals: signals,
+                thoughts: thoughts,
+                feeds: feeds,
                 interaction: interaction,
                 drawingStore: drawingStore
             )
         }
         .panel()
-        .onChange(of: model.selectedSymbol) { _, _ in
+        .onChange(of: displaySymbol) { _, _ in
             interaction.resetForNewSeries()
             selectedRange = nil
             flashToken += 1
             flashDirection = 0
         }
-        .onChange(of: model.selectedInterval) { _, _ in
+        .onChange(of: displayInterval) { _, _ in
             interaction.resetForNewSeries()
         }
         .onChange(of: weeklyMode) { _, _ in
             interaction.resetForNewSeries()
         }
-        .onChange(of: model.lastPrice(model.selectedSymbol)) { old, new in
+        .onChange(of: model.lastPrice(symbol)) { old, new in
             handleTick(old, new)
         }
+        .onChange(of: bars.count) { _, _ in
+            // Deeper history landing while a preset is active re-frames the
+            // window. Framing math only — no re-sync — so bars cannot loop
+            // it. Only while following: a user who panned back must not be
+            // yanked to the live edge by a background bar landing.
+            guard let range = selectedRange, interaction.isFollowing else { return }
+            frameRange(range)
+        }
+        .onAppear { ensurePaneData() }
+        .onChange(of: model.symbols) { _, _ in
+            // The connect snapshot only carries watchlist bars — restored
+            // fixed panes pointing at universe tickers fetch theirs here.
+            ensurePaneData()
+        }
+    }
+
+    // MARK: - Pane context
+
+    /// The pane's own symbol when fixed; nil = follow the global selection.
+    private var fixedSymbol: String? { pane?.wrappedValue.symbol }
+
+    /// The symbol this panel charts.
+    private var displaySymbol: String { fixedSymbol ?? model.selectedSymbol }
+
+    /// The interval this panel charts. Fixed panes ride the global interval
+    /// until they set their own override; setInterval keeps the override
+    /// pane-local so grid panes never fight over the global picker.
+    private var displayInterval: Interval {
+        pane?.wrappedValue.interval ?? model.selectedInterval
+    }
+
+    private func setInterval(_ interval: Interval) {
+        if fixedSymbol != nil {
+            pane?.wrappedValue.interval = interval
+        } else {
+            model.selectedInterval = interval
+        }
+    }
+
+    /// Restored fixed panes may point at symbols with no bars at all
+    /// (universe tickers) — pull their history without touching the
+    /// global selection. No-op when any interval already has data.
+    private func ensurePaneData() {
+        guard let symbol = fixedSymbol else { return }
+        model.ensureSymbolData(symbol)
     }
 
     private var chartBars: [Bar] {
         weeklyMode
-            ? ChartMath.aggregateWeekly(model.bars(model.selectedSymbol, .d1))
-            : model.bars(model.selectedSymbol, model.selectedInterval)
+            ? ChartMath.aggregateWeekly(model.bars(displaySymbol, .d1))
+            : model.bars(displaySymbol, displayInterval)
     }
 
     // MARK: - Header
 
     private var header: some View {
-        @Bindable var model = model
-        let symbol = model.selectedSymbol
+        let symbol = displaySymbol
         let price = model.lastPrice(symbol)
         let changePct = model.sessionChangePct(symbol)
         let top = model.bookTop[symbol]
 
         return HStack(spacing: 12) {
-            if AppModel.isEquity(symbol) {
+            if fixedSymbol != nil {
+                paneSymbolMenu(symbol)
+            } else if AppModel.isEquity(symbol) {
                 Button {
                     model.openCompany(symbol)
                 } label: {
@@ -109,10 +177,74 @@ struct ChartPanel: View {
 
             rangePicker
 
-            intervalPicker($model.selectedInterval)
+            intervalPicker(Binding(
+                get: { displayInterval },
+                set: { setInterval($0) }
+            ))
 
             feedDot
         }
+    }
+
+    // MARK: - Pane symbol menu (fixed panes)
+
+    /// Watchlist + scan-universe picker replacing the plain header symbol
+    /// on fixed multi-chart panes; picking sets this pane's symbol only.
+    private func paneSymbolMenu(_ current: String) -> some View {
+        Menu {
+            if !model.symbols.isEmpty {
+                Section("watchlist") {
+                    ForEach(model.symbols, id: \.self) { symbol in
+                        Button(symbol) { pickPaneSymbol(symbol) }
+                    }
+                }
+            }
+            let universe = model.searchUniverse.filter { !model.symbols.contains($0) }
+            if !universe.isEmpty {
+                Section("universe") {
+                    ForEach(universe, id: \.self) { symbol in
+                        Button(symbol) { pickPaneSymbol(symbol) }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Text(current)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(symbolHovering ? Theme.ember : Theme.bone)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Theme.dim)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .onHover { symbolHovering = $0 }
+        .help("pane symbol")
+    }
+
+    /// Fixed-pane symbol pick — the pane stays independent of the global
+    /// selection. A sparse series at the pane's interval jumps to the
+    /// densest one; symbols with no history at all (universe tickers) get
+    /// an on-demand D1 fetch that never touches `model.selectedSymbol`.
+    private func pickPaneSymbol(_ symbol: String) {
+        guard let pane else { return }
+        var state = pane.wrappedValue
+        state.symbol = symbol
+        if model.bars(symbol, state.interval ?? model.selectedInterval).count < 30 {
+            let densest = Interval.allCases
+                .map { ($0, model.bars(symbol, $0).count) }
+                .max { $0.1 < $1.1 }
+            if let (interval, count) = densest, count >= 30 {
+                state.interval = interval
+            } else {
+                state.interval = .d1 // on-demand history lands daily
+                model.ensureSymbolData(symbol)
+            }
+        }
+        pane.wrappedValue = state
     }
 
     private var priceColor: Color {
@@ -125,7 +257,7 @@ struct ChartPanel: View {
     /// back to bone. Token guards against overlapping fades; the symbol guard
     /// suppresses the spurious flash when the selection switches instruments.
     private func handleTick(_ old: Double?, _ new: Double?) {
-        let symbol = model.selectedSymbol
+        let symbol = displaySymbol
         guard symbol == flashSymbol else {
             flashSymbol = symbol
             return
@@ -186,11 +318,22 @@ struct ChartPanel: View {
 
     private func applyRange(_ range: ChartRange) {
         selectedRange = range
-        model.selectedInterval = .d1
+        setInterval(.d1)
         weeklyMode = range.weekly
+        // The connect snapshot often beats the engine's 5y daily backfill,
+        // leaving the D1 series short — ask for depth before framing
+        // ("all" requests the full 5y backfill).
+        model.ensureDepth(
+            symbol: displaySymbol, spanMs: range.spanMs ?? 1_826 * 86_400_000
+        )
+        frameRange(range)
+    }
+
+    /// The framing math alone — safe to re-run as deeper bars land.
+    private func frameRange(_ range: ChartRange) {
         let series = weeklyMode
-            ? ChartMath.aggregateWeekly(model.bars(model.selectedSymbol, .d1))
-            : model.bars(model.selectedSymbol, .d1)
+            ? ChartMath.aggregateWeekly(model.bars(displaySymbol, .d1))
+            : model.bars(displaySymbol, .d1)
         let count = ChartMath.barsWithin(
             spanMs: range.spanMs, bars: series,
             nowMs: Int64(Date().timeIntervalSince1970 * 1000)

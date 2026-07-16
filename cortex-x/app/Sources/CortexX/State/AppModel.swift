@@ -74,6 +74,20 @@ final class AppModel {
 
     private let client: EngineClient
     private let maxBars = 3_000
+    /// Minimum spacing between depth-driven re-syncs.
+    static let resyncCooldownMs: Int64 = 30_000
+    /// Reconnect guard: only the latest connection's follow-up sync fires.
+    private var connectionToken = 0
+    /// When the last deep re-sync went out (0 = never).
+    private var lastResyncMs: Int64 = 0
+    /// Per-symbol timestamps of the last depth-driven getHistory (0 = never).
+    /// Separate from `lastResyncMs`: a watchlist sync never deepens an
+    /// off-watchlist ticker, so those requests get their own cooldown.
+    private var lastHistoryMs: [String: Int64] = [:]
+    /// The underlying of the most recent explicit chain request. The engine
+    /// republishes chains for ALL equities periodically — only the requested
+    /// one may replace what the operator is viewing.
+    private var requestedChainUnderlying: String?
 
     init(client: EngineClient = EngineClient()) {
         self.client = client
@@ -111,6 +125,7 @@ final class AppModel {
 
     func requestOptionsChain(underlying: String, expiry: String? = nil) {
         guard Self.isEquity(underlying) else { return }
+        requestedChainUnderlying = underlying
         chainLoading = true
         send(.getOptionsChain(underlying: underlying, expiry: expiry))
     }
@@ -146,6 +161,82 @@ final class AppModel {
         }
     }
 
+    /// Pane-local history path for the multi-chart grid: request on-demand
+    /// history for a symbol with no bars on any interval, WITHOUT touching
+    /// `selectedSymbol` or `selectedInterval` — fixed panes must never move
+    /// the global selection. Returns whether a request actually went out.
+    @discardableResult
+    func ensureSymbolData(_ symbol: String) -> Bool {
+        let symbol = symbol.uppercased()
+        let hasBars = bars[symbol]?.values.contains { !$0.isEmpty } ?? false
+        guard !hasBars else { return false }
+        send(.getHistory(symbol: symbol))
+        return true
+    }
+
+    // MARK: Historical depth
+
+    /// The connect snapshot often lands before the engine finishes its 5y
+    /// daily backfill, and equity D1 bars never stream live — so charts stay
+    /// short forever without a follow-up. One deep re-sync ~20s after each
+    /// hello closes the gap. The token guards reconnects: each hello bumps
+    /// it, so only the latest connection's task fires. applySnapshot rebuilds
+    /// bars wholesale but never touches optionsChain/copilot/company state,
+    /// and it keeps the selected symbol whenever it is still listed.
+    private func scheduleFollowUpSync() {
+        connectionToken += 1
+        let token = connectionToken
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(20))
+            guard let self, self.connectionToken == token else { return }
+            let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+            // A depth-driven re-sync (range preset right after connect) may
+            // have just fired — inside the cooldown this one is redundant.
+            guard nowMs - self.lastResyncMs >= Self.resyncCooldownMs else { return }
+            self.lastResyncMs = nowMs
+            self.send(.sync(barsPerSymbol: self.maxBars))
+        }
+    }
+
+    /// Ask the engine for deeper history when the D1 series cannot cover the
+    /// requested span (range presets call this before framing). Rate-limited
+    /// so preset clicks and re-frames never spam requests; `nowMs` is
+    /// injected for tests. Watchlist symbols ride the shared sync cooldown;
+    /// off-watchlist tickers ride outside that sync entirely (a sync for
+    /// another symbol never deepens them), so their direct getHistory runs
+    /// on its own per-symbol cooldown. Returns whether anything was issued.
+    @discardableResult
+    func ensureDepth(
+        symbol: String, spanMs: Int64,
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> Bool {
+        guard Self.isShortSeries(bars(symbol, .d1), spanMs: spanMs, nowMs: nowMs) else {
+            return false
+        }
+        var issued = false
+        if nowMs - lastResyncMs >= Self.resyncCooldownMs {
+            lastResyncMs = nowMs
+            send(.sync(barsPerSymbol: maxBars))
+            issued = true
+        }
+        if !symbols.contains(symbol),
+            nowMs - (lastHistoryMs[symbol] ?? 0) >= Self.resyncCooldownMs {
+            // Universe/searched symbols ride outside the watchlist sync —
+            // fetch their D1 history directly.
+            lastHistoryMs[symbol] = nowMs
+            send(.getHistory(symbol: symbol))
+            issued = true
+        }
+        return issued
+    }
+
+    /// True when the series cannot cover the trailing `spanMs` window — its
+    /// oldest bar is younger than the cutoff (or there are no bars at all).
+    static func isShortSeries(_ series: [Bar], spanMs: Int64, nowMs: Int64) -> Bool {
+        guard let oldest = series.first else { return true }
+        return oldest.ts_open_ms > nowMs - spanMs
+    }
+
     func requestCompany(_ symbol: String) {
         // Re-request on every navigation: stale cards must never masquerade
         // as current. A watchdog clears the spinner if the engine never
@@ -178,6 +269,7 @@ final class AppModel {
         switch frame {
         case .hello(let v):
             protocolVersion = v
+            scheduleFollowUpSync()
         case .snapshot(let snap):
             applySnapshot(snap)
         case .tick(let t):
@@ -227,8 +319,15 @@ final class AppModel {
                 tags: ["caution"], confidence: 1.0, symbol: c.scope, ts_ms: c.ts_ms
             ), at: 0)
         case .optionsChain(let chain):
-            optionsChain = chain
-            chainLoading = false
+            // The engine republishes chains for ALL equities periodically —
+            // only the requested underlying may replace what the operator is
+            // viewing. Unsolicited chains may still fill an empty slot.
+            if chain.underlying == requestedChainUnderlying {
+                optionsChain = chain
+                chainLoading = false
+            } else if optionsChain == nil {
+                optionsChain = chain
+            }
         case .sim(let report):
             simReport = report
             simRunning = false
@@ -272,7 +371,14 @@ final class AppModel {
 
     private func applySnapshot(_ snap: EngineSnapshot) {
         symbols = snap.symbols
-        if !symbols.contains(selectedSymbol), let first = symbols.first {
+        if let u = snap.search_universe { searchUniverse = u }
+        // Mid-session re-syncs (hello follow-up, ensureDepth) must never
+        // yank a universe/ad-hoc selection away — only reset when the model
+        // truly has nothing to show for it.
+        if !symbols.contains(selectedSymbol),
+            !searchUniverse.contains(selectedSymbol),
+            bars[selectedSymbol] == nil,
+            let first = symbols.first {
             selectedSymbol = first
         }
         var rebuilt: [String: [Interval: [Bar]]] = [:]
@@ -295,7 +401,6 @@ final class AppModel {
         if let r = snap.regimes { regimeBoard = r }
         if let g = snap.geo { geoPulse = g }
         if let s = snap.scan { scanBoard = s }
-        if let u = snap.search_universe { searchUniverse = u }
         for (symbol, byInterval) in rebuilt {
             if sessionOpen[symbol] == nil {
                 sessionOpen[symbol] = byInterval[.m1]?.last?.close ?? byInterval[.h1]?.last?.close

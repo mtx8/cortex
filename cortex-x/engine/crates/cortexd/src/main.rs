@@ -92,6 +92,13 @@ async fn main() -> anyhow::Result<()> {
     );
     snap.spawn_collector(Arc::clone(&bus));
 
+    // Options-chain refresh: fresh chains on the bus for the options desk
+    // (cx-agents) without the desk ever fetching — bus-only stays intact.
+    let option_underlyings = equity_symbols(&cfg.symbols);
+    if !option_underlyings.is_empty() {
+        spawn_options_chain_refresh(Arc::clone(&bus), Arc::clone(&snap), option_underlyings);
+    }
+
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<Command>(256);
     {
         let bus = Arc::clone(&bus);
@@ -370,6 +377,54 @@ fn spawn_autoresearch(
     });
 }
 
+/// The configured EQUITY (bare-ticker) symbols — the only underlyings the
+/// options-chain refresh loop targets; dashed crypto products have no
+/// listed CBOE chain.
+fn equity_symbols(symbols: &[String]) -> Vec<String> {
+    symbols
+        .iter()
+        .filter(|s| cx_core::types::asset_class_of(s) == cx_core::types::AssetClass::Equity)
+        .cloned()
+        .collect()
+}
+
+/// The options-chain refresh loop: every 15 minutes (market hours are
+/// irrelevant in v1 — a closed market simply republishes the prior
+/// session's chain, with staleness visible via `as_of`), fetch the
+/// front-expiry chain for each configured EQUITY symbol through the SAME
+/// `cx_md::options::fetch_chain` + greek-enrichment path as
+/// `Command::GetOptionsChain`, and publish `EngineEvent::OptionsChain` —
+/// the options desk (cx-agents) reads fresh chains off the bus. Failures
+/// degrade per-symbol with a warn; the loop never dies.
+fn spawn_options_chain_refresh(
+    bus: Arc<cx_core::Bus>,
+    snap: Arc<SnapshotSrc>,
+    underlyings: Vec<String>,
+) {
+    const REFRESH: std::time::Duration = std::time::Duration::from_secs(900);
+    tokio::spawn(async move {
+        let egress = cx_core::egress::Egress::new();
+        loop {
+            for sym in &underlyings {
+                match cx_md::options::fetch_chain(&egress, sym, None).await {
+                    Ok(mut chain) => {
+                        options_enrich::enrich(&mut chain, snap.risk_free_rate());
+                        bus.publish(cx_core::EngineEvent::OptionsChain(chain));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            symbol = %sym,
+                            error = %e,
+                            "options chain refresh failed; symbol degrades this cycle"
+                        );
+                    }
+                }
+            }
+            tokio::time::sleep(REFRESH).await;
+        }
+    });
+}
+
 /// The bar interval a symbol replays at in cx-sim (crypto M1, everything
 /// else D1) — a mirror of cx-sim's internal routing, which is not exported.
 fn replay_interval(symbol: &str) -> cx_core::types::Interval {
@@ -467,6 +522,19 @@ mod tests {
         let s2 =
             cx_sim::evaluate_strategy_params(&frozen, &symbols, "meanrev_z", &cx_sim::ParamMap::new());
         assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn options_refresh_targets_equities_only() {
+        let symbols = vec![
+            "BTC-USD".to_string(),
+            "SPY".to_string(),
+            "ETH-USD".to_string(),
+            "NVDA".to_string(),
+        ];
+        assert_eq!(equity_symbols(&symbols), vec!["SPY", "NVDA"]);
+        assert!(equity_symbols(&["BTC-USD".to_string()]).is_empty());
+        assert!(equity_symbols(&[]).is_empty());
     }
 
     #[test]

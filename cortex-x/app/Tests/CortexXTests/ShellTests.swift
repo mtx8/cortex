@@ -22,4 +22,30 @@ final class ShellTests: XCTestCase {
         XCTAssertEqual(model.centerMode, .company)
         XCTAssertTrue(model.companyLoading)
     }
+
+    // Panel toggles live at their panels; ShellPanel is the shared identity
+    // that keeps the collapse buttons, the re-open handles, and RootView's
+    // @AppStorage visibility keys in sync.
+    func testShellPanelStorageKeysMatchRootView() {
+        XCTAssertEqual(ShellPanel.allCases, [.watchlist, .intelligence, .deck])
+        XCTAssertEqual(
+            ShellPanel.allCases.map(\.storageKey),
+            ["showWatchlist", "showIntelligence", "showDeck"]
+        )
+    }
+
+    func testShellPanelShortcutKeysAreDistinct() {
+        XCTAssertEqual(ShellPanel.allCases.map(\.shortcutKey), ["l", "r", "b"])
+        XCTAssertEqual(Set(ShellPanel.allCases.map(\.shortcutKey)).count, 3)
+    }
+
+    // Re-open chevrons must point back toward where the panel returns.
+    func testShellPanelIcons() {
+        XCTAssertEqual(ShellPanel.watchlist.collapseIcon, "sidebar.left")
+        XCTAssertEqual(ShellPanel.intelligence.collapseIcon, "sidebar.right")
+        XCTAssertEqual(ShellPanel.deck.collapseIcon, "rectangle.bottomthird.inset.filled")
+        XCTAssertEqual(ShellPanel.watchlist.reopenIcon, "chevron.right")
+        XCTAssertEqual(ShellPanel.intelligence.reopenIcon, "chevron.left")
+        XCTAssertEqual(ShellPanel.deck.reopenIcon, "chevron.up")
+    }
 }

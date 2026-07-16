@@ -10,6 +10,10 @@
 //! - "execution_auditor" (execution): per-fill slippage audit.
 //! - "strategist" (strategy-ai): LLM-read of the ledger on a slow cadence,
 //!   only when an LLM is configured; advisory output only.
+//! - asset-class DESKS ("desk-crypto" / "desk-equity" / "desk-options",
+//!   one bus task in [`desks`]): 24/7 crypto dynamics, session gaps +
+//!   scanner ranks + breadth divergence, and option-chain IV/skew —
+//!   throttled thoughts, tighten-only cautions, advisory signals only.
 //!
 //! Invariants enforced at this layer:
 //! - Bus-only inter-squadron IO: the mesh publishes [`EngineEvent`]s and
@@ -35,6 +39,7 @@ pub mod autoresearch;
 mod analyst;
 mod auditor;
 mod copilot;
+mod desks;
 mod ledger;
 mod llm;
 mod macro_agent;
@@ -116,6 +121,7 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
         cfg.risk.max_daily_drawdown,
     );
     auditor::spawn(Arc::clone(&bus), Arc::clone(&ledger));
+    desks::spawn(Arc::clone(&bus), Arc::clone(&store), cfg.symbols.clone());
 
     // Always spawn: the client auto-detects local servers (Ollama/LM Studio)
     // at runtime, so a user who starts one later is picked up on the next
@@ -137,7 +143,7 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
         None,
         1.0,
         format!(
-            "agent mesh online: market_analyst, macro_sentinel, risk_officer, execution_auditor{}{}",
+            "agent mesh online: market_analyst, macro_sentinel, risk_officer, execution_auditor, asset desks (crypto/equity/options){}{}",
             if strategist_on {
                 ", strategist (llm)"
             } else {

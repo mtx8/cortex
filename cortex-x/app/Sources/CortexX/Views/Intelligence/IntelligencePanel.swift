@@ -50,9 +50,15 @@ private struct CopilotSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionLabel(text: "copilot")
-                .padding(.horizontal, 12)
-                .padding(.top, 10)
+            // The copilot header is the panel's top row, so the panel
+            // collapse affordance lives at its left edge.
+            HStack(spacing: 8) {
+                PanelCollapseButton(.intelligence)
+                SectionLabel(text: "copilot")
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.top, 10)
 
             ScrollViewReader { proxy in
                 ScrollView {

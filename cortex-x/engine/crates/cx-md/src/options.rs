@@ -2,6 +2,15 @@
 //! venue chain for ONE expiry; greek enrichment happens in cortexd where a
 //! risk-free rate is known. Payloads can exceed the default egress cap
 //! (SPY ~6 MB) so this path uses an explicit larger cap.
+//!
+//! Expiry selection: an explicit `want_expiry` present on the board is
+//! honored exactly. With NO expiry requested the default is the first
+//! expiry at least [`MIN_DEFAULT_EXPIRY_DAYS`] calendar days out —
+//! "nearest weekly, not 0DTE" — because heavily-listed underlyings (SPY)
+//! put a 0DTE chain first, and a recurring desk read pinned to
+//! `expirations.first()` would roll its tenor daily, corrupting IV/skew
+//! comparisons across cycles. Fallback when the whole board is nearer
+//! than that: the last available expiry.
 
 use cx_core::egress::Egress;
 use cx_core::error::CxError;
@@ -9,6 +18,10 @@ use cx_core::events::{OptionContract, OptionRight, OptionsChain};
 use cx_core::time::now_ms;
 
 const CHAIN_CAP_BYTES: usize = 24 * 1024 * 1024;
+const DAY_MS: i64 = 86_400_000;
+/// Default-expiry floor: with `want_expiry: None` the chosen expiry is the
+/// first at least this many calendar days out (fallback: last available).
+const MIN_DEFAULT_EXPIRY_DAYS: i64 = 7;
 
 fn chain_url(underlying: &str) -> String {
     format!("https://cdn.cboe.com/api/global/delayed_quotes/options/{underlying}.json")
@@ -36,6 +49,47 @@ pub(crate) fn parse_occ(occ: &str) -> Option<(String, OptionRight, f64)> {
     Some((expiry, right, strike))
 }
 
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// UTC day number of a `YYYY-MM-DD` expiry; None for malformed strings.
+fn expiry_day(expiry: &str) -> Option<i64> {
+    let b = expiry.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let y: i64 = expiry[0..4].parse().ok()?;
+    let m: i64 = expiry[5..7].parse().ok()?;
+    let d: i64 = expiry[8..10].parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// Default expiry when none is requested: the first (sorted) expiry at
+/// least [`MIN_DEFAULT_EXPIRY_DAYS`] calendar days out; when the whole
+/// board is nearer than that, the last available expiry.
+fn default_expiry(expirations: &[String], now: i64) -> Option<&String> {
+    let cutoff = now.div_euclid(DAY_MS) + MIN_DEFAULT_EXPIRY_DAYS;
+    expirations
+        .iter()
+        .find(|e| expiry_day(e).is_some_and(|d| d >= cutoff))
+        .or_else(|| expirations.last())
+}
+
+/// Fetch the venue chain for one expiry. An explicit `want_expiry` present
+/// on the board is honored exactly (on-demand UI requests pass these and
+/// are unaffected). `want_expiry: None` — the recurring desk read — now
+/// means "nearest weekly, not 0DTE": the first expiry >= 7 calendar days
+/// out, falling back to the last available.
 pub async fn fetch_chain(
     egress: &Egress,
     underlying: &str,
@@ -48,13 +102,14 @@ pub async fn fetch_chain(
     let raw = egress
         .get_text_with_cap(&chain_url(&symbol), CHAIN_CAP_BYTES)
         .await?;
-    parse_chain(&symbol, &raw, want_expiry)
+    parse_chain(&symbol, &raw, want_expiry, now_ms())
 }
 
 pub(crate) fn parse_chain(
     symbol: &str,
     raw: &str,
     want_expiry: Option<&str>,
+    now: i64,
 ) -> Result<OptionsChain, CxError> {
     let v: serde_json::Value =
         serde_json::from_str(raw).map_err(|_| CxError::Feed("chain: invalid json".into()))?;
@@ -117,7 +172,9 @@ pub(crate) fn parse_chain(
 
     let chosen = match want_expiry {
         Some(e) if expirations.iter().any(|x| x == e) => e.to_string(),
-        _ => expirations.first().cloned().unwrap_or_default(),
+        _ => default_expiry(&expirations, now)
+            .cloned()
+            .unwrap_or_default(),
     };
     let mut contracts: Vec<OptionContract> = rows
         .into_iter()
@@ -172,7 +229,9 @@ mod tests {
             {"option":"XX260710C00090000","bid":10.0,"ask":10.5,"iv":0.0,"volume":1,"open_interest":2},
             {"option":"XX260807P00100000","bid":3.0,"ask":3.3,"iv":0.25,"volume":7,"open_interest":9}
         ]}}"#;
-        let chain = parse_chain("XX", raw, None).unwrap();
+        // Well before both expiries: 2026-07-10 is >= 7 days out -> default.
+        let now = expiry_day("2026-06-01").unwrap() * DAY_MS;
+        let chain = parse_chain("XX", raw, None, now).unwrap();
         assert_eq!(chain.expirations, vec!["2026-07-10", "2026-08-07"]);
         assert_eq!(chain.expiry, "2026-07-10");
         assert_eq!(chain.contracts.len(), 2);
@@ -180,10 +239,47 @@ mod tests {
         // iv 0.0 is treated as absent -> engine will backfill via BS.
         assert!(chain.contracts[0].iv.is_none());
 
-        let aug = parse_chain("XX", raw, Some("2026-08-07")).unwrap();
+        let aug = parse_chain("XX", raw, Some("2026-08-07"), now).unwrap();
         assert_eq!(aug.contracts.len(), 1);
         assert_eq!(aug.contracts[0].right, OptionRight::Put);
 
-        assert!(parse_chain("XX", "{}", None).is_err());
+        assert!(parse_chain("XX", "{}", None, now).is_err());
+    }
+
+    #[test]
+    fn default_expiry_is_nearest_weekly_never_0dte() {
+        let raw = r#"{"data":{"current_price":100.0,"options":[
+            {"option":"XX260710C00100000","bid":1.0,"ask":1.2,"iv":0.5},
+            {"option":"XX260714C00100000","bid":1.0,"ask":1.2,"iv":0.4},
+            {"option":"XX260717C00100000","bid":1.0,"ask":1.2,"iv":0.3},
+            {"option":"XX260807C00100000","bid":1.0,"ask":1.2,"iv":0.25}
+        ]}}"#;
+        // "Today" IS the first listed expiry (the SPY 0DTE shape): the
+        // default skips 0DTE and the 4-day chain for the first expiry
+        // >= 7 calendar days out (exactly 7 qualifies).
+        let now = expiry_day("2026-07-10").unwrap() * DAY_MS;
+        let chain = parse_chain("XX", raw, None, now).unwrap();
+        assert_eq!(chain.expiry, "2026-07-17");
+        // Intraday (mid-Saturday of the same day number) is identical.
+        let chain = parse_chain("XX", raw, None, now + DAY_MS / 2).unwrap();
+        assert_eq!(chain.expiry, "2026-07-17");
+        // Explicit requests are honored exactly, 0DTE included.
+        let zero = parse_chain("XX", raw, Some("2026-07-10"), now).unwrap();
+        assert_eq!(zero.expiry, "2026-07-10");
+        // Whole board nearer than 7 days: fall back to the LAST available.
+        let late = expiry_day("2026-08-05").unwrap() * DAY_MS;
+        let chain = parse_chain("XX", raw, None, late).unwrap();
+        assert_eq!(chain.expiry, "2026-08-07");
+    }
+
+    #[test]
+    fn expiry_day_maps_civil_dates() {
+        assert_eq!(expiry_day("1970-01-01"), Some(0));
+        assert_eq!(expiry_day("1970-01-02"), Some(1));
+        // 10957 days to 2000-01-01, +31 (Jan) +29 (leap Feb) = 11017.
+        assert_eq!(expiry_day("2000-03-01"), Some(11017));
+        assert_eq!(expiry_day("2026-7-10"), None);
+        assert_eq!(expiry_day("2026-13-01"), None);
+        assert_eq!(expiry_day("garbage"), None);
     }
 }

@@ -29,8 +29,12 @@ struct Watchlist: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(text: "watchlist")
-                .padding(.horizontal, 4)
+            HStack(spacing: 6) {
+                SectionLabel(text: "watchlist")
+                Spacer(minLength: 0)
+                PanelCollapseButton(.watchlist)
+            }
+            .padding(.horizontal, 4)
             searchField
             if !cryptoSymbols.isEmpty {
                 symbolGroup(label: "crypto", symbols: cryptoSymbols)

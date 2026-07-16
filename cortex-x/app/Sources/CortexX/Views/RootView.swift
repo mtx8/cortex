@@ -17,21 +17,19 @@ struct RootView: View {
             TopBar()
             Divider().overlay(Theme.line)
             HStack(spacing: 0) {
-                IconRail(
-                    showWatchlist: $showWatchlist,
-                    showIntelligence: $showIntelligence,
-                    showDeck: $showDeck
-                )
+                IconRail()
                 Divider().overlay(Theme.line)
                 if showWatchlist {
                     Watchlist()
                         .frame(width: 220)
                     Divider().overlay(Theme.line)
+                } else {
+                    ReopenHandle(panel: .watchlist, visible: $showWatchlist)
                 }
                 VStack(spacing: 0) {
                     Group {
                         switch model.centerMode {
-                        case .chart: ChartPanel()
+                        case .chart: ChartGrid()
                         case .scanner: ScannerView()
                         case .company: CompanyView()
                         case .options: OptionsChainView()
@@ -45,6 +43,8 @@ struct RootView: View {
                         Divider().overlay(Theme.line)
                         DashboardPanel()
                             .frame(height: 280)
+                    } else {
+                        ReopenHandle(panel: .deck, visible: $showDeck)
                     }
                 }
                 .frame(maxWidth: .infinity)
@@ -52,6 +52,8 @@ struct RootView: View {
                     Divider().overlay(Theme.line)
                     IntelligencePanel()
                         .frame(width: 340)
+                } else {
+                    ReopenHandle(panel: .intelligence, visible: $showIntelligence)
                 }
             }
         }
@@ -62,16 +64,149 @@ struct RootView: View {
     }
 }
 
+// MARK: - Shell panels
+
+/// The three collapsible shell panels. Single source of truth for the
+/// @AppStorage visibility key, the header collapse icon, the re-open chevron,
+/// the .help name, and the cmd-shift shortcut — so the collapse buttons (at
+/// the panels) and the re-open handles (here) can never drift apart.
+enum ShellPanel: CaseIterable {
+    case watchlist, intelligence, deck
+
+    /// UserDefaults key backing visibility; RootView owns the same keys.
+    var storageKey: String {
+        switch self {
+        case .watchlist: "showWatchlist"
+        case .intelligence: "showIntelligence"
+        case .deck: "showDeck"
+        }
+    }
+
+    /// SF Symbol on the collapse affordance in the panel's own header.
+    var collapseIcon: String {
+        switch self {
+        case .watchlist: "sidebar.left"
+        case .intelligence: "sidebar.right"
+        case .deck: "rectangle.bottomthird.inset.filled"
+        }
+    }
+
+    /// Chevron on the slim re-open handle, pointing where the panel returns.
+    var reopenIcon: String {
+        switch self {
+        case .watchlist: "chevron.right"
+        case .intelligence: "chevron.left"
+        case .deck: "chevron.up"
+        }
+    }
+
+    /// Lowercase name for .help copy ("hide watchlist" / "show watchlist").
+    var displayName: String {
+        switch self {
+        case .watchlist: "watchlist"
+        case .intelligence: "intelligence"
+        case .deck: "bottom deck"
+        }
+    }
+
+    /// cmd-shift key shared by the collapse button and the re-open handle
+    /// (they are never in the hierarchy at the same time).
+    var shortcutKey: Character {
+        switch self {
+        case .watchlist: "l"
+        case .intelligence: "r"
+        case .deck: "b"
+        }
+    }
+}
+
+/// 13pt collapse affordance in a panel's own header: dim, ember on hover.
+/// Reads the same @AppStorage key RootView arranges by, so no bindings need
+/// to thread through the panels.
+struct PanelCollapseButton: View {
+    let panel: ShellPanel
+    @AppStorage private var visible: Bool
+    @State private var hovering = false
+
+    init(_ panel: ShellPanel) {
+        self.panel = panel
+        _visible = AppStorage(wrappedValue: true, panel.storageKey)
+    }
+
+    var body: some View {
+        Button {
+            visible.toggle()
+        } label: {
+            Image(systemName: panel.collapseIcon)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(hovering ? Theme.ember : Theme.dim)
+                .frame(width: 20, height: 20)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(KeyEquivalent(panel.shortcutKey), modifiers: [.command, .shift])
+        .onHover { hovering = $0 }
+        .help("hide \(panel.displayName)")
+    }
+}
+
+/// Slim re-open strip pinned to a hidden panel's edge: 16pt of ink with a
+/// hairline on the inner edge and a centered chevron (dim, ember on hover).
+/// Carries the panel's cmd-shift shortcut while its collapse button is gone.
+private struct ReopenHandle: View {
+    let panel: ShellPanel
+    @Binding var visible: Bool
+    @State private var hovering = false
+
+    private var isBottom: Bool { panel == .deck }
+
+    private var innerEdge: Alignment {
+        switch panel {
+        case .watchlist: .trailing
+        case .intelligence: .leading
+        case .deck: .top
+        }
+    }
+
+    var body: some View {
+        Button {
+            visible = true
+        } label: {
+            Image(systemName: panel.reopenIcon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(hovering ? Theme.ember : Theme.dim)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(KeyEquivalent(panel.shortcutKey), modifiers: [.command, .shift])
+        .onHover { hovering = $0 }
+        .help("show \(panel.displayName)")
+        .frame(width: isBottom ? nil : 16, height: isBottom ? 16 : nil)
+        .frame(
+            maxWidth: isBottom ? .infinity : nil,
+            maxHeight: isBottom ? nil : .infinity
+        )
+        .background(Theme.ink)
+        .overlay(alignment: innerEdge) {
+            Rectangle()
+                .fill(Theme.line)
+                .frame(
+                    width: isBottom ? nil : Theme.hairline,
+                    height: isBottom ? Theme.hairline : nil
+                )
+        }
+        .animation(DeckMotion.ease(), value: hovering)
+    }
+}
+
 // MARK: - Icon rail
 
-/// Far-left section rail: six SF Symbol section buttons on top, panel
-/// visibility toggles + connection dot pinned at the bottom. GINEXUS style:
-/// clean, small, quiet — no labels.
+/// Far-left section rail: SF Symbol section buttons on top, connection dot
+/// pinned at the bottom. GINEXUS style: clean, small, quiet — no labels.
+/// Panel visibility toggles live at their panels (PanelCollapseButton).
 private struct IconRail: View {
     @Environment(AppModel.self) private var model
-    @Binding var showWatchlist: Bool
-    @Binding var showIntelligence: Bool
-    @Binding var showDeck: Bool
 
     private static let sections: [(mode: AppModel.CenterMode, icon: String, name: String)] = [
         (.chart, "chart.xyaxis.line", "terminal"),
@@ -89,11 +224,7 @@ private struct IconRail: View {
                 sectionButton(section, digit: index + 1)
             }
             Spacer(minLength: 8)
-            panelToggle("sidebar.left", isOn: $showWatchlist, name: "watchlist", key: "l")
-            panelToggle("sidebar.right", isOn: $showIntelligence, name: "intelligence", key: "r")
-            panelToggle("rectangle.bottomthird.inset.filled", isOn: $showDeck, name: "bottom deck", key: "b")
             connectionDot
-                .padding(.top, 6)
         }
         .padding(.vertical, 10)
         .frame(width: 48)
@@ -123,23 +254,6 @@ private struct IconRail: View {
         .buttonStyle(.plain)
         .keyboardShortcut(KeyEquivalent(Character("\(digit)")), modifiers: .command)
         .help(section.name)
-    }
-
-    private func panelToggle(
-        _ icon: String, isOn: Binding<Bool>, name: String, key: Character
-    ) -> some View {
-        Button {
-            isOn.wrappedValue.toggle()
-        } label: {
-            Image(systemName: icon)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(isOn.wrappedValue ? Theme.bone : Theme.dim)
-                .frame(width: 28, height: 24)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .keyboardShortcut(KeyEquivalent(key), modifiers: [.command, .shift])
-        .help(isOn.wrappedValue ? "hide \(name)" : "show \(name)")
     }
 
     private var connectionDot: some View {

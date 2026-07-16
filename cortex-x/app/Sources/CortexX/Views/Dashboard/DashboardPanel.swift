@@ -42,6 +42,7 @@ struct TradeDeckTables: View {
                     tabButton(t)
                 }
                 Spacer(minLength: 0)
+                PanelCollapseButton(.deck)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)

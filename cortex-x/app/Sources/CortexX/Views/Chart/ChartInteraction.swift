@@ -8,14 +8,17 @@ import SwiftUI
 /// Drawing tool armed on the chart. Anything but `.cursor` claims clicks
 /// for anchor placement and suppresses pan-dragging.
 enum ChartTool: String, CaseIterable {
-    case cursor, trendline, hline, fib
+    case cursor, trendline, hline, vline, rect, fib, measure
 
     var symbolName: String {
         switch self {
         case .cursor: "cursorarrow"
         case .trendline: "line.diagonal"
         case .hline: "minus"
+        case .vline: "arrow.up.and.down"
+        case .rect: "rectangle"
         case .fib: "point.topleft.down.curvedto.point.bottomright.up"
+        case .measure: "ruler"
         }
     }
 
@@ -24,7 +27,23 @@ enum ChartTool: String, CaseIterable {
         case .cursor: "cursor"
         case .trendline: "trendline"
         case .hline: "horizontal line"
+        case .vline: "vertical line"
+        case .rect: "rectangle"
         case .fib: "fib retracement"
+        case .measure: "measure"
+        }
+    }
+
+    /// Drawing kind an armed tool produces; nil for the cursor.
+    var drawingKind: DrawingKind? {
+        switch self {
+        case .cursor: nil
+        case .trendline: .trendline
+        case .hline: .hline
+        case .vline: .vline
+        case .rect: .rect
+        case .fib: .fib
+        case .measure: .measure
         }
     }
 }

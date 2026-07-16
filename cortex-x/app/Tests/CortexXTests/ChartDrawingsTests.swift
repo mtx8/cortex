@@ -1,7 +1,7 @@
 // Drawing-layer tests: model JSON roundtrip, fib level interpolation in
-// both directions, screen-space hit testing with tolerance, and
-// DrawingStore add / remove / move / persistence against an isolated
-// UserDefaults suite.
+// both directions, measure readout math, screen-space hit testing with
+// tolerance, and DrawingStore add / remove / move / persistence against an
+// isolated UserDefaults suite.
 
 import XCTest
 @testable import CortexX
@@ -31,6 +31,24 @@ final class ChartDrawingsTests: XCTestCase {
         XCTAssertEqual(DrawingKind.trendline.rawValue, "trendline")
         XCTAssertEqual(DrawingKind.hline.rawValue, "hline")
         XCTAssertEqual(DrawingKind.fib.rawValue, "fib")
+        XCTAssertEqual(DrawingKind.rect.rawValue, "rect")
+        XCTAssertEqual(DrawingKind.vline.rawValue, "vline")
+        XCTAssertEqual(DrawingKind.measure.rawValue, "measure")
+    }
+
+    func testNewDrawingKindsJSONRoundtrip() throws {
+        let two = [
+            DrawingPoint(ts_ms: 1_700_000_000_000, price: 100),
+            DrawingPoint(ts_ms: 1_700_000_600_000, price: 110),
+        ]
+        for kind in [DrawingKind.rect, .measure] {
+            let original = Drawing(kind: kind, points: two)
+            let data = try JSONEncoder().encode(original)
+            XCTAssertEqual(try JSONDecoder().decode(Drawing.self, from: data), original)
+        }
+        let vline = Drawing(kind: .vline, points: [two[0]])
+        let data = try JSONEncoder().encode(vline)
+        XCTAssertEqual(try JSONDecoder().decode(Drawing.self, from: data), vline)
     }
 
     // MARK: - Fib levels
@@ -58,6 +76,54 @@ final class ChartDrawingsTests: XCTestCase {
     func testFibLevelsNonFiniteInputIsEmpty() {
         XCTAssertTrue(DrawingMath.fibLevels(a: .nan, b: 100).isEmpty)
         XCTAssertTrue(DrawingMath.fibLevels(a: 100, b: .infinity).isEmpty)
+    }
+
+    // MARK: - Measure stats
+
+    func testMeasureStatsSignedPercentAndBars() {
+        let span: Int64 = 60_000
+        let a = DrawingPoint(ts_ms: 0, price: 100)
+        let b = DrawingPoint(ts_ms: 10 * span, price: 125)
+        let up = DrawingMath.measureStats(a: a, b: b, barSpanMs: span)
+        XCTAssertEqual(up?.pct ?? .nan, 25, accuracy: 1e-9)
+        XCTAssertEqual(up?.bars, 10)
+        // Reversed anchors: both readouts flip sign.
+        let down = DrawingMath.measureStats(a: b, b: a, barSpanMs: span)
+        XCTAssertEqual(down?.pct ?? .nan, -20, accuracy: 1e-9)
+        XCTAssertEqual(down?.bars, -10)
+    }
+
+    func testMeasureStatsRoundsBarCount() {
+        let a = DrawingPoint(ts_ms: 0, price: 100)
+        let flat = { (ts: Int64) in DrawingPoint(ts_ms: ts, price: 100) }
+        XCTAssertEqual(
+            DrawingMath.measureStats(a: a, b: flat(540_000), barSpanMs: 100_000)?.bars, 5
+        )
+        XCTAssertEqual(
+            DrawingMath.measureStats(a: a, b: flat(560_000), barSpanMs: 100_000)?.bars, 6
+        )
+    }
+
+    func testMeasureStatsRejectsDegenerateInput() {
+        let a = DrawingPoint(ts_ms: 0, price: 100)
+        let b = DrawingPoint(ts_ms: 60_000, price: 110)
+        XCTAssertNil(
+            DrawingMath.measureStats(
+                a: DrawingPoint(ts_ms: 0, price: .nan), b: b, barSpanMs: 60_000
+            )
+        )
+        XCTAssertNil(
+            DrawingMath.measureStats(
+                a: a, b: DrawingPoint(ts_ms: 60_000, price: .infinity), barSpanMs: 60_000
+            )
+        )
+        // Zero start price would divide away the percent.
+        XCTAssertNil(
+            DrawingMath.measureStats(
+                a: DrawingPoint(ts_ms: 0, price: 0), b: b, barSpanMs: 60_000
+            )
+        )
+        XCTAssertNil(DrawingMath.measureStats(a: a, b: b, barSpanMs: 0))
     }
 
     // MARK: - Hit testing
@@ -114,9 +180,45 @@ final class ChartDrawingsTests: XCTestCase {
         XCTAssertFalse(hit(d, CGPoint(x: 350, y: 150))) // outside the anchor span
     }
 
+    func testRectHitOnEdgesOnly() {
+        // Corners (100, y 50) and (300, y 150) on screen.
+        let d = Drawing(kind: .rect, points: [
+            DrawingPoint(ts_ms: 100, price: 150),
+            DrawingPoint(ts_ms: 300, price: 50),
+        ])
+        XCTAssertTrue(hit(d, CGPoint(x: 100, y: 100))) // left edge
+        XCTAssertTrue(hit(d, CGPoint(x: 200, y: 53))) // 3pt off the top edge
+        XCTAssertTrue(hit(d, CGPoint(x: 300, y: 150))) // corner
+        XCTAssertFalse(hit(d, CGPoint(x: 200, y: 100))) // interior stays click-through
+        XCTAssertFalse(hit(d, CGPoint(x: 320, y: 100))) // outside
+    }
+
+    func testVLineHitNearXOnly() {
+        // ts 150 -> x 150.
+        let d = Drawing(kind: .vline, points: [DrawingPoint(ts_ms: 150, price: 60)])
+        XCTAssertTrue(hit(d, CGPoint(x: 153, y: 10)))
+        XCTAssertTrue(hit(d, CGPoint(x: 150, y: 195)))
+        XCTAssertFalse(hit(d, CGPoint(x: 170, y: 100))) // 20pt away in x
+        XCTAssertFalse(hit(d, CGPoint(x: 150, y: 220))) // below the pane
+    }
+
+    func testMeasureHitIsASegmentNotARay() {
+        // Anchors (0,0) and (100,100) on screen: the diagonal y = x.
+        let d = Drawing(kind: .measure, points: [
+            DrawingPoint(ts_ms: 0, price: 200),
+            DrawingPoint(ts_ms: 100, price: 100),
+        ])
+        XCTAssertTrue(hit(d, CGPoint(x: 50, y: 50)))
+        XCTAssertTrue(hit(d, CGPoint(x: 100, y: 100))) // endpoint
+        XCTAssertFalse(hit(d, CGPoint(x: 150, y: 150))) // no extension past the anchor
+        XCTAssertFalse(hit(d, CGPoint(x: 50, y: 70))) // off the line
+    }
+
     func testHitTestRejectsNonFinitePoint() {
         let d = Drawing(kind: .hline, points: [DrawingPoint(ts_ms: 5, price: 120)])
         XCTAssertFalse(hit(d, CGPoint(x: CGFloat.nan, y: 80)))
+        let v = Drawing(kind: .vline, points: [DrawingPoint(ts_ms: 5, price: 120)])
+        XCTAssertFalse(hit(v, CGPoint(x: 5, y: CGFloat.nan)))
     }
 }
 
@@ -210,6 +312,25 @@ final class DrawingStoreTests: XCTestCase {
         store.add(d, for: "NVDA")
         store.move(id: d.id, to: [p, p], for: "NVDA")
         XCTAssertEqual(store.drawings(for: "NVDA"), [d])
+    }
+
+    func testStoreValidatesNewKinds() {
+        let (_, store) = makeStore()
+        let p = DrawingPoint(ts_ms: 1_700_000_000_000, price: 42)
+        let q = DrawingPoint(ts_ms: 1_700_000_600_000, price: 50)
+        // Coincident two-point anchors rejected.
+        store.add(Drawing(kind: .rect, points: [p, p]), for: "NVDA")
+        store.add(Drawing(kind: .measure, points: [p, p]), for: "NVDA")
+        // Wrong anchor count for the kind.
+        store.add(Drawing(kind: .vline, points: [p, q]), for: "NVDA")
+        store.add(Drawing(kind: .rect, points: [p]), for: "NVDA")
+        store.add(Drawing(kind: .measure, points: []), for: "NVDA")
+        XCTAssertTrue(store.drawings(for: "NVDA").isEmpty)
+        // Well-formed ones land.
+        store.add(Drawing(kind: .rect, points: [p, q]), for: "NVDA")
+        store.add(Drawing(kind: .measure, points: [p, q]), for: "NVDA")
+        store.add(Drawing(kind: .vline, points: [p]), for: "NVDA")
+        XCTAssertEqual(store.drawings(for: "NVDA").count, 3)
     }
 
     func testCommitCapsPerSymbolDrawingsDroppingOldest() {

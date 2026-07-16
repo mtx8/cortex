@@ -2,7 +2,7 @@
 // overlays, volume + RSI + MACD subpanes, optional log price axis,
 // crosshair readout, pan/zoom, the AI annotation layer (signal markers,
 // agent-thought dots) and the manual drawing layer (trendlines, hlines,
-// fib retracements).
+// vlines, rects, fib retracements, measures).
 
 import SwiftUI
 
@@ -128,22 +128,23 @@ struct CandleChart: View {
         switch interaction.activeTool {
         case .cursor:
             interaction.selectedDrawingID = frame.drawingID(at: p)
-        case .trendline, .fib:
-            guard let anchor = frame.drawingPoint(at: p) else { return }
+        case .trendline, .fib, .rect, .measure:
+            guard let anchor = frame.drawingPoint(at: p),
+                let kind = interaction.activeTool.drawingKind else { return }
             if let first = interaction.pendingAnchor {
                 // A second click on the exact first anchor would form a
                 // degenerate (invisible) drawing — keep waiting instead.
                 guard anchor != first else { return }
-                let kind: DrawingKind = interaction.activeTool == .fib ? .fib : .trendline
                 drawingStore.add(Drawing(kind: kind, points: [first, anchor]), for: symbol)
                 interaction.pendingAnchor = nil
                 interaction.activeTool = .cursor
             } else {
                 interaction.pendingAnchor = anchor
             }
-        case .hline:
-            guard let anchor = frame.drawingPoint(at: p) else { return }
-            drawingStore.add(Drawing(kind: .hline, points: [anchor]), for: symbol)
+        case .hline, .vline:
+            guard let anchor = frame.drawingPoint(at: p),
+                let kind = interaction.activeTool.drawingKind else { return }
+            drawingStore.add(Drawing(kind: kind, points: [anchor]), for: symbol)
             interaction.activeTool = .cursor
         }
     }
@@ -1267,6 +1268,9 @@ private struct ChartFrame {
             case .trendline: drawTrendline(clipped, d, selected: selected)
             case .hline: drawHLine(ctx, clipped, d, selected: selected)
             case .fib: drawFib(clipped, d, selected: selected)
+            case .rect: drawRect(clipped, d, selected: selected)
+            case .vline: drawVLine(ctx, clipped, d, selected: selected)
+            case .measure: drawMeasure(clipped, d, selected: selected)
             }
         }
         if let pending = pendingAnchor, let pt = anchorPoint(pending) {
@@ -1330,6 +1334,71 @@ private struct ChartFrame {
             center: CGPoint(x: axisX + (size.width - axisX) / 2, y: yy),
             background: Theme.panel, textColor: color
         )
+    }
+
+    /// 1px border + 4% fill wash spanning the two corner anchors. Muted
+    /// unless selected; hit-testing is edges-only so the interior stays
+    /// click-through.
+    private func drawRect(_ ctx: GraphicsContext, _ d: Drawing, selected: Bool) {
+        guard d.points.count >= 2,
+            let a = anchorPoint(d.points[0]),
+            let b = anchorPoint(d.points[1]) else { return }
+        let color = selected ? Theme.emberHi : Self.mutedDrawing
+        let rect = CGRect(
+            x: min(a.x, b.x).rounded(), y: min(a.y, b.y).rounded(),
+            width: max(1, abs(b.x - a.x).rounded()), height: max(1, abs(b.y - a.y).rounded())
+        )
+        ctx.fill(
+            Path(rect), with: .color((selected ? Theme.emberHi : Theme.bone).opacity(0.04))
+        )
+        ctx.stroke(Path(rect.insetBy(dx: 0.5, dy: 0.5)), with: .color(color), lineWidth: 1)
+        if selected { drawAnchors(ctx, [a, b]) }
+    }
+
+    /// 1px dashed vertical through the anchor timestamp, across the price
+    /// pane, + a bottom time tag (drawn unclipped, in the time axis strip).
+    /// Muted unless selected.
+    private func drawVLine(
+        _ ctx: GraphicsContext, _ clipped: GraphicsContext, _ d: Drawing, selected: Bool
+    ) {
+        guard let point = d.points.first else { return }
+        let x = xTs(point.ts_ms)
+        guard x.isFinite, x > -1, x < plotWidth + 1 else { return }
+        let color = selected ? Theme.emberHi : Self.mutedDrawing
+        let xx = x.rounded() + 0.5
+        var p = Path()
+        p.move(to: CGPoint(x: xx, y: mainRect.minY))
+        p.addLine(to: CGPoint(x: xx, y: mainRect.maxY))
+        clipped.stroke(p, with: .color(color), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+        drawTag(
+            ctx, text: ChartMath.readoutTimeLabel(point.ts_ms, interval: interval),
+            center: CGPoint(x: xx, y: paneBottom + timeAxisHeight / 2),
+            background: Theme.panel, textColor: color
+        )
+    }
+
+    /// 1px segment between the anchors + a midpoint readout chip showing
+    /// the signed % change and bar count (ember on panel — a
+    /// selection-adjacent affordance). Muted line unless selected.
+    private func drawMeasure(_ ctx: GraphicsContext, _ d: Drawing, selected: Bool) {
+        guard d.points.count >= 2,
+            let a = anchorPoint(d.points[0]),
+            let b = anchorPoint(d.points[1]) else { return }
+        var p = Path()
+        p.move(to: a)
+        p.addLine(to: b)
+        ctx.stroke(p, with: .color(selected ? Theme.emberHi : Self.mutedDrawing), lineWidth: 1)
+        if let stats = DrawingMath.measureStats(
+            a: d.points[0], b: d.points[1], barSpanMs: barSpanMs
+        ) {
+            let unit = abs(stats.bars) == 1 ? "bar" : "bars"
+            drawTag(
+                ctx, text: String(format: "%+.2f%% · %d \(unit)", stats.pct, stats.bars),
+                center: CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2),
+                background: Theme.panel, textColor: Theme.ember
+            )
+        }
+        if selected { drawAnchors(ctx, [a, b]) }
     }
 
     /// Dim 1px level lines between the two anchor timestamps with tiny

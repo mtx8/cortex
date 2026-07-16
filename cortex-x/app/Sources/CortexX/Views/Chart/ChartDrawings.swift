@@ -1,14 +1,15 @@
-// Manual drawing layer for the chart: trendlines, horizontal lines and fib
-// retracements. Model + per-symbol UserDefaults persistence (DrawingStore)
-// and the pure screen-space geometry helpers (DrawingMath) — rendering lives
-// in CandleChart, tool state in ChartInteraction.
+// Manual drawing layer for the chart: trendlines, horizontal / vertical
+// lines, rectangles, fib retracements and measures. Model + per-symbol
+// UserDefaults persistence (DrawingStore) and the pure screen-space geometry
+// helpers (DrawingMath) — rendering lives in CandleChart, tool state in
+// ChartInteraction.
 
 import CoreGraphics
 import Foundation
 import Observation
 
 enum DrawingKind: String, Codable {
-    case trendline, hline, fib
+    case trendline, hline, fib, rect, vline, measure
 }
 
 /// A drawing anchor in data space — timestamps and prices, never pixels, so
@@ -18,7 +19,8 @@ struct DrawingPoint: Codable, Equatable {
     var price: Double
 }
 
-/// One user drawing. trendline / fib carry 2 anchor points, hline carries 1.
+/// One user drawing. trendline / fib / rect / measure carry 2 anchor
+/// points, hline / vline carry 1.
 struct Drawing: Codable, Identifiable, Equatable {
     var id: UUID
     var kind: DrawingKind
@@ -118,7 +120,7 @@ final class DrawingStore {
     private static func key(_ symbol: String) -> String { "drawings.\(symbol)" }
 
     private static func isValid(_ d: Drawing) -> Bool {
-        let expected = d.kind == .hline ? 1 : 2
+        let expected = d.kind == .hline || d.kind == .vline ? 1 : 2
         guard d.points.count == expected, d.points.allSatisfy({ $0.price.isFinite }) else {
             return false
         }
@@ -148,6 +150,22 @@ enum DrawingMath {
         String(format: "%g", ratio)
     }
 
+    /// Measure readout between two anchors: percent change from the first
+    /// anchor's price and whole bars spanned (rounded), both signed by the
+    /// anchor order. Nil on non-finite input, a zero start price or a
+    /// non-positive bar span.
+    static func measureStats(
+        a: DrawingPoint, b: DrawingPoint, barSpanMs: Int64
+    ) -> (pct: Double, bars: Int)? {
+        guard a.price.isFinite, b.price.isFinite, a.price != 0, barSpanMs > 0 else {
+            return nil
+        }
+        let pct = (b.price - a.price) / abs(a.price) * 100
+        guard pct.isFinite else { return nil }
+        let bars = (Double(b.ts_ms - a.ts_ms) / Double(barSpanMs)).rounded()
+        return (pct: pct, bars: Int(bars))
+    }
+
     /// Endpoint of the trendline ray: `b` pushed along the a->b direction
     /// far enough to leave `rect` from anywhere inside it. Degenerate
     /// (zero-length / non-finite) anchors return `b` unchanged.
@@ -163,7 +181,8 @@ enum DrawingMath {
     /// True when `point` (screen space) lies within `tolerance` of the
     /// drawing rendered through the given ts->x / price->y frame mapping.
     /// Trendlines test against the full ray, fibs against every level line
-    /// between the two anchor timestamps.
+    /// between the two anchor timestamps, rects against their edges only,
+    /// vlines near their x and measures against the anchor segment.
     static func hitTest(
         _ drawing: Drawing,
         at point: CGPoint,
@@ -204,6 +223,35 @@ enum DrawingMath {
                 if y.isFinite, abs(point.y - y) <= tolerance { return true }
             }
             return false
+        case .rect:
+            guard drawing.points.count >= 2,
+                let a = screenPoint(drawing.points[0], xForTs, yForPrice),
+                let b = screenPoint(drawing.points[1], xForTs, yForPrice) else {
+                return false
+            }
+            let r = CGRect(
+                x: min(a.x, b.x), y: min(a.y, b.y),
+                width: abs(b.x - a.x), height: abs(b.y - a.y)
+            )
+            // Edges only: inside the outer band but not the shrunk interior
+            // (which goes null — and contains nothing — for thin rects).
+            let inner = r.insetBy(dx: tolerance, dy: tolerance)
+            if inner.contains(point) { return false }
+            return r.insetBy(dx: -tolerance, dy: -tolerance).contains(point)
+        case .vline:
+            guard let p = drawing.points.first else { return false }
+            let x = xForTs(p.ts_ms)
+            guard x.isFinite else { return false }
+            return abs(point.x - x) <= tolerance
+                && point.y >= rect.minY - tolerance
+                && point.y <= rect.maxY + tolerance
+        case .measure:
+            guard drawing.points.count >= 2,
+                let a = screenPoint(drawing.points[0], xForTs, yForPrice),
+                let b = screenPoint(drawing.points[1], xForTs, yForPrice) else {
+                return false
+            }
+            return distanceToSegment(point, a, b) <= tolerance
         }
     }
 
