@@ -6,7 +6,10 @@
 //!
 //! Invariants enforced at this layer:
 //! - Kill switch Phase 1 is synchronous and in-memory ([`kill::KillSwitch`]).
-//! - All outbound HTTP flows through the hardened [`egress`] chokepoint.
+//! - All trading/market/AI-provider HTTP flows through the hardened
+//!   [`egress`] chokepoint (exact-host allowlist, unchanged). The copilot's
+//!   WEB RESEARCH rides a SEPARATE, secret-free channel ([`webfetch`]) that
+//!   no market-data or order path ever touches.
 //! - Secrets load from `~/.cortex/secrets.toml` / environment, never hardcoded.
 
 pub mod autonomy;
@@ -22,6 +25,7 @@ pub mod portfolio;
 pub mod store;
 pub mod time;
 pub mod types;
+pub mod webfetch;
 
 pub use bus::Bus;
 pub use command::Command;

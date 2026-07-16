@@ -21,8 +21,14 @@
 //! - No LLM ever sits in the execution hot path; every LLM touchpoint is a
 //!   slow strategic cycle or an operator question.
 //! - The ONLY text an LLM ever sees is `ledger.render()` output (plus the
-//!   operator's question and, for memory questions, verbatim PALACE hits —
-//!   stored engine output) — no secrets, no config, no raw keys.
+//!   operator's question, for memory questions verbatim PALACE hits —
+//!   stored engine output — and, for live-info questions, WEB RESEARCH
+//!   extracts wrapped in clearly-delimited UNTRUSTED blocks) — no secrets,
+//!   no config, no raw keys.
+//! - WEB RESEARCH ([`web_research`], copilot-only) rides the SEPARATE
+//!   `cx_core::webfetch` channel: https-only, SSRF-guarded, redirect/byte/
+//!   time-capped, budgeted per query. The hardened trading egress and every
+//!   market-data/order path are untouched by it.
 //! - Agents degrade to Thought(info) on network trouble; the mesh never
 //!   panics on external input.
 //!
@@ -46,6 +52,7 @@ mod macro_agent;
 mod palace;
 mod risk_officer;
 mod strategist;
+mod web_research;
 
 use std::sync::Arc;
 
@@ -53,6 +60,7 @@ use cx_core::events::{AgentThought, EngineEvent};
 use cx_core::store::BarStore;
 use cx_core::time::now_ms;
 use cx_core::types::Severity;
+use cx_core::webfetch::WebResearch;
 use cx_core::{Bus, Config};
 
 use ledger::ContextLedger;
@@ -69,14 +77,16 @@ struct MeshInner {
     ledger: Arc<ContextLedger>,
     llm: Arc<LlmClient>,
     palace: Option<Arc<palace::Palace>>,
+    /// The copilot's SEPARATE web-research channel; None = feature off.
+    web: Option<Arc<WebResearch>>,
     symbols: Vec<String>,
 }
 
 impl MeshHandle {
     /// Fire-and-forget copilot question: spawns its own task and returns
     /// immediately; the answer arrives on the bus as
-    /// [`EngineEvent::AiAnswer`]. A slow (or absent) LLM can therefore never
-    /// block the mesh or the caller.
+    /// [`EngineEvent::AiAnswer`]. A slow (or absent) LLM — or a slow web
+    /// fetch — can therefore never block the mesh or the caller.
     pub fn ask(&self, request_id: String, question: String) {
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
@@ -85,6 +95,7 @@ impl MeshHandle {
                 Arc::clone(&inner.ledger),
                 Arc::clone(&inner.llm),
                 inner.palace.clone(),
+                inner.web.clone(),
                 inner.symbols.clone(),
                 request_id,
                 question,
@@ -112,6 +123,16 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
     ledger.spawn_ingest(&bus);
 
     let llm = Arc::new(LlmClient::new(cfg.ai.clone()));
+
+    // WEB RESEARCH: the copilot's separate, budgeted research channel.
+    // Config-gated; the hardened trading egress is untouched either way.
+    let web = if cfg.ai.enable_web_research {
+        Some(Arc::new(WebResearch::new(
+            cfg.ai.web_budget_per_query as usize,
+        )))
+    } else {
+        None
+    };
 
     analyst::spawn(Arc::clone(&bus), Arc::clone(&store), cfg.symbols.clone());
     macro_agent::spawn(Arc::clone(&bus));
@@ -143,7 +164,7 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
         None,
         1.0,
         format!(
-            "agent mesh online: market_analyst, macro_sentinel, risk_officer, execution_auditor, asset desks (crypto/equity/options){}{}",
+            "agent mesh online: market_analyst, macro_sentinel, risk_officer, execution_auditor, asset desks (crypto/equity/options){}{}{}",
             if strategist_on {
                 ", strategist (llm)"
             } else {
@@ -153,6 +174,11 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
                 "; palace memory attached"
             } else {
                 "; palace memory unavailable"
+            },
+            if web.is_some() {
+                "; web research on"
+            } else {
+                "; web research off"
             }
         ),
     );
@@ -163,6 +189,7 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
             ledger,
             llm,
             palace,
+            web,
             symbols: cfg.symbols,
         }),
     }
@@ -415,6 +442,7 @@ mod tests {
             ledger,
             llm,
             None, // no palace: the heuristic desk read must not need one
+            None, // no web research either
             vec!["BTC-USD".to_string()],
             "req-7".into(),
             "how are we positioned?".into(),

@@ -141,6 +141,13 @@ pub struct AiConfig {
     /// experiments over stored history (paper-only, off the hot path).
     /// 0 disables the loop entirely; anything else must be >= 3600.
     pub autoresearch_secs: u64,
+    /// Copilot WEB RESEARCH master switch: "search:" and live-info questions
+    /// may fetch public web pages through the SEPARATE research channel
+    /// (`cx_core::webfetch` — the hardened trading egress is untouched).
+    pub enable_web_research: bool,
+    /// Max outbound requests one research cycle may spend (the search page
+    /// plus result-page fetches). Validated to [1, 32].
+    pub web_budget_per_query: u32,
 }
 
 impl Default for AiConfig {
@@ -153,6 +160,8 @@ impl Default for AiConfig {
             strategist_cadence_secs: 300,
             max_output_tokens: 1024,
             autoresearch_secs: 21_600,
+            enable_web_research: true,
+            web_budget_per_query: crate::webfetch::DEFAULT_RESEARCH_BUDGET as u32,
         }
     }
 }
@@ -349,6 +358,11 @@ impl Config {
                 "ai.autoresearch_secs must be 0 (disabled) or >= 3600".into(),
             ));
         }
+        if !(1..=32).contains(&self.ai.web_budget_per_query) {
+            return Err(CxError::Config(
+                "ai.web_budget_per_query must be in [1, 32]".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -404,6 +418,28 @@ mod tests {
         assert!(cfg.validate().is_ok());
         cfg.ai.autoresearch_secs = 21_600; // the default
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn web_research_defaults_on_and_budget_bounds_enforced() {
+        let cfg = Config::default();
+        assert!(cfg.ai.enable_web_research, "web research must default ON");
+        assert_eq!(cfg.ai.web_budget_per_query, 6);
+        assert!(cfg.validate().is_ok());
+
+        let mut cfg = Config::default();
+        cfg.ai.web_budget_per_query = 0; // a zero budget is a misconfig, not "off"
+        assert!(cfg.validate().is_err());
+        cfg.ai.web_budget_per_query = 33; // runaway fan-out
+        assert!(cfg.validate().is_err());
+        cfg.ai.web_budget_per_query = 1;
+        assert!(cfg.validate().is_ok());
+        cfg.ai.web_budget_per_query = 32;
+        assert!(cfg.validate().is_ok());
+        // Disabling the feature doesn't excuse an invalid budget.
+        cfg.ai.enable_web_research = false;
+        cfg.ai.web_budget_per_query = 0;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
