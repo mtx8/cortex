@@ -185,6 +185,10 @@ pub struct IntelConfig {
     pub enable_regimes: bool,
     pub enable_meridian: bool,
     pub enable_news: bool,
+    /// Multi-source RSS/Atom + Google-News-relay layer inside NEWS (on top of
+    /// GDELT). When false, NEWS runs GDELT + EDGAR only. Master `enable_news`
+    /// still gates the whole poller.
+    pub enable_news_rss: bool,
 }
 
 /// Liquid US megacaps + core index ETFs. Dashed share classes are excluded
@@ -209,6 +213,7 @@ impl Default for IntelConfig {
             enable_regimes: true,
             enable_meridian: true,
             enable_news: true,
+            enable_news_rss: true,
         }
     }
 }
@@ -446,6 +451,7 @@ mod tests {
     fn news_defaults_and_cadence_floor() {
         let cfg = Config::default();
         assert!(cfg.intel.enable_news, "news must default on");
+        assert!(cfg.intel.enable_news_rss, "rss/atom news layer must default on");
         assert_eq!(cfg.intel.news_poll_secs, 900);
 
         let mut cfg = Config::default();
@@ -453,6 +459,22 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.intel.news_poll_secs = 300; // at the floor
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn intel_toml_without_rss_flag_keeps_it_on() {
+        // Older config files predate `enable_news_rss`; the container-level
+        // serde(default) must fill it from IntelConfig::default() (on).
+        let cfg: Config = toml::from_str(
+            r#"
+            symbols = ["BTC-USD"]
+            [intel]
+            news_poll_secs = 600
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.intel.news_poll_secs, 600);
+        assert!(cfg.intel.enable_news_rss, "missing flag must default on");
     }
 
     #[test]

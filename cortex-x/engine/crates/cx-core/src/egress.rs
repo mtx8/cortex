@@ -19,6 +19,18 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "data.sec.gov",
     "www.sec.gov",
     "api.gdeltproject.org",
+    // Read-only news/RSS + Atom feeds (intel/NEWS side only). Same hardened
+    // egress: https-only, no redirects, byte cap, timeout. No credentials
+    // ever travel to these; they publish public headlines.
+    "news.google.com",
+    "www.cnbc.com",
+    "finance.yahoo.com",
+    "feeds.finance.yahoo.com",
+    "feeds.content.dowjones.io",
+    "www.nasdaq.com",
+    "www.aljazeera.com",
+    "www.prnewswire.com",
+    "www.globenewswire.com",
     "localhost",
     "127.0.0.1",
 ];
@@ -154,5 +166,30 @@ mod tests {
         assert!(Egress::check_url("http://home.treasury.gov/x").is_err());
         assert!(Egress::check_url("https://home.treasury.gov/x").is_ok());
         assert!(Egress::check_url("http://127.0.0.1:11434/v1/chat").is_ok());
+    }
+
+    #[test]
+    fn news_and_google_news_hosts_are_allowlisted_https_only() {
+        // The added read-only news feeds resolve, over https only.
+        for host in [
+            "news.google.com",
+            "www.cnbc.com",
+            "finance.yahoo.com",
+            "feeds.finance.yahoo.com",
+            "feeds.content.dowjones.io",
+            "www.nasdaq.com",
+            "www.aljazeera.com",
+            "www.prnewswire.com",
+            "www.globenewswire.com",
+        ] {
+            assert!(
+                Egress::check_url(&format!("https://{host}/feed")).is_ok(),
+                "{host} should be allowlisted"
+            );
+            assert!(
+                Egress::check_url(&format!("http://{host}/feed")).is_err(),
+                "{host} must be https-only"
+            );
+        }
     }
 }

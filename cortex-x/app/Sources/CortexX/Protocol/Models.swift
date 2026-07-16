@@ -640,6 +640,10 @@ struct NewsItem: Codable, Equatable, Identifiable {
     /// GDELT average tone: negative = grim, positive = calm.
     var tone: Double
     var ts_ms: Int64
+    /// NEW OPTIONAL wire field — the human-readable outlet name ("Reuters")
+    /// when the engine resolves one. Older engines omit it (decodes nil, and
+    /// the feed falls back to a name derived from `source_domain`).
+    var source_name: String? = nil
     var id: String { "\(symbol ?? "market")-\(ts_ms)-\(title.hashValue)" }
 }
 

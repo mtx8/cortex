@@ -937,6 +937,7 @@ mod tests {
             symbol: symbol.map(String::from),
             title: title.into(),
             source_domain: "wire.com".into(),
+            source_name: None,
             url: String::new(),
             tone,
             ts_ms: 1,

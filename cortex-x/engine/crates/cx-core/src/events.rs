@@ -588,16 +588,28 @@ pub struct ScanBoard {
     pub ts_ms: i64,
 }
 
-/// One market/company headline (GDELT DOC 2.0), deduped by title.
-/// `symbol` names the configured equity whose company query surfaced it;
-/// None marks the general markets query.
+/// One market/company headline, deduped by title. `symbol` names the
+/// configured equity whose company/per-symbol query surfaced it; None marks a
+/// general markets query.
+///
+/// WIRE COMPAT: `source_name` is an additive, `#[serde(default)]` field —
+/// payloads without it still decode (None), and clients (Swift) must treat it
+/// as optional. It is the human display outlet ("Reuters", "CNBC", "Yahoo
+/// Finance") when a feed names its source; `source_domain` is always the real
+/// article/outlet domain. GDELT items leave `source_name` None (the domain is
+/// their only honest attribution).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewsItem {
     pub symbol: Option<String>,
     pub title: String,
     pub source_domain: String,
+    /// Display attribution ("Reuters", "CNBC", "Yahoo Finance"); None when the
+    /// source names no outlet (GDELT) — the UI falls back to `source_domain`.
+    #[serde(default)]
+    pub source_name: Option<String>,
     pub url: String,
-    /// GDELT average tone: negative = grim, positive = calm.
+    /// GDELT average tone (negative = grim, positive = calm); RSS/Atom feeds
+    /// carry no tone and record a neutral 0.0, the same rule as absent tone.
     pub tone: f64,
     pub ts_ms: i64,
 }
@@ -767,7 +779,8 @@ mod tests {
             items: vec![NewsItem {
                 symbol: Some("NVDA".into()),
                 title: "Blackwell demand outruns supply".into(),
-                source_domain: "example.com".into(),
+                source_domain: "www.reuters.com".into(),
+                source_name: Some("Reuters".into()),
                 url: "https://example.com/a".into(),
                 tone: -1.5,
                 ts_ms: 1,
@@ -785,8 +798,39 @@ mod tests {
         assert!(!ev.is_critical(), "news must never starve ticks");
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"type\":\"news\""));
+        assert!(json.contains("\"source_name\":\"Reuters\""));
         let back: EngineEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn news_item_source_name_is_additive_and_defaults_none() {
+        // A pre-`source_name` frame (the multi-source news engine's field is
+        // additive) must still decode — old engines' stored boards and older
+        // clients never break, and the field reads back None.
+        let old = r#"{"type":"news","items":[{"symbol":null,
+            "title":"markets steady","source_domain":"example.com",
+            "url":"https://example.com/x","tone":0.0,"ts_ms":3}],
+            "earnings":[],"source":"gdelt 2.0","ts_ms":4}"#;
+        let ev: EngineEvent = serde_json::from_str(old).unwrap();
+        let EngineEvent::News(board) = &ev else {
+            panic!("decoded wrong variant");
+        };
+        assert_eq!(board.items[0].source_name, None);
+
+        // A populated outlet round-trips.
+        let item = NewsItem {
+            symbol: None,
+            title: "chip stocks weaken".into(),
+            source_domain: "www.reuters.com".into(),
+            source_name: Some("Reuters".into()),
+            url: "https://news.google.com/rss/articles/abc".into(),
+            tone: 0.0,
+            ts_ms: 5,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let back: NewsItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, item);
     }
 
     #[test]

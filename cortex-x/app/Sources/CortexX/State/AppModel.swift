@@ -14,6 +14,16 @@ struct CopilotMessage: Identifiable, Equatable {
     let ts = Date()
 }
 
+/// One NEWS AI-BRIEF ask: the request id plus the exact question posed. The
+/// answer is looked up live from `copilot` by id (so a brief that resolves
+/// later still renders), and this lives on the model so the AI-BRIEF history
+/// survives leaving and re-entering the NEWS section.
+struct NewsBriefRef: Identifiable, Equatable {
+    let requestId: String
+    let question: String
+    var id: String { requestId }
+}
+
 @MainActor
 @Observable
 final class AppModel {
@@ -75,6 +85,10 @@ final class AppModel {
     // MARK: Copilot
     private(set) var copilot: [CopilotMessage] = []
     private(set) var pendingAsk: String?
+    /// NEWS AI-BRIEF ask history, newest-first, capped. Each entry's answer is
+    /// resolved from `copilot` by request id at render time.
+    private(set) var newsBriefHistory: [NewsBriefRef] = []
+    static let newsBriefHistoryCap = 20
     /// Monotonic ask counter: millisecond wall-clock alone can collide when
     /// two asks dispatch in the same run-loop drain (double-click before
     /// `.disabled` re-renders), corrupting id-keyed answer routing.
@@ -320,6 +334,20 @@ final class AppModel {
         copilot.append(CopilotMessage(id: id, role: .cortex, text: "", pending: true))
         pendingAsk = id
         send(.askAi(requestId: id, question: question))
+        return id
+    }
+
+    /// Fire a NEWS AI brief and record it in the section-local history so the
+    /// AI-BRIEF tab can list past question/answer pairs. Delegates to
+    /// `askCopilot` (the reply still lands in the shared thread) and returns
+    /// its request id. Newest-first; the history caps at `newsBriefHistoryCap`.
+    @discardableResult
+    func askNewsBrief(_ question: String) -> String {
+        let id = askCopilot(question)
+        newsBriefHistory.insert(NewsBriefRef(requestId: id, question: question), at: 0)
+        if newsBriefHistory.count > Self.newsBriefHistoryCap {
+            newsBriefHistory.removeLast(newsBriefHistory.count - Self.newsBriefHistoryCap)
+        }
         return id
     }
 
