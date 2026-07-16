@@ -53,7 +53,8 @@ final class ScannerViewTests: XCTestCase {
         volState: Double = 50,
         rsi: Double? = 50,
         flags: [String] = [],
-        regime: RegimeState? = nil
+        regime: RegimeState? = nil,
+        lastClose: Double = 100
     ) -> ScanRow {
         ScanRow(
             symbol: symbol, asset_class: symbol.contains("-") ? "crypto" : "equity",
@@ -61,7 +62,7 @@ final class ScannerViewTests: XCTestCase {
             meanrev: meanrev, vol_state: volState, rsi_14: rsi, zscore_20: nil,
             kalman_tstat: nil, ret_1w: nil, ret_1m: nil, ret_3m: nil,
             dist_52w_high: nil, vol_surge: nil, regime: regime, flags: flags,
-            last_close: 100
+            last_close: lastClose
         )
     }
 
@@ -129,6 +130,41 @@ final class ScannerViewTests: XCTestCase {
     func testPresetFlagMatchIsCaseInsensitive() {
         let rows = [row("A", flags: ["Breakout Setup"])]
         XCTAssertEqual(ScanPreset.breakoutWatch.apply(rows).map(\.symbol), ["A"])
+    }
+
+    func testPremarketMoversGapScreen() {
+        let rows = [
+            row("GAPUP", lastClose: 100),   // +5% -> in
+            row("GAPDN", lastClose: 200),   // -3% -> in (|gap|)
+            row("FLAT", lastClose: 100),    // +1% -> out
+            row("EDGE", lastClose: 100),    // exactly +2% -> in
+            row("BTC-USD", lastClose: 100), // crypto -> out even with a gap
+            row("NOPX", lastClose: 100),    // no latest price -> out
+            row("BADPX", lastClose: 100),   // NaN latest price -> out
+            row("BADCL", lastClose: 0),     // unusable prior close -> out
+        ]
+        let px: [String: Double] = [
+            "GAPUP": 105, "GAPDN": 194, "FLAT": 101, "EDGE": 102,
+            "BTC-USD": 150, "BADPX": .nan, "BADCL": 50,
+        ]
+        // Sorted by |gap| desc: 5%, 3%, 2%.
+        XCTAssertEqual(
+            ScanPreset.premarketMovers.apply(rows, lastPrice: { px[$0] }).map(\.symbol),
+            ["GAPUP", "GAPDN", "EDGE"]
+        )
+        // No price context (the default): the screen is empty, never wrong.
+        XCTAssertTrue(ScanPreset.premarketMovers.apply(rows).isEmpty)
+    }
+
+    func testGapFractionNaNSafe() throws {
+        let gap = try XCTUnwrap(ScanPreset.gapFraction(lastPrice: 105, priorClose: 100))
+        XCTAssertEqual(gap, 0.05, accuracy: 1e-12)
+        XCTAssertNil(ScanPreset.gapFraction(lastPrice: nil, priorClose: 100))
+        XCTAssertNil(ScanPreset.gapFraction(lastPrice: .nan, priorClose: 100))
+        XCTAssertNil(ScanPreset.gapFraction(lastPrice: 0, priorClose: 100))
+        XCTAssertNil(ScanPreset.gapFraction(lastPrice: 105, priorClose: 0))
+        XCTAssertNil(ScanPreset.gapFraction(lastPrice: 105, priorClose: .nan))
+        XCTAssertNil(ScanPreset.gapFraction(lastPrice: 105, priorClose: -1))
     }
 
     // MARK: - Sorting

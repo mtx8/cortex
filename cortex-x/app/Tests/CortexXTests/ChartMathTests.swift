@@ -501,4 +501,45 @@ extension ChartMathTests {
         XCTAssertTrue(ChartRange.all.weekly)
         XCTAssertEqual(ChartRange.allCases.map(\.label), ["1y", "2y", "5y", "all"])
     }
+
+    // MARK: - US equity sessions (extended hours)
+
+    /// Epoch ms for an ISO-8601 UTC instant — fixtures stay readable.
+    private func ts(_ iso: String) throws -> Int64 {
+        let date = try XCTUnwrap(ISO8601DateFormatter().date(from: iso), "bad ISO fixture")
+        return Int64(date.timeIntervalSince1970 * 1000)
+    }
+
+    func testIsExtendedHoursWinterEST() throws {
+        // January: ET = UTC-5. RTH is 14:30-21:00 UTC.
+        XCTAssertFalse(ChartMath.isExtendedHours(try ts("2026-01-15T14:30:00Z"))) // 09:30 open
+        XCTAssertTrue(ChartMath.isExtendedHours(try ts("2026-01-15T14:29:00Z")))  // 09:29 premkt
+        XCTAssertFalse(ChartMath.isExtendedHours(try ts("2026-01-15T20:59:00Z"))) // 15:59
+        XCTAssertTrue(ChartMath.isExtendedHours(try ts("2026-01-15T21:00:00Z")))  // 16:00 close
+        XCTAssertTrue(ChartMath.isExtendedHours(try ts("2026-01-15T09:00:00Z")))  // 04:00 premkt
+    }
+
+    func testIsExtendedHoursSummerEDT() throws {
+        // July: ET = UTC-4 — the same wall-clock session, shifted an hour.
+        XCTAssertFalse(ChartMath.isExtendedHours(try ts("2026-07-15T13:30:00Z"))) // 09:30 open
+        XCTAssertTrue(ChartMath.isExtendedHours(try ts("2026-07-15T13:29:00Z")))  // 09:29 premkt
+        XCTAssertFalse(ChartMath.isExtendedHours(try ts("2026-07-15T19:59:00Z"))) // 15:59
+        XCTAssertTrue(ChartMath.isExtendedHours(try ts("2026-07-15T20:00:00Z")))  // 16:00 close
+        // UTC midnight = 20:00 ET the prior evening — after-hours.
+        XCTAssertTrue(ChartMath.isExtendedHours(try ts("2026-07-15T00:00:00Z")))
+    }
+
+    func testDayKeysEasternVsUTC() throws {
+        // Midday: both calendars agree on the date.
+        XCTAssertEqual(ChartMath.easternDayKey(try ts("2026-07-15T12:00:00Z")), 20_260_715)
+        XCTAssertEqual(ChartMath.utcDayKey(try ts("2026-07-15T12:00:00Z")), 20_260_715)
+        // 01:00 UTC on the 16th = 21:00 ET on the 15th — the seam that
+        // makes D1 bars key through UTC and "now" key through ET.
+        XCTAssertEqual(ChartMath.easternDayKey(try ts("2026-07-16T01:00:00Z")), 20_260_715)
+        XCTAssertEqual(ChartMath.utcDayKey(try ts("2026-07-16T01:00:00Z")), 20_260_716)
+        // Winter seam (EST, UTC-5): 03:00 UTC Jan 15 = 22:00 ET Jan 14.
+        XCTAssertEqual(ChartMath.easternDayKey(try ts("2026-01-15T03:00:00Z")), 20_260_114)
+        // A D1 bar-open (UTC midnight) keys to its own session date.
+        XCTAssertEqual(ChartMath.utcDayKey(try ts("2026-07-15T00:00:00Z")), 20_260_715)
+    }
 }

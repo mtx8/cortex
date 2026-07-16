@@ -220,11 +220,111 @@ final class AppModelStateTests: XCTestCase {
         )
     }
 
-    private func d1Bar(symbol: String, tsOpenMs: Int64) -> Bar {
+    private func d1Bar(
+        symbol: String, tsOpenMs: Int64, close: Double = 100, complete: Bool = true
+    ) -> Bar {
         Bar(
             symbol: symbol, interval: .d1, ts_open_ms: tsOpenMs,
-            open: 100, high: 101, low: 99, close: 100,
-            volume: 1_000, trade_count: 10, vwap: 100, complete: true
+            open: 100, high: 101, low: 99, close: close,
+            volume: 1_000, trade_count: 10, vwap: close, complete: complete
         )
+    }
+
+    private func tick(_ symbol: String, price: Double, tsMs: Int64 = 0) -> Tick {
+        Tick(symbol: symbol, ts_ms: tsMs, price: price, size: 0, aggressor: nil, venue: .cboe)
+    }
+
+    /// Epoch ms for an ISO-8601 UTC instant — session fixtures stay readable.
+    private func ts(_ iso: String) throws -> Int64 {
+        let date = try XCTUnwrap(ISO8601DateFormatter().date(from: iso), "bad ISO fixture")
+        return Int64(date.timeIntervalSince1970 * 1000)
+    }
+
+    // MARK: - Session-aware change % (equities)
+
+    func testPriorSessionCloseSkipsTodayIncompleteAndNaN() throws {
+        // "Now" is 08:00 ET premarket on July 15 (EDT).
+        let now = try ts("2026-07-15T12:00:00Z")
+        let bars = [
+            d1Bar(symbol: "AAPL", tsOpenMs: try ts("2026-07-10T00:00:00Z"), close: 90),
+            d1Bar(symbol: "AAPL", tsOpenMs: try ts("2026-07-13T00:00:00Z"), close: .nan),
+            d1Bar(
+                symbol: "AAPL", tsOpenMs: try ts("2026-07-14T00:00:00Z"),
+                close: 100, complete: false
+            ),
+            d1Bar(symbol: "AAPL", tsOpenMs: try ts("2026-07-15T00:00:00Z"), close: 110),
+        ]
+        // Today's row never counts as "prior"; the NaN and incomplete rows
+        // are skipped; the newest usable prior close wins.
+        XCTAssertEqual(AppModel.priorSessionClose(d1: bars, nowMs: now), 90)
+        XCTAssertNil(AppModel.priorSessionClose(d1: [], nowMs: now))
+        XCTAssertNil(AppModel.priorSessionClose(
+            d1: [d1Bar(symbol: "AAPL", tsOpenMs: try ts("2026-07-15T00:00:00Z"), close: 110)],
+            nowMs: now
+        ))
+    }
+
+    func testPriorSessionCloseEasternEveningSeam() throws {
+        // 01:00 UTC July 16 = 21:00 ET July 15: after-hours still belongs
+        // to the July 15 session, so its D1 row is "today", not prior.
+        let bars = [
+            d1Bar(symbol: "AAPL", tsOpenMs: try ts("2026-07-14T00:00:00Z"), close: 100),
+            d1Bar(symbol: "AAPL", tsOpenMs: try ts("2026-07-15T00:00:00Z"), close: 110),
+        ]
+        XCTAssertEqual(
+            AppModel.priorSessionClose(d1: bars, nowMs: try ts("2026-07-16T01:00:00Z")), 100
+        )
+        // Next morning's premarket rolls the reference to July 15's close.
+        XCTAssertEqual(
+            AppModel.priorSessionClose(d1: bars, nowMs: try ts("2026-07-16T12:00:00Z")), 110
+        )
+    }
+
+    func testEquityPremarketChangeReadsPriorSessionClose() throws {
+        let model = AppModel()
+        let now = try ts("2026-07-15T12:00:00Z") // 08:00 ET premarket
+        model.apply(.history(HistorySlice(
+            symbol: "AAPL", interval: .d1,
+            bars: [
+                d1Bar(symbol: "AAPL", tsOpenMs: try ts("2026-07-13T00:00:00Z"), close: 95),
+                d1Bar(symbol: "AAPL", tsOpenMs: try ts("2026-07-14T00:00:00Z"), close: 100),
+            ],
+            source: "test", ts_ms: now
+        )))
+        model.apply(.tick(tick("AAPL", price: 103, tsMs: now)))
+        // +3% against the prior session's RTH close, not tick drift.
+        let pct = try XCTUnwrap(model.sessionChangePct("AAPL", nowMs: now))
+        XCTAssertEqual(pct, 3.0, accuracy: 1e-9)
+    }
+
+    func testEquityChangeIgnoresSameDayD1Row() throws {
+        // Today's D1 row already landed (post-close backfill): reading
+        // against it would collapse the change to ~0%. sessionOpen (set to
+        // 110 by the slice) would too — the prior close must win.
+        let model = AppModel()
+        let now = try ts("2026-07-15T21:00:00Z") // 17:00 ET after-hours
+        model.apply(.history(HistorySlice(
+            symbol: "AAPL", interval: .d1,
+            bars: [
+                d1Bar(symbol: "AAPL", tsOpenMs: try ts("2026-07-14T00:00:00Z"), close: 100),
+                d1Bar(symbol: "AAPL", tsOpenMs: try ts("2026-07-15T00:00:00Z"), close: 110),
+            ],
+            source: "test", ts_ms: now
+        )))
+        model.apply(.tick(tick("AAPL", price: 110, tsMs: now)))
+        let pct = try XCTUnwrap(model.sessionChangePct("AAPL", nowMs: now))
+        XCTAssertEqual(pct, 10.0, accuracy: 1e-9)
+    }
+
+    func testSessionChangeFallbackWithoutPriorClose() throws {
+        // Crypto never reads the equity path; an equity with no D1 history
+        // keeps the rolling sessionOpen reference.
+        let model = AppModel()
+        model.apply(.tick(tick("BTC-USD", price: 100)))
+        model.apply(.tick(tick("BTC-USD", price: 105)))
+        XCTAssertEqual(try XCTUnwrap(model.sessionChangePct("BTC-USD")), 5.0, accuracy: 1e-9)
+        model.apply(.tick(tick("TSM", price: 200)))
+        model.apply(.tick(tick("TSM", price: 202)))
+        XCTAssertEqual(try XCTUnwrap(model.sessionChangePct("TSM")), 1.0, accuracy: 1e-9)
     }
 }

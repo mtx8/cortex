@@ -180,12 +180,7 @@ private struct CopilotBubble: View {
                     if message.pending {
                         PendingDots()
                     } else {
-                        Text(message.text)
-                            .font(.system(size: 12))
-                            .foregroundStyle(Theme.bone)
-                            .lineSpacing(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .textSelection(.enabled)
+                        MarkdownText(message.text)
                     }
                     if let model = message.model {
                         Text(model)

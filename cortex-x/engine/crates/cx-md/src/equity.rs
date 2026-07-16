@@ -1,7 +1,10 @@
 //! Equity feed: CBOE delayed quotes (keyless, ~15 min delayed) polled on a
-//! slow cadence, plus Stooq daily-history backfill. Delayed data is honest
-//! data: the feed advertises itself as Degraded (never Live) so downstream
-//! consumers and the operator can see exactly what they are trading on.
+//! slow cadence, plus Yahoo chart backfill. Intraday (H1/M5) backfill asks
+//! for extended-hours bars (`includePrePost=true`) so pre/post-market
+//! action lands in the store — bars carry their real timestamps, nothing
+//! is re-marked or filtered as RTH-only. Delayed data is honest data: the
+//! feed advertises itself as Degraded (never Live) so downstream consumers
+//! and the operator can see exactly what they are trading on.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +21,16 @@ const FEED_NAME: &str = "cboe-equities";
 
 fn quote_url(symbol: &str) -> String {
     format!("https://cdn.cboe.com/api/global/delayed_quotes/quotes/{symbol}.json")
+}
+
+/// Yahoo v8 chart backfill URL. Intraday requests (`pre_post`) include
+/// extended-hours bars — the daily range never asks (D1 rows are official
+/// RTH sessions; the flag is meaningless there).
+fn chart_url(symbol: &str, range: &str, gran: &str, pre_post: bool) -> String {
+    let extra = if pre_post { "&includePrePost=true" } else { "" };
+    format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={range}&interval={gran}{extra}"
+    )
 }
 
 /// Parsed subset of the CBOE quote payload.
@@ -100,10 +113,20 @@ pub(crate) fn parse_yahoo_chart(symbol: &str, interval: Interval, raw: &str, max
         if ![o, h, l, c].iter().all(|x| x.is_finite() && *x > 0.0) || h < l {
             continue;
         }
+        // D1 rows stay UTC-midnight-bucketed (utcDayKey + the live
+        // aggregator's daily dedupe key on them). Intraday bars keep
+        // Yahoo's true opens: RTH hourlies are 09:30-anchored, so flooring
+        // would alias the 09:30 RTH bar into the 09:00 pre-market bucket —
+        // destroying the pre-market bar in the store and mis-shading the
+        // first regular hour as extended on every equity H1 chart.
         bars.push(Bar {
             symbol: symbol.to_string(),
             interval,
-            ts_open_ms: cx_core::time::bucket_start(t * 1000, interval.ms()),
+            ts_open_ms: if interval == Interval::D1 {
+                cx_core::time::bucket_start(t * 1000, interval.ms())
+            } else {
+                t * 1000
+            },
             open: o,
             high: h,
             low: l,
@@ -133,17 +156,16 @@ pub(crate) async fn run(
     let egress = Egress::new();
 
     // History first, so charts and analytics have context immediately:
-    // a year of dailies, a month of hourlies, five days of 5-minute bars.
-    const RANGES: [(Interval, &str, &str); 3] = [
-        (Interval::D1, "5y", "1d"),
-        (Interval::H1, "3mo", "1h"),
-        (Interval::M5, "5d", "5m"),
+    // five years of dailies, three months of hourlies, five days of
+    // 5-minute bars. Intraday ranges include extended-hours bars.
+    const RANGES: [(Interval, &str, &str, bool); 3] = [
+        (Interval::D1, "5y", "1d", false),
+        (Interval::H1, "3mo", "1h", true),
+        (Interval::M5, "5d", "5m", true),
     ];
     for symbol in &symbols {
-        for (interval, range, gran) in RANGES {
-            let url = format!(
-                "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={range}&interval={gran}"
-            );
+        for (interval, range, gran, pre_post) in RANGES {
+            let url = chart_url(symbol, range, gran, pre_post);
             match egress.get_text(&url).await {
                 Ok(raw) => {
                     let bars = parse_yahoo_chart(symbol, interval, &raw, backfill_bars as usize);
@@ -238,6 +260,23 @@ mod tests {
     }
 
     #[test]
+    fn chart_url_intraday_includes_pre_post_daily_does_not() {
+        let m5 = chart_url("AAPL", "5d", "5m", true);
+        assert_eq!(
+            m5,
+            "https://query1.finance.yahoo.com/v8/finance/chart/AAPL?range=5d&interval=5m&includePrePost=true"
+        );
+        let h1 = chart_url("AAPL", "3mo", "1h", true);
+        assert!(h1.contains("&includePrePost=true"));
+        let d1 = chart_url("AAPL", "5y", "1d", false);
+        assert_eq!(
+            d1,
+            "https://query1.finance.yahoo.com/v8/finance/chart/AAPL?range=5y&interval=1d"
+        );
+        assert!(!d1.contains("includePrePost"));
+    }
+
+    #[test]
     fn yahoo_chart_parses_skips_nulls_and_caps() {
         let raw = r#"{"chart":{"result":[{"timestamp":[1751500800,1751587200,1751673600],
             "indicators":{"quote":[{
@@ -256,5 +295,30 @@ mod tests {
         assert_eq!(capped[0].close, 106.5);
         assert!(parse_yahoo_chart("AAPL", Interval::D1, "junk", 10).is_empty());
         assert!(parse_yahoo_chart("AAPL", Interval::D1, "{}", 10).is_empty());
+    }
+
+    /// Intraday bars keep Yahoo's true opens; D1 floors to UTC midnight.
+    /// 2025-07-02 (EDT): 13:00 UTC = 09:00 ET pre-market hourly, 13:30 UTC
+    /// = the 09:30-anchored RTH hourly. Flooring both to the 13:00 bucket
+    /// used to collapse them into one bar (the store replaces same-ts tails)
+    /// and shade the first regular hour as pre-market.
+    #[test]
+    fn intraday_keeps_true_opens_daily_floors() {
+        let raw = r#"{"chart":{"result":[{"timestamp":[1751461200,1751463000],
+            "indicators":{"quote":[{
+                "open":[100.0,101.0],"high":[101.0,103.0],
+                "low":[99.5,100.5],"close":[100.8,102.4],
+                "volume":[500,9000]}]}}]}}"#;
+
+        let h1 = parse_yahoo_chart("AAPL", Interval::H1, raw, 10);
+        assert_eq!(h1.len(), 2, "pre-market and RTH bars must both survive");
+        assert_eq!(h1[0].ts_open_ms, 1_751_461_200_000); // 09:00 ET, as sent
+        assert_eq!(h1[1].ts_open_ms, 1_751_463_000_000); // 09:30 ET, not floored
+        let m5 = parse_yahoo_chart("AAPL", Interval::M5, raw, 10);
+        assert_eq!(m5[0].ts_open_ms, 1_751_461_200_000);
+
+        let d1 = parse_yahoo_chart("AAPL", Interval::D1, raw, 10);
+        // Both land in the same UTC day; the same-bucket tail replaces.
+        assert!(d1.iter().all(|b| b.ts_open_ms == 1_751_414_400_000));
     }
 }

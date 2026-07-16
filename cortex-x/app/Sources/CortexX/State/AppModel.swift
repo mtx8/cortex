@@ -132,9 +132,42 @@ final class AppModel {
         return bars[symbol]?[.m1]?.last?.close ?? bars[symbol]?[.d1]?.last?.close
     }
 
-    func sessionChangePct(_ symbol: String) -> Double? {
-        guard let last = lastPrice(symbol), let open = sessionOpen[symbol], open > 0 else { return nil }
+    /// Change % against the session reference. Equities read against the
+    /// last RTH close of the PRIOR US/Eastern session when the D1 series
+    /// carries one — so a pre-market print shows the real gap, not drift
+    /// from whatever tick this process saw first. Everything else (crypto,
+    /// equities with no D1 history yet) keeps the rolling `sessionOpen`
+    /// reference. `nowMs` is injected for tests.
+    func sessionChangePct(
+        _ symbol: String,
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> Double? {
+        guard let last = lastPrice(symbol) else { return nil }
+        if Self.isEquity(symbol),
+            let ref = Self.priorSessionClose(d1: bars(symbol, .d1), nowMs: nowMs) {
+            return (last - ref) / ref * 100
+        }
+        guard let open = sessionOpen[symbol], open > 0 else { return nil }
         return (last - open) / open * 100
+    }
+
+    /// The prior-session reference close: the newest D1 close whose session
+    /// day sits STRICTLY before the current US/Eastern day. D1 closes are
+    /// official RTH closes — the daily backfill never asks for extended
+    /// hours, and the engine's live aggregator folds only RTH prints into
+    /// equity daily bars (extended-hours prints are skipped), so a bar
+    /// completed after an evening of after-hours drift still closes on the
+    /// last 16:00 ET print. Skipping today's row keeps a same-day D1 bar —
+    /// however it landed — from collapsing the change to ~0%. Pure; nil
+    /// when the series has no usable prior bar (caller falls back).
+    static func priorSessionClose(d1: [Bar], nowMs: Int64) -> Double? {
+        let today = ChartMath.easternDayKey(nowMs)
+        for bar in d1.reversed()
+        where ChartMath.utcDayKey(bar.ts_open_ms) < today
+            && bar.complete && bar.close.isFinite && bar.close > 0 {
+            return bar.close
+        }
+        return nil
     }
 
     var totalUnrealized: Double {

@@ -268,6 +268,57 @@ enum ChartMath {
         return lo + f * (hi - lo)
     }
 
+    // MARK: - US equity sessions (extended hours)
+
+    /// US/Eastern calendar for session math. Fixed zone identifier, so DST
+    /// transitions resolve correctly for any timestamp via Foundation.
+    private static let easternCalendar: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "America/New_York")
+            ?? TimeZone(secondsFromGMT: -5 * 3600)!
+        return c
+    }()
+
+    /// Regular trading hours as minutes-since-midnight ET: 09:30 ..< 16:00.
+    private static let rthMinutes: Range<Int> = 570..<960
+
+    /// True when the US/Eastern time-of-day of `tsMs` falls outside regular
+    /// trading hours (09:30-16:00 ET) — pre-market, after-hours, overnight.
+    /// Classifies by the instant itself (charts pass the bar-open), and is
+    /// DST-correct because the calendar resolves the ET offset per date.
+    static func isExtendedHours(_ tsMs: Int64) -> Bool {
+        let date = Date(timeIntervalSince1970: Double(tsMs) / 1000)
+        let hm = easternCalendar.dateComponents([.hour, .minute], from: date)
+        let minutes = (hm.hour ?? 0) * 60 + (hm.minute ?? 0)
+        return !rthMinutes.contains(minutes)
+    }
+
+    /// Session-day key (yyyymmdd) of the US/Eastern calendar day containing
+    /// `tsMs` — "which session is it now". DST-correct via the calendar.
+    static func easternDayKey(_ tsMs: Int64) -> Int {
+        dayKey(tsMs, calendar: easternCalendar)
+    }
+
+    /// Session-day key (yyyymmdd) of the UTC calendar day containing `tsMs`.
+    /// Equity D1 bar-opens are UTC-midnight bucketed and their UTC date IS
+    /// the US session date, so D1 bars key through this (an ET conversion
+    /// of a UTC midnight would land on the prior evening).
+    static func utcDayKey(_ tsMs: Int64) -> Int {
+        dayKey(tsMs, calendar: utcCalendar)
+    }
+
+    private static let utcCalendar: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(secondsFromGMT: 0)!
+        return c
+    }()
+
+    private static func dayKey(_ tsMs: Int64, calendar: Calendar) -> Int {
+        let date = Date(timeIntervalSince1970: Double(tsMs) / 1000)
+        let ymd = calendar.dateComponents([.year, .month, .day], from: date)
+        return (ymd.year ?? 0) * 10_000 + (ymd.month ?? 0) * 100 + (ymd.day ?? 0)
+    }
+
     // MARK: - Time & buckets
 
     /// One 7-day bar span in milliseconds — the view-level weekly bar width.

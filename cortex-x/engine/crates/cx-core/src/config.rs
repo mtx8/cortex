@@ -37,7 +37,9 @@ pub struct FeedConfig {
     pub primary: String,
     /// When the live feed dies, keep the engine alive on a synthetic feed.
     pub synthetic_fallback: bool,
-    /// REST backfill of recent candles at startup.
+    /// REST backfill of recent candles at startup. Must cover the equity
+    /// extended-hours intraday windows (M5 5d = 960 bars, H1 3mo ≈ 1,055
+    /// with includePrePost) — the store keeps up to 3,000 per series.
     pub backfill_bars: u32,
 }
 
@@ -46,7 +48,7 @@ impl Default for FeedConfig {
         Self {
             primary: "coinbase".into(),
             synthetic_fallback: true,
-            backfill_bars: 600,
+            backfill_bars: 1_200,
         }
     }
 }
@@ -358,6 +360,14 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         Config::default().validate().unwrap();
+    }
+
+    /// The equity backfill promises "three months of hourlies, five days of
+    /// 5-minute bars" WITH extended hours: M5 = 192 bars/day -> 960 per 5d,
+    /// H1 3mo ≈ 1,055. A cap below those silently truncates chart depth.
+    #[test]
+    fn backfill_default_covers_prepost_intraday_windows() {
+        assert!(FeedConfig::default().backfill_bars >= 1_100);
     }
 
     #[test]

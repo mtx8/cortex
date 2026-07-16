@@ -8,6 +8,10 @@
 //! - A completed bar is stored and published exactly once, at rollover,
 //!   before the new forming bar of the next bucket.
 //! - vwap = sum(px*sz)/sum(sz), falling back to close while volume is zero.
+//! - Equity (bare-ticker) D1 bars are official-session bars: extended-hours
+//!   prints never fold into the daily OHLC, so the close stays the last RTH
+//!   print (the prior-session reference and gap math read it). A print from
+//!   a newer UTC day still completes the prior forming daily bar.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -76,6 +80,23 @@ impl Aggregator {
         for interval in Interval::ALL {
             let bucket = bucket_start(tick.ts_ms, interval.ms());
             let key = (tick.symbol.clone(), interval);
+            // Equity daily bars track the official session only: a
+            // pre-market or after-hours print neither opens nor updates the
+            // D1 OHLC (the close must stay the last RTH print), but a print
+            // from a NEWER UTC day still completes yesterday's forming bar
+            // — otherwise it would sit forming until the next open.
+            if interval == Interval::D1 && is_equity(&tick.symbol) && !us_rth(tick.ts_ms) {
+                if let Some(f) = self.forming.get(&key) {
+                    if bucket > f.bar.ts_open_ms {
+                        let mut completed = f.bar.clone();
+                        completed.complete = true;
+                        out.store.push(completed.clone());
+                        out.publish.push(completed);
+                        self.forming.remove(&key);
+                    }
+                }
+                continue;
+            }
             match self.forming.get_mut(&key) {
                 None => {
                     let f = new_forming(tick, interval, bucket, size);
@@ -121,6 +142,40 @@ impl Aggregator {
         }
         out
     }
+}
+
+/// Bare tickers are equities; dashed products route to the crypto feed.
+fn is_equity(symbol: &str) -> bool {
+    !symbol.contains('-')
+}
+
+/// True when the instant falls inside US regular trading hours
+/// (09:30 ..< 16:00 US/Eastern), DST-correct per the post-2007 US rules:
+/// EDT from 2:00 the second Sunday of March through 2:00 the first Sunday
+/// of November. Mirror of the app's `ChartMath.isExtendedHours`, negated.
+fn us_rth(ts_ms: i64) -> bool {
+    use chrono::{Datelike, TimeZone, Utc};
+    let Some(dt) = Utc.timestamp_millis_opt(ts_ms).single() else {
+        return false;
+    };
+    let (dst_start, dst_end) = dst_bounds_utc_ms(dt.year());
+    let offset_hours: i64 = if ts_ms >= dst_start && ts_ms < dst_end { -4 } else { -5 };
+    let et_minutes = (ts_ms + offset_hours * 3_600_000).rem_euclid(86_400_000) / 60_000;
+    (570..960).contains(&et_minutes)
+}
+
+/// UTC-ms instants when US/Eastern enters and leaves daylight time:
+/// 2:00 EST on the second Sunday of March (07:00 UTC) and 2:00 EDT on the
+/// first Sunday of November (06:00 UTC).
+fn dst_bounds_utc_ms(year: i32) -> (i64, i64) {
+    use chrono::{Datelike, TimeZone, Utc, Weekday};
+    let sunday_ms = |month: u32, days: std::ops::RangeInclusive<u32>, hour_utc: u32| {
+        days.filter_map(|d| Utc.with_ymd_and_hms(year, month, d, hour_utc, 0, 0).single())
+            .find(|d| d.weekday() == Weekday::Sun)
+            .map(|d| d.timestamp_millis())
+            .unwrap_or(i64::MAX) // unreachable: every 7-day window has a Sunday
+    };
+    (sunday_ms(3, 8..=14, 7), sunday_ms(11, 1..=7, 6))
 }
 
 fn new_forming(tick: &Tick, interval: Interval, bucket: i64, size: f64) -> Forming {
@@ -238,5 +293,99 @@ mod tests {
         let bar = m1(&out.store)[0];
         assert_eq!(bar.vwap, 250.0);
         assert_eq!(bar.volume, 0.0);
+    }
+
+    fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+        use chrono::{TimeZone, Utc};
+        Utc.with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn equity_tick(ts_ms: i64, price: f64) -> Tick {
+        Tick {
+            symbol: "AAPL".into(),
+            ts_ms,
+            price,
+            size: 0.0,
+            aggressor: None,
+            venue: Venue::Cboe,
+        }
+    }
+
+    #[test]
+    fn us_rth_is_dst_correct() {
+        // January (EST, UTC-5): RTH = 14:30 ..< 21:00 UTC.
+        assert!(!us_rth(ts(2026, 1, 15, 14, 29)));
+        assert!(us_rth(ts(2026, 1, 15, 14, 30)));
+        assert!(us_rth(ts(2026, 1, 15, 20, 59)));
+        assert!(!us_rth(ts(2026, 1, 15, 21, 0)));
+        // July (EDT, UTC-4): RTH = 13:30 ..< 20:00 UTC.
+        assert!(!us_rth(ts(2026, 7, 15, 13, 29)));
+        assert!(us_rth(ts(2026, 7, 15, 13, 30)));
+        assert!(us_rth(ts(2026, 7, 15, 19, 59)));
+        assert!(!us_rth(ts(2026, 7, 15, 20, 0)));
+        // EDT begins 2026-03-08 (second Sunday of March): the Friday before
+        // is still EST, the Monday after is EDT.
+        assert!(us_rth(ts(2026, 3, 6, 14, 30)));
+        assert!(!us_rth(ts(2026, 3, 6, 13, 30)));
+        assert!(us_rth(ts(2026, 3, 9, 13, 30)));
+        // EDT ends 2026-11-01 (first Sunday of November).
+        assert!(us_rth(ts(2026, 10, 30, 13, 30)));
+        assert!(!us_rth(ts(2026, 11, 2, 13, 30)));
+        assert!(us_rth(ts(2026, 11, 2, 14, 30)));
+    }
+
+    #[test]
+    fn equity_daily_bar_ignores_extended_hours_prints() {
+        let mut agg = Aggregator::new();
+        let d1 = |bars: &[Bar]| -> Vec<Bar> {
+            bars.iter()
+                .filter(|b| b.interval == Interval::D1)
+                .cloned()
+                .collect()
+        };
+
+        // Pre-market print (08:00 ET): no daily bar forms, M1 still does.
+        let pre = agg.on_tick(&equity_tick(ts(2026, 7, 15, 12, 0), 99.0), 0);
+        assert!(d1(&pre.store).is_empty());
+        assert!(pre.store.iter().any(|b| b.interval == Interval::M1));
+
+        // RTH prints open and update the daily bar.
+        let open = agg.on_tick(&equity_tick(ts(2026, 7, 15, 13, 30), 100.0), 1);
+        assert_eq!(d1(&open.store).len(), 1);
+        assert_eq!(d1(&open.store)[0].open, 100.0);
+        let rth = agg.on_tick(&equity_tick(ts(2026, 7, 15, 19, 59), 104.0), 2);
+        assert_eq!(d1(&rth.store)[0].close, 104.0);
+
+        // After-hours drift in the same UTC day: the daily bar must not move.
+        let ah = agg.on_tick(&equity_tick(ts(2026, 7, 15, 21, 0), 90.0), 3);
+        assert!(d1(&ah.store).is_empty());
+
+        // First print past UTC midnight (20:30 ET, still after-hours)
+        // completes yesterday's bar with the last RTH close — never the
+        // after-hours print — and opens nothing new.
+        let roll = agg.on_tick(&equity_tick(ts(2026, 7, 16, 0, 30), 91.0), 4);
+        let completed = d1(&roll.publish);
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0].complete);
+        assert_eq!(completed[0].close, 104.0);
+        assert_eq!(completed[0].ts_open_ms, ts(2026, 7, 15, 0, 0));
+        assert!(d1(&roll.store).iter().all(|b| b.complete));
+
+        // The next session's first RTH print opens a fresh daily bar.
+        let next = agg.on_tick(&equity_tick(ts(2026, 7, 16, 13, 30), 102.0), 5);
+        let formed = d1(&next.store);
+        assert_eq!(formed.len(), 1);
+        assert_eq!(formed[0].ts_open_ms, ts(2026, 7, 16, 0, 0));
+        assert_eq!(formed[0].open, 102.0);
+    }
+
+    #[test]
+    fn crypto_daily_bars_form_around_the_clock() {
+        let mut agg = Aggregator::new();
+        // 21:00 UTC is after-hours for equities; crypto trades 24/7.
+        let out = agg.on_tick(&tick(ts(2026, 7, 15, 21, 0), 50_000.0, 1.0), 0);
+        assert!(out.store.iter().any(|b| b.interval == Interval::D1));
     }
 }

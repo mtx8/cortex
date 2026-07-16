@@ -43,7 +43,11 @@ struct CandleChart: View {
                         bars: bars, interval: interval, barSpanMs: barSpanMs,
                         signals: signals, thoughts: thoughts,
                         drawings: drawingStore.drawings(for: symbol),
-                        size: geo.size, interaction: interaction
+                        size: geo.size, interaction: interaction,
+                        // Equity intraday only: bare ticker = equity (the
+                        // AppModel.isEquity rule), and D1/weekly bars are
+                        // whole RTH sessions — nothing to shade there.
+                        shadeExtendedHours: interval != .d1 && !symbol.contains("-")
                     )
                 )
             }
@@ -564,11 +568,15 @@ private struct ChartFrame {
     let pendingAnchor: DrawingPoint?
     /// Magnet mode: anchor prices snap to the clicked bar's nearest O/H/L/C.
     let magnet: Bool
+    /// Equity intraday charts wash the background behind bars whose ET
+    /// time-of-day sits outside 09:30-16:00 (pre/post-market).
+    let shadeExtendedHours: Bool
 
     init?(
         bars: [Bar], interval: Interval, barSpanMs: Int64,
         signals: [StrategySignal], thoughts: [AgentThought],
-        drawings: [Drawing], size: CGSize, interaction: ChartInteraction
+        drawings: [Drawing], size: CGSize, interaction: ChartInteraction,
+        shadeExtendedHours: Bool
     ) {
         guard !bars.isEmpty, size.width > 140, size.height > 140 else { return nil }
         self.bars = bars
@@ -577,6 +585,7 @@ private struct ChartFrame {
         self.size = size
         self.showBB = interaction.showBollinger
         self.hoverPoint = interaction.isDragging ? nil : interaction.hover
+        self.shadeExtendedHours = shadeExtendedHours
         self.drawings = drawings
         self.selectedDrawingID = interaction.selectedDrawingID
         self.pendingAnchor = interaction.pendingAnchor
@@ -816,6 +825,7 @@ private struct ChartFrame {
 
     func draw(in ctx: GraphicsContext) {
         drawBackground(ctx)
+        drawExtendedHours(ctx)
         drawGrid(ctx)
         drawBollinger(ctx)
         drawCandles(ctx)
@@ -836,6 +846,35 @@ private struct ChartFrame {
         p.move(to: CGPoint(x: axisX + 0.5, y: 0))
         p.addLine(to: CGPoint(x: axisX + 0.5, y: paneBottom))
         ctx.stroke(p, with: .color(Theme.line.opacity(0.8)), lineWidth: 1)
+    }
+
+    /// Subtle panelHi wash behind extended-hours bars (equity intraday
+    /// only). Adjacent extended bars coalesce into one column so runs read
+    /// as a single session block; sits under the grid so gridlines stay
+    /// visible through the wash.
+    private func drawExtendedHours(_ ctx: GraphicsContext) {
+        guard shadeExtendedHours else { return }
+        var wash = Path()
+        var runStart: Int?
+        for i in range {
+            if ChartMath.isExtendedHours(bars[i].ts_open_ms) {
+                if runStart == nil { runStart = i }
+            } else if let start = runStart {
+                wash.addRect(extendedRunRect(start, i - 1))
+                runStart = nil
+            }
+        }
+        if let start = runStart {
+            wash.addRect(extendedRunRect(start, range.upperBound - 1))
+        }
+        ctx.fill(wash, with: .color(Theme.panelHi))
+    }
+
+    /// Full-height column spanning the bar slots [a, b], clamped to the plot.
+    private func extendedRunRect(_ a: Int, _ b: Int) -> CGRect {
+        let x0 = max(0, x(a) - slot / 2)
+        let x1 = min(plotWidth, x(b) + slot / 2)
+        return CGRect(x: x0, y: 0, width: max(0, x1 - x0), height: paneBottom)
     }
 
     private func axisText(_ s: String) -> Text {

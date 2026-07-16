@@ -289,12 +289,7 @@ private struct BriefPanel: View {
             if message.pending {
                 BriefPendingDots()
             } else {
-                Text(message.text)
-                    .font(.system(size: 12))
-                    .foregroundStyle(Theme.bone)
-                    .lineSpacing(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
+                MarkdownText(message.text)
             }
         }
         .padding(12)

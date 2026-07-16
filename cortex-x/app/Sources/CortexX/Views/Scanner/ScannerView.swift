@@ -13,7 +13,7 @@ import SwiftUI
 /// ordering; explicit column sorting (ScanSort) applies afterwards.
 /// Codable (raw string) so saved screens can persist the active preset.
 enum ScanPreset: String, CaseIterable, Codable {
-    case all, topMomentum, breakoutWatch, oversold, volMovers, equities, crypto
+    case all, topMomentum, breakoutWatch, oversold, volMovers, premarketMovers, equities, crypto
 
     var title: String {
         switch self {
@@ -22,12 +22,26 @@ enum ScanPreset: String, CaseIterable, Codable {
         case .breakoutWatch: "breakout watch"
         case .oversold: "oversold"
         case .volMovers: "vol movers"
+        case .premarketMovers: "premarket movers"
         case .equities: "equities"
         case .crypto: "crypto"
         }
     }
 
-    func apply(_ rows: [ScanRow]) -> [ScanRow] {
+    /// Chip tooltip — spells out the delayed-quote basis where it matters.
+    var help: String? {
+        self == .premarketMovers
+            ? "equities gapping ±\(Int(Self.premarketGapMin * 100))%+ between the "
+                + "latest price (delayed ~15m) and the prior session D1 close, biggest gap first"
+            : nil
+    }
+
+    /// `lastPrice` feeds the presets that need a price beyond the row (the
+    /// premarket-movers gap); it defaults to "unknown" so every other
+    /// preset — and existing callers — stays pure over rows alone.
+    func apply(
+        _ rows: [ScanRow], lastPrice: (String) -> Double? = { _ in nil }
+    ) -> [ScanRow] {
         switch self {
         case .all:
             return rows.sorted { $0.composite > $1.composite }
@@ -45,6 +59,21 @@ enum ScanPreset: String, CaseIterable, Codable {
             return rows
                 .filter { Self.hasFlag($0, "volume spike") || Self.hasFlag($0, "vol expansion") }
                 .sorted { $0.vol_state > $1.vol_state }
+        case .premarketMovers:
+            // Equities whose latest (delayed) price gaps >= 2% off the prior
+            // session's D1 close (`last_close` is the newest COMPLETE daily
+            // close), biggest absolute gap first. Rows without a usable
+            // price or close never sneak in.
+            return rows
+                .compactMap { row -> (row: ScanRow, gap: Double)? in
+                    guard !row.symbol.contains("-"),
+                        let gap = Self.gapFraction(
+                            lastPrice: lastPrice(row.symbol), priorClose: row.last_close
+                        ), abs(gap) >= Self.premarketGapMin else { return nil }
+                    return (row, gap)
+                }
+                .sorted { abs($0.gap) > abs($1.gap) }
+                .map(\.row)
         case .equities:
             // Bare ticker = equity, dashed pair = crypto — the same rule as
             // AppModel.isEquity (inlined; this enum stays pure for tests).
@@ -56,6 +85,18 @@ enum ScanPreset: String, CaseIterable, Codable {
 
     static func hasFlag(_ row: ScanRow, _ flag: String) -> Bool {
         row.flags.contains { $0.caseInsensitiveCompare(flag) == .orderedSame }
+    }
+
+    /// Minimum absolute gap fraction for the premarket-movers screen (2%).
+    static let premarketGapMin = 0.02
+
+    /// Fractional gap between the latest price and the prior D1 close.
+    /// nil whenever either side is absent, non-finite, or non-positive —
+    /// absent data never fabricates a gap.
+    static func gapFraction(lastPrice: Double?, priorClose: Double) -> Double? {
+        guard let lastPrice, lastPrice.isFinite, lastPrice > 0,
+            priorClose.isFinite, priorClose > 0 else { return nil }
+        return (lastPrice - priorClose) / priorClose
     }
 }
 
@@ -684,6 +725,7 @@ struct ScannerView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .help(p.help ?? p.title)
         .animation(DeckMotion.ease(), value: active)
     }
 
@@ -704,7 +746,7 @@ struct ScannerView: View {
     // MARK: Table
 
     private func displayRows(_ board: ScanBoard) -> [ScanRow] {
-        var rows = preset.apply(board.rows)
+        var rows = preset.apply(board.rows, lastPrice: { model.lastPrice($0) })
         rows = ScanFilter.apply(filters, to: rows)
         let query = search.trimmingCharacters(in: .whitespaces)
         if !query.isEmpty {
