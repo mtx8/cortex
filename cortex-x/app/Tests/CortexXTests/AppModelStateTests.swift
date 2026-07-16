@@ -96,6 +96,112 @@ final class AppModelStateTests: XCTestCase {
         XCTAssertEqual(model.selectedSymbol, "IONQ")
     }
 
+    // MARK: - Copilot ask lifecycle
+
+    func testGapFrameFailsPendingAskSoAskSurfacesRearm() {
+        // AiAnswer is not in the engine's critical set: under backpressure
+        // it is dropped and a gap frame arrives instead. The pending ask
+        // must fail, not disable every ASK surface for the session.
+        let model = AppModel()
+        let id = model.askCopilot("what changed?")
+        XCTAssertEqual(model.pendingAsk, id)
+        model.apply(.gap(dropped: 3))
+        XCTAssertNil(model.pendingAsk)
+        let bubble = model.copilot.first { $0.id == id }
+        XCTAssertEqual(bubble?.pending, false)
+        XCTAssertEqual(bubble?.text, "answer lost — ask again")
+    }
+
+    func testErrorFrameFailsPendingAsk() {
+        let model = AppModel()
+        let id = model.askCopilot("what changed?")
+        model.apply(.error(detail: "boom"))
+        XCTAssertNil(model.pendingAsk)
+        XCTAssertEqual(model.copilot.first { $0.id == id }?.pending, false)
+    }
+
+    func testGapWithoutPendingAskTouchesNothing() {
+        let model = AppModel()
+        let id = model.askCopilot("what changed?")
+        model.apply(.aiAnswer(AiAnswer(
+            request_id: id, question: "what changed?", answer: "answered",
+            model: "m", ts_ms: nowMs
+        )))
+        model.apply(.gap(dropped: 1))
+        XCTAssertEqual(model.copilot.first { $0.id == id }?.text, "answered")
+    }
+
+    func testDisconnectFailsPendingAsk() {
+        // Reconnects never replay an in-flight ask — the id dies with the
+        // connection, so the pending state must die with it too.
+        let model = AppModel()
+        model.handleStateChange(.connected)
+        let id = model.askCopilot("what changed?")
+        model.handleStateChange(.disconnected)
+        XCTAssertNil(model.pendingAsk)
+        XCTAssertEqual(model.copilot.first { $0.id == id }?.pending, false)
+        XCTAssertEqual(model.connection, .disconnected)
+    }
+
+    func testBackToBackAskIdsNeverCollide() {
+        // Millisecond wall-clock alone collides when two asks dispatch in
+        // the same run-loop drain (double-click before .disabled lands).
+        let model = AppModel()
+        let a = model.askCopilot("one")
+        let b = model.askCopilot("two")
+        XCTAssertNotEqual(a, b)
+        XCTAssertEqual(Set(model.copilot.map(\.id)).count, model.copilot.count)
+    }
+
+    // MARK: - History miss caching
+
+    func testEmptyHistoryMissBlocksRerequestForever() {
+        // Dead tickers ("NVDAA") answer with an empty slice. The first
+        // request records the miss; every later ensureSymbolData (list
+        // switches, rail re-appearance) must stay silent — each re-request
+        // was a fresh Yahoo egress hit.
+        let model = AppModel()
+        XCTAssertTrue(model.ensureSymbolData("NVDAA"))
+        model.apply(.history(HistorySlice(
+            symbol: "NVDAA", interval: .d1, bars: [], source: "test", ts_ms: nowMs
+        )))
+        XCTAssertFalse(model.ensureSymbolData("NVDAA"))
+    }
+
+    func testHistoryMissClearsWhenDataLaterArrives() {
+        let model = AppModel()
+        model.apply(.history(HistorySlice(
+            symbol: "IONQ", interval: .d1, bars: [], source: "test", ts_ms: nowMs
+        )))
+        XCTAssertFalse(model.ensureSymbolData("IONQ"))
+        model.apply(.history(HistorySlice(
+            symbol: "IONQ", interval: .d1,
+            bars: [d1Bar(symbol: "IONQ", tsOpenMs: nowMs - dayMs)],
+            source: "test", ts_ms: nowMs
+        )))
+        XCTAssertTrue(model.historyMisses.isEmpty)
+    }
+
+    func testMissForOneSymbolNeverBlocksAnother() {
+        let model = AppModel()
+        model.apply(.history(HistorySlice(
+            symbol: "NVDAA", interval: .d1, bars: [], source: "test", ts_ms: nowMs
+        )))
+        XCTAssertTrue(model.ensureSymbolData("TSM"))
+    }
+
+    // MARK: - Type-to-add ticker validation
+
+    func testTickerInputValidation() {
+        XCTAssertTrue(Watchlist.isValidTickerInput("NVDA"))
+        XCTAssertTrue(Watchlist.isValidTickerInput("BRK.B"))
+        XCTAssertTrue(Watchlist.isValidTickerInput("BTC-USD"))
+        XCTAssertFalse(Watchlist.isValidTickerInput("FOO BAR"))
+        XCTAssertFalse(Watchlist.isValidTickerInput(""))
+        XCTAssertFalse(Watchlist.isValidTickerInput("WAYTOOLONGTICKER"))
+        XCTAssertFalse(Watchlist.isValidTickerInput("nvda"))
+    }
+
     // MARK: - Fixtures
 
     private func chain(_ underlying: String) -> OptionsChain {
@@ -110,7 +216,7 @@ final class AppModelStateTests: XCTestCase {
         EngineSnapshot(
             symbols: symbols, bars: [:], positions: [], account: nil,
             risk: nil, thoughts: [], orders: [], macro: nil, feeds: nil,
-            regimes: nil, geo: nil, scan: nil, search_universe: universe
+            regimes: nil, geo: nil, scan: nil, news: nil, search_universe: universe
         )
     }
 

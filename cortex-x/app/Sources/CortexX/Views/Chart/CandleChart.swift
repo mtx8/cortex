@@ -235,6 +235,12 @@ struct CandleChart: View {
                     help: tool.help
                 ) { interaction.selectTool(tool) }
             }
+            // Magnet snap is a mode, not a tool: it bends anchor placement
+            // toward the bar's O/H/L/C. ("dot.scope" — SF Symbols ships no
+            // magnet glyph on macOS 14.)
+            ToolChip(
+                symbol: "dot.scope", isOn: interaction.magnetMode, help: "magnet snap"
+            ) { interaction.magnetMode.toggle() }
             ToolChip(symbol: "trash", isOn: false, help: "clear drawings") {
                 drawingStore.removeAll(for: symbol)
                 interaction.selectedDrawingID = nil
@@ -556,6 +562,8 @@ private struct ChartFrame {
     let drawings: [Drawing]
     let selectedDrawingID: UUID?
     let pendingAnchor: DrawingPoint?
+    /// Magnet mode: anchor prices snap to the clicked bar's nearest O/H/L/C.
+    let magnet: Bool
 
     init?(
         bars: [Bar], interval: Interval, barSpanMs: Int64,
@@ -572,6 +580,7 @@ private struct ChartFrame {
         self.drawings = drawings
         self.selectedDrawingID = interaction.selectedDrawingID
         self.pendingAnchor = interaction.pendingAnchor
+        self.magnet = interaction.magnetMode
 
         // Layout
         let axisWidth: CGFloat = 56
@@ -732,11 +741,13 @@ private struct ChartFrame {
     // MARK: Drawing lookups
 
     /// Inverse frame mapping for anchor placement: nearest bar timestamp
-    /// plus the exact price under the cursor. Price pane only.
+    /// plus the price under the cursor — exact, or snapped to that bar's
+    /// nearest O/H/L/C in magnet mode. Price pane only.
     func drawingPoint(at p: CGPoint) -> DrawingPoint? {
         guard mainRect.contains(p), let i = index(atX: p.x) else { return nil }
-        let price = priceAtY(p.y)
-        guard price.isFinite else { return nil }
+        let raw = priceAtY(p.y)
+        guard raw.isFinite else { return nil }
+        let price = magnet ? MagnetMath.snapPrice(raw, to: bars[i]) : raw
         return DrawingPoint(ts_ms: bars[i].ts_open_ms, price: price)
     }
 

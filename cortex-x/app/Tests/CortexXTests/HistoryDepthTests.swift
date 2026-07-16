@@ -117,7 +117,7 @@ final class HistoryDepthTests: XCTestCase {
             bars: ["AAPL": ["d1": [d1Bar(tsOpenMs: oldestBarMs), d1Bar(tsOpenMs: nowMs - dayMs)]]],
             positions: [], account: nil, risk: nil, thoughts: [], orders: [],
             macro: nil, feeds: nil, regimes: nil, geo: nil, scan: nil,
-            search_universe: nil
+            news: nil, search_universe: nil
         )))
         return model
     }

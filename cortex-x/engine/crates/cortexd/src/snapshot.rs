@@ -9,8 +9,8 @@ use cx_core::autonomy::AutonomyDial;
 use std::collections::HashMap;
 
 use cx_core::events::{
-    AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, OrderUpdate, RegimeBoard,
-    ScanBoard,
+    AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, NewsBoard, OrderUpdate,
+    RegimeBoard, ScanBoard,
 };
 use cx_core::store::BarStore;
 use cx_core::types::Interval;
@@ -38,6 +38,7 @@ pub struct SnapshotSrc {
     regimes_last: Mutex<Option<RegimeBoard>>,
     geo_last: Mutex<Option<GeoPulse>>,
     scan_last: Mutex<Option<ScanBoard>>,
+    news_last: Mutex<Option<NewsBoard>>,
 }
 
 impl SnapshotSrc {
@@ -67,6 +68,7 @@ impl SnapshotSrc {
             regimes_last: Mutex::new(None),
             geo_last: Mutex::new(None),
             scan_last: Mutex::new(None),
+            news_last: Mutex::new(None),
         })
     }
 
@@ -128,6 +130,10 @@ impl SnapshotSrc {
                         EngineEvent::Scan(s) => {
                             *this.scan_last.lock().unwrap_or_else(|p| p.into_inner()) =
                                 Some(s.clone());
+                        }
+                        EngineEvent::News(n) => {
+                            *this.news_last.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(n.clone());
                         }
                         _ => {}
                     },
@@ -202,6 +208,7 @@ impl SnapshotSource for SnapshotSrc {
             .clone();
         let geo_last = self.geo_last.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let scan_last = self.scan_last.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let news_last = self.news_last.lock().unwrap_or_else(|p| p.into_inner()).clone();
 
         serde_json::json!({
             "symbols": self.symbols,
@@ -216,6 +223,7 @@ impl SnapshotSource for SnapshotSrc {
             "regimes": regimes_last,
             "geo": geo_last,
             "scan": scan_last,
+            "news": news_last,
             "search_universe": self.universe,
         })
     }

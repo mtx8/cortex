@@ -613,6 +613,45 @@ struct ScanBoard: Codable, Equatable {
     var ts_ms: Int64
 }
 
+// MARK: - Intel: NEWS (headlines + earnings-cadence estimates)
+
+/// One market/company headline (GDELT DOC 2.0), deduped by title.
+/// `symbol` names the configured equity whose company query surfaced it;
+/// nil marks the general markets query.
+struct NewsItem: Codable, Equatable, Identifiable {
+    var symbol: String?
+    var title: String
+    var source_domain: String
+    var url: String
+    /// GDELT average tone: negative = grim, positive = calm.
+    var tone: Double
+    var ts_ms: Int64
+    var id: String { "\(symbol ?? "market")-\(ts_ms)-\(title.hashValue)" }
+}
+
+/// One configured equity's earnings-calendar row, ESTIMATED from its SEC
+/// EDGAR filing cadence. `next_estimate` is arithmetic, not a confirmed
+/// date — `basis` discloses that on every row.
+struct EarningsRow: Codable, Equatable, Identifiable {
+    var symbol: String
+    /// Most recent periodic (10-Q/10-K) filing date, "YYYY-MM-DD".
+    var last_report: String
+    /// `last_report` + 91 days, "YYYY-MM-DD".
+    var next_estimate: String
+    /// e.g. "estimated from filing cadence (not confirmed)".
+    var basis: String
+    var id: String { symbol }
+}
+
+/// The NEWS board: deduped company/market headlines plus filing-cadence
+/// earnings estimates. Sources are always disclosed.
+struct NewsBoard: Codable, Equatable {
+    var items: [NewsItem]
+    var earnings: [EarningsRow]
+    var source: String
+    var ts_ms: Int64
+}
+
 /// On-demand history for a searched symbol: one interval, whole series.
 struct HistorySlice: Codable, Equatable {
     var symbol: String
@@ -638,6 +677,7 @@ struct EngineSnapshot: Codable {
     var regimes: RegimeBoard?
     var geo: GeoPulse?
     var scan: ScanBoard?
+    var news: NewsBoard?
     /// Scan-universe symbols beyond the watchlist (D1 charts + search).
     var search_universe: [String]?
 }
@@ -668,6 +708,7 @@ enum ServerFrame {
     case regimeMap(RegimeBoard)
     case geo(GeoPulse)
     case scan(ScanBoard)
+    case news(NewsBoard)
     case history(HistorySlice)
     case gap(dropped: Int)
     case error(detail: String)
@@ -706,6 +747,7 @@ enum ServerFrame {
         case "regime_map": return .regimeMap(try dec.decode(RegimeBoard.self, from: data))
         case "geo": return .geo(try dec.decode(GeoPulse.self, from: data))
         case "scan": return .scan(try dec.decode(ScanBoard.self, from: data))
+        case "news": return .news(try dec.decode(NewsBoard.self, from: data))
         case "history": return .history(try dec.decode(HistorySlice.self, from: data))
         case "gap":
             struct Gap: Codable { var dropped: Int }

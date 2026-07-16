@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use cx_core::events::{
-    AccountSnapshot, AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, Position,
-    RegimeBoard, RegimeState, RiskStatus, StrategySignal,
+    AccountSnapshot, AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, NewsBoard,
+    Position, RegimeBoard, RegimeState, RiskStatus, StrategySignal,
 };
 use cx_core::store::BarStore;
 use cx_core::types::{Interval, Severity};
@@ -36,6 +36,13 @@ const RENDER_CHAINS: usize = 3;
 const RENDER_CHAIN_ASSETS: usize = 3;
 /// ENSEMBLE render cap: at most this many strategy weights.
 const RENDER_WEIGHTS: usize = 12;
+/// NEWS render caps: top headlines plus imminent earnings estimates — the
+/// section stays compact whatever cx-intel publishes.
+const RENDER_HEADLINES: usize = 6;
+const RENDER_EARNINGS: usize = 8;
+/// Earnings estimates render only within this many days of the board's own
+/// timestamp (today inclusive).
+const EARNINGS_WINDOW_DAYS: i64 = 14;
 /// DESKS bound: at most this many "desk-*" squadrons keep a latest note.
 const MAX_DESKS: usize = 6;
 /// PLAYBOOK bound: at most this many strategies in the regime matrix.
@@ -71,6 +78,9 @@ pub(crate) struct LedgerState {
     pub regime_board: Option<RegimeBoard>,
     /// Latest MERIDIAN pulse (cx-intel); render caps forces/chains/assets.
     pub geo: Option<GeoPulse>,
+    /// Latest NEWS board (cx-intel); render caps headlines and shows only
+    /// earnings estimates within [`EARNINGS_WINDOW_DAYS`] of the board.
+    pub news: Option<NewsBoard>,
     /// Latest fusion Hedge weights keyed by strategy name, from the "w_*"
     /// features of the most recent "fusion" signal. Finite values only.
     pub ensemble: BTreeMap<String, f64>,
@@ -201,6 +211,7 @@ impl ContextLedger {
             EngineEvent::Macro(m) => st.macro_snap = Some(m.clone()),
             EngineEvent::RegimeMap(b) => st.regime_board = Some(b.clone()),
             EngineEvent::Geo(g) => st.geo = Some(g.clone()),
+            EngineEvent::News(n) => st.news = Some(n.clone()),
             EngineEvent::FeedStatus(f) => {
                 st.feeds.insert(f.feed.clone(), f.clone());
             }
@@ -496,6 +507,50 @@ impl ContextLedger {
             }
         }
 
+        // NEWS: top headlines + imminent (filing-cadence-estimated) earnings.
+        // Bounded like every intel section; omitted while no board exists.
+        if let Some(n) = &st.news {
+            // The board arrives keyed by symbol (alphabetical). With more
+            // rows due than the render cap, alphabetical truncation would
+            // hide the MOST imminent reports — sort soonest-first before
+            // truncating (ISO dates compare correctly as strings, matching
+            // NewsSupport.orderedEarnings on the Swift side).
+            let mut due: Vec<&cx_core::events::EarningsRow> = n
+                .earnings
+                .iter()
+                .filter(|r| within_days(&r.next_estimate, n.ts_ms, EARNINGS_WINDOW_DAYS))
+                .collect();
+            due.sort_by(|a, b| {
+                a.next_estimate
+                    .cmp(&b.next_estimate)
+                    .then_with(|| a.symbol.cmp(&b.symbol))
+            });
+            due.truncate(RENDER_EARNINGS);
+            if !n.items.is_empty() || !due.is_empty() {
+                out.push_str("\n=== NEWS ===\n");
+                for item in n.items.iter().take(RENDER_HEADLINES) {
+                    out.push_str(&format!(
+                        "- {}{} (tone {:+.1})\n",
+                        item.symbol
+                            .as_deref()
+                            .map(|s| format!("[{s}] "))
+                            .unwrap_or_default(),
+                        snip(&item.title, 90),
+                        fin(item.tone),
+                    ));
+                }
+                for r in due {
+                    out.push_str(&format!(
+                        "earnings {}: next ~{} (last report {}; {})\n",
+                        snip(&r.symbol, 12),
+                        snip(&r.next_estimate, 10),
+                        snip(&r.last_report, 10),
+                        snip(&r.basis, 60),
+                    ));
+                }
+            }
+        }
+
         if !st.ensemble.is_empty() {
             out.push_str("\n=== ENSEMBLE ===\n");
             let weights = st
@@ -621,6 +676,20 @@ fn observe_price(st: &mut LedgerState, symbol: &str, px: f64, ts_ms: i64) {
     e.last = px;
 }
 
+/// True when `date` ("YYYY-MM-DD") falls within `days` days of `now_ms`,
+/// today inclusive. Unparseable dates (or timestamps) are never "within" —
+/// a junk estimate must not render as imminent.
+fn within_days(date: &str, now_ms: i64, days: i64) -> bool {
+    let Ok(d) = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") else {
+        return false;
+    };
+    let Some(now) = chrono::DateTime::from_timestamp_millis(now_ms) else {
+        return false;
+    };
+    let diff = d.signed_duration_since(now.date_naive()).num_days();
+    (0..=days).contains(&diff)
+}
+
 // ---- shared formatting helpers (crate-wide) --------------------------------
 
 /// Non-finite reads as 0.0 so `format!` never prints NaN/inf.
@@ -721,7 +790,8 @@ pub(crate) fn cap_words(s: &str, max_words: usize) -> String {
 mod tests {
     use super::*;
     use cx_core::events::{
-        AssetImpact, Bar, Breadth, CausalChain, ForceGauge, RegimeRow, Tick,
+        AssetImpact, Bar, Breadth, CausalChain, EarningsRow, ForceGauge, NewsItem, RegimeRow,
+        Tick,
     };
     use cx_core::types::Venue;
 
@@ -836,6 +906,144 @@ mod tests {
             features,
             ts_ms: 1_000_000,
         })
+    }
+
+    fn news_item(symbol: Option<&str>, title: &str, tone: f64) -> NewsItem {
+        NewsItem {
+            symbol: symbol.map(String::from),
+            title: title.into(),
+            source_domain: "wire.com".into(),
+            url: String::new(),
+            tone,
+            ts_ms: 1,
+        }
+    }
+
+    fn earnings_row(symbol: &str, last: &str, next: &str) -> EarningsRow {
+        EarningsRow {
+            symbol: symbol.into(),
+            last_report: last.into(),
+            next_estimate: next.into(),
+            basis: "estimated from filing cadence (not confirmed)".into(),
+        }
+    }
+
+    /// Noon UTC on 2026-07-16 — a fixed "now" for the earnings window.
+    fn board_ts() -> i64 {
+        chrono::NaiveDate::from_ymd_opt(2026, 7, 16)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis()
+    }
+
+    #[test]
+    fn news_section_renders_capped_headlines_and_due_earnings() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        let long_title = "A".repeat(100);
+        let mut items = vec![
+            news_item(Some("NVDA"), &long_title, -2.4),
+            news_item(None, "Markets drift ahead of CPI", f64::NAN),
+        ];
+        for i in 0..6 {
+            items.push(news_item(Some("AAPL"), &format!("filler headline {i}"), 0.5));
+        }
+        ledger.apply(&EngineEvent::News(NewsBoard {
+            items, // 8 items: only the top 6 render
+            earnings: vec![
+                earnings_row("NVDA", "2026-04-16", "2026-07-16"), // today: shown
+                earnings_row("AAPL", "2026-04-30", "2026-07-30"), // +14d: shown
+                earnings_row("MSFT", "2026-04-31", "2026-07-31"), // +15d: hidden
+                earnings_row("SPY", "2026-04-15", "2026-07-15"),  // past: hidden
+                earnings_row("ZZZZ", "junk", "not-a-date"),       // junk: hidden
+            ],
+            source: "test".into(),
+            ts_ms: board_ts(),
+        }));
+
+        let out = ledger.render(&["NVDA".to_string()]);
+        assert!(out.contains("=== NEWS ==="), "{out}");
+        // Title snipped at 90 chars, symbol-tagged, tone appended.
+        assert!(
+            out.contains(&format!("- [NVDA] {}… (tone -2.4)", "A".repeat(90))),
+            "{out}"
+        );
+        // The markets item carries no symbol tag; NaN tone reads 0.0.
+        assert!(out.contains("- Markets drift ahead of CPI (tone +0.0)"), "{out}");
+        // 8 items, cap 6: the last two fillers never render.
+        assert!(out.contains("filler headline 3"), "{out}");
+        assert!(!out.contains("filler headline 4"), "{out}");
+        // Earnings inside the 14-day window only, honestly labeled.
+        assert!(
+            out.contains(
+                "earnings NVDA: next ~2026-07-16 (last report 2026-04-16; \
+                 estimated from filing cadence (not confirmed))"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("earnings AAPL: next ~2026-07-30"), "{out}");
+        assert!(!out.contains("earnings MSFT"), "beyond window leaked: {out}");
+        assert!(!out.contains("earnings SPY"), "past estimate leaked: {out}");
+        assert!(!out.contains("earnings ZZZZ"), "junk date leaked: {out}");
+    }
+
+    #[test]
+    fn earnings_over_cap_keep_the_most_imminent_not_the_alphabetical_head() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        // 9 due rows (cap 8) arriving alphabetically (BTreeMap order), with
+        // imminence OPPOSITE to the alphabet: the alphabetically-first
+        // symbol reports last. Alphabetical truncation would silently drop
+        // III — the soonest report on the board.
+        let symbols = ["AAA", "BBB", "CCC", "DDD", "EEE", "FFF", "GGG", "HHH", "III"];
+        let earnings = symbols
+            .iter()
+            .enumerate()
+            .map(|(i, s)| earnings_row(s, "2026-04-16", &format!("2026-07-{}", 24 - i)))
+            .collect();
+        ledger.apply(&EngineEvent::News(NewsBoard {
+            items: vec![],
+            earnings,
+            source: "test".into(),
+            ts_ms: board_ts(),
+        }));
+
+        let out = ledger.render(&[]);
+        // The farthest-out report (AAA, +8d) is the one truncated away.
+        assert!(!out.contains("earnings AAA"), "{out}");
+        // The soonest (III, today) renders, soonest-first.
+        let iii = out.find("earnings III").expect("III must render");
+        let bbb = out.find("earnings BBB").expect("BBB must render");
+        assert!(iii < bbb, "soonest report must render first: {out}");
+    }
+
+    #[test]
+    fn news_section_omitted_when_absent_or_carrying_nothing_due() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(Arc::clone(&store));
+        // No board at all: no section, zero tokens.
+        assert!(!ledger.render(&[]).contains("=== NEWS ==="));
+        // A board with no headlines and only far-out earnings: still omitted.
+        ledger.apply(&EngineEvent::News(NewsBoard {
+            items: vec![],
+            earnings: vec![earnings_row("NVDA", "2026-05-28", "2026-08-27")],
+            source: "test".into(),
+            ts_ms: board_ts(),
+        }));
+        assert!(!ledger.render(&[]).contains("=== NEWS ==="));
+    }
+
+    #[test]
+    fn within_days_guards_junk_and_window_edges() {
+        let now = board_ts();
+        assert!(within_days("2026-07-16", now, 14)); // today
+        assert!(within_days("2026-07-30", now, 14)); // last day in window
+        assert!(!within_days("2026-07-31", now, 14)); // one past the window
+        assert!(!within_days("2026-07-15", now, 14)); // yesterday
+        assert!(!within_days("not-a-date", now, 14));
+        assert!(!within_days("", now, 14));
     }
 
     #[test]

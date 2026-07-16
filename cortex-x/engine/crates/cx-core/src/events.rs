@@ -564,6 +564,44 @@ pub struct ScanBoard {
     pub ts_ms: i64,
 }
 
+/// One market/company headline (GDELT DOC 2.0), deduped by title.
+/// `symbol` names the configured equity whose company query surfaced it;
+/// None marks the general markets query.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewsItem {
+    pub symbol: Option<String>,
+    pub title: String,
+    pub source_domain: String,
+    pub url: String,
+    /// GDELT average tone: negative = grim, positive = calm.
+    pub tone: f64,
+    pub ts_ms: i64,
+}
+
+/// One configured equity's earnings-calendar row, ESTIMATED from its SEC
+/// EDGAR filing cadence. `next_estimate` is arithmetic, not a confirmed
+/// date — `basis` discloses that on every row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EarningsRow {
+    pub symbol: String,
+    /// Most recent periodic (10-Q/10-K) filing date, "YYYY-MM-DD".
+    pub last_report: String,
+    /// `last_report` + 91 days, "YYYY-MM-DD".
+    pub next_estimate: String,
+    /// e.g. "estimated from filing cadence (not confirmed)".
+    pub basis: String,
+}
+
+/// The NEWS board: deduped company/market headlines plus filing-cadence
+/// earnings estimates. Sources are always disclosed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewsBoard {
+    pub items: Vec<NewsItem>,
+    pub earnings: Vec<EarningsRow>,
+    pub source: String,
+    pub ts_ms: i64,
+}
+
 /// On-demand history answer (`Command::GetHistory`): one symbol, one
 /// interval, the whole series in a single frame so ad-hoc searched tickers
 /// can chart without being part of the configured feed set.
@@ -629,6 +667,7 @@ pub enum EngineEvent {
     RegimeMap(RegimeBoard),
     Geo(GeoPulse),
     Scan(ScanBoard),
+    News(NewsBoard),
     History(HistorySlice),
 }
 
@@ -669,6 +708,7 @@ impl EngineEvent {
             EngineEvent::RegimeMap(_) => "regime_map",
             EngineEvent::Geo(_) => "geo",
             EngineEvent::Scan(_) => "scan",
+            EngineEvent::News(_) => "news",
             EngineEvent::History(_) => "history",
         }
     }
@@ -693,6 +733,34 @@ mod tests {
         assert!(!ev.is_critical(), "param updates must never starve ticks");
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"type\":\"param_update\""));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn news_event_is_type_tagged_and_not_critical() {
+        let ev = EngineEvent::News(NewsBoard {
+            items: vec![NewsItem {
+                symbol: Some("NVDA".into()),
+                title: "Blackwell demand outruns supply".into(),
+                source_domain: "example.com".into(),
+                url: "https://example.com/a".into(),
+                tone: -1.5,
+                ts_ms: 1,
+            }],
+            earnings: vec![EarningsRow {
+                symbol: "NVDA".into(),
+                last_report: "2026-05-28".into(),
+                next_estimate: "2026-08-27".into(),
+                basis: "estimated from filing cadence (not confirmed)".into(),
+            }],
+            source: "gdelt 2.0 + sec edgar submissions".into(),
+            ts_ms: 2,
+        });
+        assert_eq!(ev.kind(), "news");
+        assert!(!ev.is_critical(), "news must never starve ticks");
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"news\""));
         let back: EngineEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
     }

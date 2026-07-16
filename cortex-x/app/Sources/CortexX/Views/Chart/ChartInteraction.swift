@@ -72,6 +72,10 @@ final class ChartInteraction {
     // Drawing tools
     /// Armed drawing tool; non-cursor tools claim clicks and suppress pan.
     var activeTool: ChartTool = .cursor
+    /// Magnet mode: anchor prices snap to the clicked bar's nearest
+    /// open/high/low/close (timestamps already snap per bar). A mode like
+    /// the overlay toggles, not a tool — it survives series switches.
+    var magnetMode = false
     /// First anchor of an in-progress two-point drawing (Esc cancels).
     var pendingAnchor: DrawingPoint?
     /// Drawing picked with the cursor tool; Delete removes it.
@@ -148,6 +152,28 @@ final class ChartInteraction {
         activeTool = .cursor
         pendingAnchor = nil
         selectedDrawingID = nil
+    }
+}
+
+// MARK: - Magnet snap
+
+enum MagnetMath {
+    /// `price` snapped to the nearest of the bar's open/high/low/close.
+    /// Non-finite candidates are skipped; if every candidate is non-finite
+    /// (or `price` itself is), the input comes back unchanged. Equidistant
+    /// candidates resolve to the earliest in O-H-L-C order.
+    static func snapPrice(_ price: Double, to bar: Bar) -> Double {
+        guard price.isFinite else { return price }
+        var best = price
+        var bestDist = Double.infinity
+        for candidate in [bar.open, bar.high, bar.low, bar.close] where candidate.isFinite {
+            let dist = abs(candidate - price)
+            if dist < bestDist {
+                bestDist = dist
+                best = candidate
+            }
+        }
+        return best
     }
 }
 

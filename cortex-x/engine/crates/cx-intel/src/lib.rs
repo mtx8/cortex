@@ -1,14 +1,17 @@
 //! cx-intel — the intelligence squadron: COMPANY (supply-chain graph +
-//! EDGAR fundamentals), REGIMES (bull/bear state board + breadth), and
-//! MERIDIAN (Dalio-style geopolitical cause-effect engine).
+//! EDGAR fundamentals), REGIMES (bull/bear state board + breadth),
+//! MERIDIAN (Dalio-style geopolitical cause-effect engine), and NEWS
+//! (company/market headlines + filing-cadence earnings estimates).
 //!
 //! Bus-only IO like every squadron: depends on cx-core (+ pure cx-ta math),
-//! publishes `EngineEvent::{Company, RegimeMap, Geo}` and tighten-only
-//! cautions. All REST leaves through the hardened `Egress` chokepoint.
+//! publishes `EngineEvent::{Company, RegimeMap, Geo, Scan, News}` and
+//! tighten-only cautions. All REST leaves through the hardened `Egress`
+//! chokepoint.
 
 pub mod causal_rules;
 pub mod company;
 pub mod meridian;
+pub mod news;
 pub mod regimes;
 pub mod scanner;
 pub mod splc_data;
@@ -22,8 +25,8 @@ use cx_core::store::BarStore;
 use cx_core::Bus;
 
 /// Spawn the intel squadron's background tasks (REGIMES scanner + MERIDIAN
-/// poller). COMPANY is on-demand — dispatch [`serve_company`] from the
-/// command loop instead.
+/// poller + SCANNER + NEWS poller). COMPANY is on-demand — dispatch
+/// [`serve_company`] from the command loop instead.
 pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) {
     if cfg.intel.enable_regimes {
         regimes::spawn_scanner(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
@@ -33,6 +36,9 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) {
     }
     if cfg.intel.enable_scanner {
         scanner::spawn_scanner(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
+    }
+    if cfg.intel.enable_news {
+        news::spawn_poller(Arc::clone(&bus), cfg.clone());
     }
 }
 

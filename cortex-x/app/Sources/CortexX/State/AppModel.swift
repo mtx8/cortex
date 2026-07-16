@@ -46,7 +46,7 @@ final class AppModel {
     private(set) var feeds: [String: FeedStatus] = [:]
 
     // MARK: Center sections
-    enum CenterMode: String, CaseIterable { case chart, scanner, company, options, foundry, regimes, meridian }
+    enum CenterMode: String, CaseIterable { case chart, scanner, news, company, options, foundry, regimes, meridian }
     var centerMode: CenterMode = .chart
     private(set) var optionsChain: OptionsChain?
     private(set) var chainLoading = false
@@ -65,12 +65,22 @@ final class AppModel {
     private(set) var regimeBoard: RegimeBoard?
     private(set) var geoPulse: GeoPulse?
     private(set) var scanBoard: ScanBoard?
+    private(set) var newsBoard: NewsBoard?
     /// Universe symbols beyond the watchlist — searchable, D1-chartable.
     private(set) var searchUniverse: [String] = []
 
     // MARK: Copilot
     private(set) var copilot: [CopilotMessage] = []
     private(set) var pendingAsk: String?
+    /// Monotonic ask counter: millisecond wall-clock alone can collide when
+    /// two asks dispatch in the same run-loop drain (double-click before
+    /// `.disabled` re-renders), corrupting id-keyed answer routing.
+    private var askSeq = 0
+
+    /// Symbols whose on-demand history came back empty (dead ticker or
+    /// failed backfill). Without this, ensureSymbolData re-fires a fresh
+    /// engine request — and a fresh Yahoo egress — on every list switch.
+    private(set) var historyMisses: Set<String> = []
 
     private let client: EngineClient
     private let maxBars = 3_000
@@ -92,7 +102,15 @@ final class AppModel {
     init(client: EngineClient = EngineClient()) {
         self.client = client
         client.onFrame = { [weak self] frame in self?.apply(frame) }
-        client.onStateChange = { [weak self] s in self?.connection = s }
+        client.onStateChange = { [weak self] s in self?.handleStateChange(s) }
+    }
+
+    func handleStateChange(_ s: ConnectionState) {
+        connection = s
+        // A dropped connection orphans any in-flight ask: the engine answers
+        // by exact request id only, and a fresh connection knows nothing
+        // about it — without this every ASK surface stays disabled forever.
+        if s != .connected { failPendingAsk("connection lost — ask again") }
     }
 
     func start() { client.start() }
@@ -169,7 +187,7 @@ final class AppModel {
     func ensureSymbolData(_ symbol: String) -> Bool {
         let symbol = symbol.uppercased()
         let hasBars = bars[symbol]?.values.contains { !$0.isEmpty } ?? false
-        guard !hasBars else { return false }
+        guard !hasBars, !historyMisses.contains(symbol) else { return false }
         send(.getHistory(symbol: symbol))
         return true
     }
@@ -255,12 +273,31 @@ final class AppModel {
         }
     }
 
-    func askCopilot(_ question: String) {
-        let id = "ask-\(Int(Date().timeIntervalSince1970 * 1000))"
+    /// Fire a copilot question. Returns the request id so section-local
+    /// surfaces (the NEWS brief panel) can track their own answer inline —
+    /// the reply still lands in the shared copilot thread.
+    @discardableResult
+    func askCopilot(_ question: String) -> String {
+        askSeq += 1
+        let id = "ask-\(Int(Date().timeIntervalSince1970 * 1000))-\(askSeq)"
         copilot.append(CopilotMessage(id: "\(id)-q", role: .user, text: question))
         copilot.append(CopilotMessage(id: id, role: .cortex, text: "", pending: true))
         pendingAsk = id
         send(.askAi(requestId: id, question: question))
+        return id
+    }
+
+    /// A pending ask can never resolve once its answer is lost: AiAnswer is
+    /// not in the engine's critical event set, so under backpressure it is
+    /// dropped and a gap frame arrives instead. Fail the pending bubble and
+    /// clear `pendingAsk` so ASK surfaces re-arm instead of locking up.
+    private func failPendingAsk(_ reason: String) {
+        guard let id = pendingAsk else { return }
+        pendingAsk = nil
+        if let idx = copilot.firstIndex(where: { $0.id == id }), copilot[idx].pending {
+            copilot[idx].pending = false
+            copilot[idx].text = reason
+        }
     }
 
     // MARK: Frame application
@@ -352,8 +389,17 @@ final class AppModel {
             geoPulse = pulse
         case .scan(let board):
             scanBoard = board
+        case .news(let board):
+            newsBoard = board
         case .history(let slice):
-            guard !slice.bars.isEmpty else { break }
+            guard !slice.bars.isEmpty else {
+                // The engine answered "no data" (unresolvable ticker or a
+                // failed backfill). Remember the miss so the on-demand path
+                // stops re-requesting — and re-hitting Yahoo — forever.
+                historyMisses.insert(slice.symbol)
+                break
+            }
+            historyMisses.remove(slice.symbol)
             bars[slice.symbol, default: [:]][slice.interval] =
                 slice.bars.sorted { $0.ts_open_ms < $1.ts_open_ms }
             // If the operator is waiting on this exact chart, switch to the
@@ -364,7 +410,12 @@ final class AppModel {
             if sessionOpen[slice.symbol] == nil {
                 sessionOpen[slice.symbol] = slice.bars.last?.close
             }
-        case .gap, .error, .unknown:
+        case .gap, .error:
+            // Under client lag the engine drops non-critical events (the
+            // AiAnswer among them) and sends a gap frame instead — an
+            // in-flight ask can therefore never resolve. Fail it now.
+            failPendingAsk("answer lost — ask again")
+        case .unknown:
             break
         }
     }
@@ -401,6 +452,7 @@ final class AppModel {
         if let r = snap.regimes { regimeBoard = r }
         if let g = snap.geo { geoPulse = g }
         if let s = snap.scan { scanBoard = s }
+        if let n = snap.news { newsBoard = n }
         for (symbol, byInterval) in rebuilt {
             if sessionOpen[symbol] == nil {
                 sessionOpen[symbol] = byInterval[.m1]?.last?.close ?? byInterval[.h1]?.last?.close

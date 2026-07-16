@@ -167,10 +167,13 @@ pub struct IntelConfig {
     pub regime_scan_secs: u64,
     /// SCANNER recompute cadence (seconds, floor 60).
     pub scanner_secs: u64,
+    /// NEWS poll cadence (seconds, floor 300).
+    pub news_poll_secs: u64,
     pub enable_scanner: bool,
     pub enable_company: bool,
     pub enable_regimes: bool,
     pub enable_meridian: bool,
+    pub enable_news: bool,
 }
 
 /// Liquid US megacaps + core index ETFs. Dashed share classes are excluded
@@ -189,10 +192,12 @@ impl Default for IntelConfig {
             gdelt_poll_secs: 900,
             regime_scan_secs: 1_800,
             scanner_secs: 300,
+            news_poll_secs: 900,
             enable_scanner: true,
             enable_company: true,
             enable_regimes: true,
             enable_meridian: true,
+            enable_news: true,
         }
     }
 }
@@ -334,6 +339,9 @@ impl Config {
         if self.intel.scanner_secs < 60 {
             return Err(CxError::Config("intel.scanner_secs must be >= 60".into()));
         }
+        if self.intel.news_poll_secs < 300 {
+            return Err(CxError::Config("intel.news_poll_secs must be >= 300".into()));
+        }
         if self.ai.autoresearch_secs != 0 && self.ai.autoresearch_secs < 3_600 {
             return Err(CxError::Config(
                 "ai.autoresearch_secs must be 0 (disabled) or >= 3600".into(),
@@ -385,6 +393,19 @@ mod tests {
         cfg.ai.autoresearch_secs = 3_600; // at the floor
         assert!(cfg.validate().is_ok());
         cfg.ai.autoresearch_secs = 21_600; // the default
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn news_defaults_and_cadence_floor() {
+        let cfg = Config::default();
+        assert!(cfg.intel.enable_news, "news must default on");
+        assert_eq!(cfg.intel.news_poll_secs, 900);
+
+        let mut cfg = Config::default();
+        cfg.intel.news_poll_secs = 299; // below the floor
+        assert!(cfg.validate().is_err());
+        cfg.intel.news_poll_secs = 300; // at the floor
         assert!(cfg.validate().is_ok());
     }
 
