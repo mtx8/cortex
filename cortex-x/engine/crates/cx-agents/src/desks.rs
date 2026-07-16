@@ -1109,6 +1109,8 @@ mod tests {
     fn scan_board(rows: Vec<ScanRow>) -> ScanBoard {
         ScanBoard {
             rows,
+            alerts: Vec::new(),
+            weights_used: Default::default(),
             source: "test".into(),
             ts_ms: 0,
         }

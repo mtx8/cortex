@@ -91,7 +91,15 @@ pub fn oos_span_ms(interval_ms: i64) -> i64 {
 /// ratchet its value toward one window's noise. The runner in cortexd keeps
 /// the per-tunable bookkeeping; this predicate is the pure rule.
 pub fn cooldown_over(adopted_newest_ts: i64, newest_ts: i64, interval_ms: i64) -> bool {
-    newest_ts.saturating_sub(adopted_newest_ts) >= oos_span_ms(interval_ms)
+    span_cooldown_over(adopted_newest_ts, newest_ts, oos_span_ms(interval_ms))
+}
+
+/// The generic span form of [`cooldown_over`]: has the newest data advanced
+/// past the adoption point by at least `span_ms`? The scanner-weight runner
+/// passes its own forward-evaluation span (cx-intel's `EVAL_SPAN_BARS` of
+/// D1); the strategy runner specializes to the OOS replay span above.
+pub fn span_cooldown_over(adopted_newest_ts: i64, newest_ts: i64, span_ms: i64) -> bool {
+    newest_ts.saturating_sub(adopted_newest_ts) >= span_ms.max(0)
 }
 
 /// The default recipe: every tunable at its compiled-in default.
@@ -264,6 +272,189 @@ pub fn format_brief(outcomes: &[Outcome], adopted: Option<&Outcome>) -> String {
     out
 }
 
+// ---- SCANNER weight tunables ------------------------------------------------
+//
+// The SCANNER composite weights are tunables too, graded not by trade
+// expectancy but by the FORWARD top-vs-bottom-decile composite return
+// spread over a frozen replay window (cx-intel's `evaluate_weight_variant`
+// — cortexd runs it; cx-agents stays bus-only). Bounds, defaults and key
+// names MIRROR cx-intel scanner.rs (`WEIGHT_MIN`/`WEIGHT_MAX`/
+// `BASE_WEIGHTS`/`ScanWeights::to_map`); the scanner re-clamps every value
+// on application, so a drifted mirror can never move a live weight out of
+// bounds. Tunables are RAW bounded weights — the scanner renormalizes to
+// sum 1 on every application (hard invariant: the composite stays a 0-100
+// blend), so the recipe here never needs to.
+
+/// The `ParamUpdate.strategy` tag scanner-weight adoptions ride under.
+pub const SCANNER_STRATEGY: &str = "scanner";
+/// Hard bounds of one scanner weight (mirror of scanner.rs).
+pub const SCANNER_WEIGHT_MIN: f64 = 0.05;
+pub const SCANNER_WEIGHT_MAX: f64 = 0.50;
+/// Grid step: one weight moves +/- this per variant.
+pub const SCANNER_WEIGHT_STEP: f64 = 0.05;
+/// The five weight keys and their compiled-in defaults (mirror of the
+/// documented W_* blend in scanner.rs).
+pub const SCANNER_WEIGHT_DEFAULTS: [(&str, f64); 5] = [
+    ("w_trend", 0.30),
+    ("w_momentum", 0.30),
+    ("w_breakout", 0.15),
+    ("w_vol_state", 0.15),
+    ("w_meanrev", 0.10),
+];
+
+/// The default scanner recipe: every weight at its compiled-in default.
+pub fn scanner_weights_default() -> BTreeMap<String, f64> {
+    SCANNER_WEIGHT_DEFAULTS
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect()
+}
+
+/// The defaults overlaid with the KNOWN keys of `cfg.strategy_params
+/// ["scanner"]`, clamped to the hard bounds; unknown keys and non-finite
+/// values are ignored — the incumbent recipe the runner starts from (the
+/// same seed the scan task applies at spawn).
+pub fn seeded_scanner_weights(cfg: &ParamMap) -> BTreeMap<String, f64> {
+    let mut out = scanner_weights_default();
+    let Some(params) = cfg.get(SCANNER_STRATEGY) else {
+        return out;
+    };
+    for (key, _) in SCANNER_WEIGHT_DEFAULTS {
+        if let Some(v) = params.get(key).copied().filter(|v| v.is_finite()) {
+            out.insert(
+                key.to_string(),
+                v.clamp(SCANNER_WEIGHT_MIN, SCANNER_WEIGHT_MAX),
+            );
+        }
+    }
+    out
+}
+
+/// The current (clamped) value of one scanner weight in a recipe.
+fn scanner_value_of(weights: &BTreeMap<String, f64>, key: &str, default: f64) -> f64 {
+    weights
+        .get(key)
+        .copied()
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(SCANNER_WEIGHT_MIN, SCANNER_WEIGHT_MAX))
+        .unwrap_or(default)
+}
+
+/// One candidate scanner recipe: a single weight perturbed off the
+/// incumbent. `weights` is the FULL five-key raw recipe (this perturbation
+/// over the incumbent), the exact map an adoption publishes as
+/// `ParamUpdate { strategy: "scanner" }`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeightVariant {
+    pub key: String,
+    pub value: f64,
+    pub weights: BTreeMap<String, f64>,
+}
+
+/// The bounded scanner grid: one weight varied at a time, +/- one step
+/// around the current value, clamped to the hard bounds; candidates that
+/// clamp back onto the current value are skipped. At most 10 variants —
+/// with the single incumbent measurement the evaluator budget stays <= 11
+/// runs per cycle.
+pub fn scanner_weight_grid(current: &BTreeMap<String, f64>) -> Vec<WeightVariant> {
+    let mut out = Vec::new();
+    for (key, default) in SCANNER_WEIGHT_DEFAULTS {
+        let cur = scanner_value_of(current, key, default);
+        for cand in [cur - SCANNER_WEIGHT_STEP, cur + SCANNER_WEIGHT_STEP] {
+            let v = cand.clamp(SCANNER_WEIGHT_MIN, SCANNER_WEIGHT_MAX);
+            if !v.is_finite() || (v - cur).abs() < 1e-9 {
+                continue;
+            }
+            let mut weights = scanner_weights_default();
+            for (k, d) in SCANNER_WEIGHT_DEFAULTS {
+                weights.insert(k.to_string(), scanner_value_of(current, k, d));
+            }
+            weights.insert(key.to_string(), v);
+            out.push(WeightVariant {
+                key: key.to_string(),
+                value: v,
+                weights,
+            });
+        }
+    }
+    out
+}
+
+/// One measured scanner experiment: a variant's forward decile spread vs
+/// the incumbent recipe's on the same frozen data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeightOutcome {
+    pub variant: WeightVariant,
+    pub spread: f64,
+    pub incumbent_spread: f64,
+}
+
+impl WeightOutcome {
+    /// The adoption bar, mirroring [`Outcome::qualifies`]: finite numbers,
+    /// positive variant spread, and more than [`MIN_RELATIVE_EDGE`]
+    /// relative improvement (any positive spread beats a non-positive
+    /// incumbent — the relative margin over a loser is unbounded).
+    pub fn qualifies(&self) -> bool {
+        self.spread.is_finite()
+            && self.incumbent_spread.is_finite()
+            && self.spread > 0.0
+            && (self.incumbent_spread <= 0.0
+                || self.spread > self.incumbent_spread * (1.0 + MIN_RELATIVE_EDGE))
+    }
+}
+
+/// Rank by spread among qualifying outcomes; None when nothing clears the
+/// bar — the incumbent recipe stands. One adoption per cycle.
+pub fn select_weight_adoption(outcomes: &[WeightOutcome]) -> Option<&WeightOutcome> {
+    outcomes
+        .iter()
+        .filter(|o| o.qualifies())
+        .max_by(|a, b| a.spread.total_cmp(&b.spread))
+}
+
+/// The written scanner-research brief (same audit contract as
+/// [`format_brief`]): what was tested, the spreads, and the verdict.
+pub fn format_weight_brief(outcomes: &[WeightOutcome], adopted: Option<&WeightOutcome>) -> String {
+    if outcomes.is_empty() {
+        return "autoresearch(scanner): no experiments this cycle — insufficient stored D1 \
+                history for a forward decile-spread evaluation; incumbent weights stand"
+            .to_string();
+    }
+    let bps = |x: f64| x * 10_000.0;
+    let mut out = String::with_capacity(1024);
+    out.push_str(
+        "autoresearch(scanner) cycle — bounded composite-weight experiments (frozen D1 replay, \
+         forward top-vs-bottom-decile composite return spread):\n",
+    );
+    for o in outcomes.iter().take(11) {
+        out.push_str(&format!(
+            "- {} = {:.2}: spread {:+.1}bps vs incumbent {:+.1}bps\n",
+            o.variant.key,
+            o.variant.value,
+            bps(o.spread),
+            bps(o.incumbent_spread),
+        ));
+    }
+    match adopted {
+        Some(o) => out.push_str(&format!(
+            "ADOPTED {} = {:.2}: spread {:+.1}bps beats incumbent {:+.1}bps by > {:.0}% relative \
+             edge; ParamUpdate (strategy \"scanner\") published (hard-clamped + renormalized on \
+             application).",
+            o.variant.key,
+            o.variant.value,
+            bps(o.spread),
+            bps(o.incumbent_spread),
+            MIN_RELATIVE_EDGE * 100.0,
+        )),
+        None => out.push_str(&format!(
+            "REJECTED all variants: none cleared the adoption bar (positive spread, > {:.0}% \
+             relative edge). Incumbent weights stand.",
+            MIN_RELATIVE_EDGE * 100.0,
+        )),
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +610,161 @@ mod tests {
         assert!(cooldown_over(0, 360 * d1, d1));
         // Clocks running backwards (stale feed) never unlock early.
         assert!(!cooldown_over(adopted_at, adopted_at - m1, m1));
+    }
+
+    // ---- scanner weight tunables --------------------------------------------
+
+    fn weight_outcome(key: &str, value: f64, spread: f64, incumbent: f64) -> WeightOutcome {
+        WeightOutcome {
+            variant: WeightVariant {
+                key: key.into(),
+                value,
+                weights: scanner_weights_default(),
+            },
+            spread,
+            incumbent_spread: incumbent,
+        }
+    }
+
+    #[test]
+    fn scanner_defaults_are_bounded_and_mirror_the_documented_blend() {
+        let defaults = scanner_weights_default();
+        assert_eq!(defaults.len(), 5);
+        for (k, v) in &defaults {
+            assert!(
+                (SCANNER_WEIGHT_MIN..=SCANNER_WEIGHT_MAX).contains(v),
+                "{k} = {v}"
+            );
+        }
+        // The exact mirror of scanner.rs BASE_WEIGHTS.
+        assert_eq!(defaults["w_trend"], 0.30);
+        assert_eq!(defaults["w_momentum"], 0.30);
+        assert_eq!(defaults["w_breakout"], 0.15);
+        assert_eq!(defaults["w_vol_state"], 0.15);
+        assert_eq!(defaults["w_meanrev"], 0.10);
+    }
+
+    #[test]
+    fn scanner_grid_is_bounded_one_weight_at_a_time_and_in_bounds() {
+        let current = scanner_weights_default();
+        let grid = scanner_weight_grid(&current);
+        assert!(grid.len() <= 10, "grid too large: {}", grid.len());
+        assert_eq!(grid.len(), 10, "all defaults sit strictly inside bounds");
+        for v in &grid {
+            assert!(
+                (SCANNER_WEIGHT_MIN..=SCANNER_WEIGHT_MAX).contains(&v.value),
+                "{v:?}"
+            );
+            assert_eq!(v.weights.len(), 5, "full recipe rides every variant");
+            // Exactly ONE key differs from the incumbent; every value in
+            // the full recipe stays inside the hard bounds.
+            let mut diffs = 0;
+            for (key, default) in SCANNER_WEIGHT_DEFAULTS {
+                let vv = scanner_value_of(&v.weights, key, default);
+                assert!(
+                    (SCANNER_WEIGHT_MIN..=SCANNER_WEIGHT_MAX).contains(&vv),
+                    "{v:?}"
+                );
+                if (vv - scanner_value_of(&current, key, default)).abs() > 1e-9 {
+                    diffs += 1;
+                }
+            }
+            assert_eq!(diffs, 1, "one weight at a time: {v:?}");
+        }
+    }
+
+    #[test]
+    fn scanner_grid_skips_candidates_clamped_onto_the_boundary_value() {
+        // Sit w_meanrev at its floor: -step clamps back onto 0.05 and must
+        // be skipped; only +step survives for that weight.
+        let mut current = scanner_weights_default();
+        current.insert("w_meanrev".into(), SCANNER_WEIGHT_MIN);
+        let grid = scanner_weight_grid(&current);
+        let meanrev: Vec<&WeightVariant> =
+            grid.iter().filter(|v| v.key == "w_meanrev").collect();
+        assert_eq!(meanrev.len(), 1, "{meanrev:?}");
+        assert!((meanrev[0].value - (SCANNER_WEIGHT_MIN + SCANNER_WEIGHT_STEP)).abs() < 1e-9);
+        assert_eq!(grid.len(), 9);
+    }
+
+    #[test]
+    fn seeded_scanner_weights_clamp_and_ignore_junk() {
+        let mut cfg = ParamMap::new();
+        let entry = cfg.entry(SCANNER_STRATEGY.to_string()).or_default();
+        entry.insert("w_trend".into(), 0.45);
+        entry.insert("w_momentum".into(), 99.0); // clamped to the cap
+        entry.insert("w_meanrev".into(), f64::NAN); // ignored
+        entry.insert("w_mystery".into(), 0.4); // unknown key ignored
+        let seeded = seeded_scanner_weights(&cfg);
+        assert_eq!(seeded["w_trend"], 0.45);
+        assert_eq!(seeded["w_momentum"], SCANNER_WEIGHT_MAX);
+        assert_eq!(seeded["w_meanrev"], 0.10);
+        assert!(!seeded.contains_key("w_mystery"));
+        // No scanner section at all: pure defaults.
+        assert_eq!(seeded_scanner_weights(&ParamMap::new()), scanner_weights_default());
+    }
+
+    #[test]
+    fn weight_adoption_requires_positivity_and_a_real_spread_edge() {
+        // +25% relative spread edge: qualifies.
+        assert!(weight_outcome("w_trend", 0.35, 0.0125, 0.0100).qualifies());
+        // +19%: below the bar.
+        assert!(!weight_outcome("w_trend", 0.35, 0.0119, 0.0100).qualifies());
+        // Positive variant over a non-positive incumbent: qualifies outright.
+        assert!(weight_outcome("w_trend", 0.35, 0.0002, -0.0010).qualifies());
+        assert!(weight_outcome("w_trend", 0.35, 0.0002, 0.0).qualifies());
+        // Negative variant never qualifies, however bad the incumbent.
+        assert!(!weight_outcome("w_trend", 0.35, -0.0001, -0.0100).qualifies());
+        // Non-finite numbers never qualify.
+        assert!(!weight_outcome("w_trend", 0.35, f64::NAN, 0.0100).qualifies());
+        assert!(!weight_outcome("w_trend", 0.35, 0.0100, f64::NAN).qualifies());
+    }
+
+    #[test]
+    fn select_weight_adoption_picks_the_best_qualifier_or_none() {
+        let a = weight_outcome("w_trend", 0.35, 0.0150, 0.0100);
+        let b = weight_outcome("w_momentum", 0.25, 0.0300, 0.0100);
+        let c = weight_outcome("w_meanrev", 0.15, -0.0400, 0.0100); // negative
+        let outcomes = [a.clone(), b.clone(), c];
+        let picked = select_weight_adoption(&outcomes).expect("b qualifies");
+        assert_eq!(picked, &b, "highest qualifying spread wins");
+        let weak = weight_outcome("w_trend", 0.35, 0.0110, 0.0100);
+        assert!(select_weight_adoption(&[weak]).is_none());
+        assert!(select_weight_adoption(&[]).is_none());
+    }
+
+    #[test]
+    fn weight_brief_narrates_spreads_and_the_verdict() {
+        let a = weight_outcome("w_trend", 0.35, 0.0150, 0.0100);
+        let brief = format_weight_brief(&[a.clone()], Some(&a));
+        assert!(brief.contains("autoresearch(scanner) cycle"), "{brief}");
+        assert!(brief.contains("w_trend = 0.35"), "{brief}");
+        assert!(brief.contains("spread +150.0bps vs incumbent +100.0bps"), "{brief}");
+        assert!(brief.contains("ADOPTED w_trend = 0.35"), "{brief}");
+
+        let brief = format_weight_brief(&[a], None);
+        assert!(brief.contains("REJECTED all variants"), "{brief}");
+        assert!(brief.contains("Incumbent weights stand"), "{brief}");
+
+        let brief = format_weight_brief(&[], None);
+        assert!(brief.contains("no experiments this cycle"), "{brief}");
+    }
+
+    #[test]
+    fn span_cooldown_is_the_generic_rule_under_cooldown_over() {
+        assert!(span_cooldown_over(0, 100, 100));
+        assert!(!span_cooldown_over(0, 99, 100));
+        // Clocks running backwards (stale feed) never unlock early.
+        assert!(!span_cooldown_over(100, 0, 100));
+        // A non-positive span never blocks.
+        assert!(span_cooldown_over(0, 0, 0));
+        assert!(span_cooldown_over(0, 0, -5));
+        // cooldown_over is exactly the OOS-span specialization.
+        let m1 = 60_000i64;
+        assert_eq!(
+            cooldown_over(0, 359 * m1, m1),
+            span_cooldown_over(0, 359 * m1, oos_span_ms(m1))
+        );
     }
 
     #[test]

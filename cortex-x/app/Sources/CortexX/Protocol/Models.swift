@@ -607,10 +607,24 @@ struct ScanRow: Codable, Equatable, Identifiable {
     var id: String { symbol }
 }
 
+/// One flag-transition alert: a flag newly raised on a symbol this scan
+/// cycle (absent last cycle, present now).
+struct ScanAlert: Codable, Equatable, Identifiable {
+    var symbol: String
+    var flag: String
+    var ts_ms: Int64
+    var id: String { "\(symbol)-\(flag)-\(ts_ms)" }
+}
+
 struct ScanBoard: Codable, Equatable {
     var rows: [ScanRow]
     var source: String
     var ts_ms: Int64
+    /// NEW OPTIONAL wire fields — older engines omit them, so both decode
+    /// to nil rather than failing the whole frame.
+    var alerts: [ScanAlert]? = nil
+    /// Factor weights the engine used to blend the composite this cycle.
+    var weights_used: [String: Double]? = nil
 }
 
 // MARK: - Intel: NEWS (headlines + earnings-cadence estimates)

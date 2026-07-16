@@ -11,7 +11,8 @@ import SwiftUI
 
 /// Preset screens over the scan board. Each preset is filter + intrinsic
 /// ordering; explicit column sorting (ScanSort) applies afterwards.
-enum ScanPreset: String, CaseIterable {
+/// Codable (raw string) so saved screens can persist the active preset.
+enum ScanPreset: String, CaseIterable, Codable {
     case all, topMomentum, breakoutWatch, oversold, volMovers, equities, crypto
 
     var title: String {
@@ -58,8 +59,9 @@ enum ScanPreset: String, CaseIterable {
     }
 }
 
-/// Table columns in display order.
-enum ScanColumn: String, CaseIterable {
+/// Table columns in display order. Codable (raw string) so filters and
+/// saved screens can persist column references.
+enum ScanColumn: String, CaseIterable, Codable {
     case symbol, composite, momentum, trend, breakout, meanrev, volState,
          rsi, zscore, ret1w, ret1m, ret3m, dist52wHi, volSurge, regime, flags
 
@@ -89,7 +91,7 @@ enum ScanColumn: String, CaseIterable {
 
 /// One sort order over the scan table. nil readings sort last in BOTH
 /// directions — absent data never floats to the top of a screen.
-struct ScanSort: Equatable {
+struct ScanSort: Equatable, Codable {
     var column: ScanColumn
     var ascending: Bool
 
@@ -208,8 +210,12 @@ private enum ScanCol {
     static let ratio: CGFloat = 48
     static let regime: CGFloat = 92
     static let flags: CGFloat = 200
+    static let news: CGFloat = 16
+    static let ai: CGFloat = 18
     static let company: CGFloat = 18
     static let gap: CGFloat = 8
+    /// Trailing affordance cluster: news glyph + AI explain + company.
+    static let trailing: CGFloat = news + ai + company + gap * 2
 
     static func width(_ column: ScanColumn) -> CGFloat {
         switch column {
@@ -233,10 +239,10 @@ private enum ScanCol {
         }
     }
 
-    /// Total content width: columns + gaps + trailing company affordance.
+    /// Total content width: columns + gaps + the trailing affordances.
     static var minWidth: CGFloat {
         let cols = ScanColumn.allCases.map(width).reduce(0, +)
-        return cols + gap * CGFloat(ScanColumn.allCases.count) + company + 24
+        return cols + gap * CGFloat(ScanColumn.allCases.count) + trailing + 24
     }
 }
 
@@ -247,6 +253,16 @@ struct ScannerView: View {
     @State private var search = ""
     @State private var preset: ScanPreset = .all
     @State private var sort: ScanSort?
+    // Filter builder + saved screens.
+    @State private var filters: [ScanFilter] = []
+    @State private var filtersOpen = false
+    @State private var screens = ScreenStore()
+    @State private var screenName = ""
+    // Alert stream.
+    @State private var alertsOpen = true
+    @State private var lastSeenAlertID: String?
+    // Copilot request id whose answer renders inline; nil = dismissed.
+    @State private var aiRequestId: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -254,10 +270,27 @@ struct ScannerView: View {
             Divider().overlay(Theme.line)
             presetRow
             Divider().overlay(Theme.line)
-            if let board = model.scanBoard, !board.rows.isEmpty {
-                table(board)
-            } else {
-                emptyState
+            filterBar
+            Divider().overlay(Theme.line)
+            if let message = aiMessage {
+                ScanAnswerCard(message: message) { aiRequestId = nil }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                Divider().overlay(Theme.line)
+            }
+            HStack(alignment: .top, spacing: 0) {
+                Group {
+                    if let board = model.scanBoard, !board.rows.isEmpty {
+                        table(board)
+                    } else {
+                        emptyState
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                if alertsOpen {
+                    Divider().overlay(Theme.line)
+                    alertStrip
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -277,12 +310,72 @@ struct ScannerView: View {
                         .foregroundStyle(Theme.dim)
                         .lineLimit(1)
                 }
+                if let weights = ScanWeights.summary(board.weights_used) {
+                    Text("weights")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Theme.dim)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: Theme.chipRadius)
+                                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+                        )
+                        .help(weights)
+                }
             }
             Spacer()
+            if let board = model.scanBoard, !board.rows.isEmpty {
+                aiPicksChip(board)
+            }
             searchField
+            alertsToggle
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    // MARK: AI (copilot) affordances
+
+    private var aiDisabled: Bool {
+        model.pendingAsk != nil || model.connection != .connected
+    }
+
+    /// The cortex message answering OUR request — the same thread the
+    /// copilot panel shows, observed here by request id.
+    private var aiMessage: CopilotMessage? {
+        guard let aiRequestId else { return nil }
+        return model.copilot.first { $0.id == aiRequestId && $0.role == .cortex }
+    }
+
+    private func aiPicksChip(_ board: ScanBoard) -> some View {
+        Button {
+            aiRequestId = model.askCopilot(ScanAI.picksPrompt(rows: displayRows(board)))
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "wand.and.stars")
+                    .font(.system(size: 8, weight: .semibold))
+                Text("AI PICKS")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.8)
+                    .lineLimit(1)
+            }
+            .foregroundStyle(aiDisabled ? Theme.dim : Theme.ember)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(Theme.panel)
+            .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.chipRadius)
+                    .strokeBorder(
+                        aiDisabled ? Theme.line : Theme.ember.opacity(0.5),
+                        lineWidth: Theme.hairline
+                    )
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(aiDisabled)
+        .help("ask cortex for 2-3 picks from the top rows — the answer also lands in the copilot thread")
     }
 
     private var searchField: some View {
@@ -316,6 +409,237 @@ struct ScannerView: View {
             RoundedRectangle(cornerRadius: Theme.chipRadius)
                 .strokeBorder(Theme.line, lineWidth: Theme.hairline)
         )
+    }
+
+    // MARK: Alert stream
+
+    private var hasUnseenAlerts: Bool {
+        guard let first = model.scanAlerts.first else { return false }
+        return first.id != lastSeenAlertID
+    }
+
+    /// Strip toggle; while collapsed it carries the unseen-alert ember dot.
+    private var alertsToggle: some View {
+        Button {
+            alertsOpen.toggle()
+        } label: {
+            Image(systemName: "sidebar.right")
+                .font(.system(size: 11))
+                .foregroundStyle(alertsOpen ? Theme.ember : Theme.dim)
+                .overlay(alignment: .topTrailing) {
+                    if !alertsOpen && hasUnseenAlerts {
+                        Circle()
+                            .fill(Theme.ember)
+                            .frame(width: 4, height: 4)
+                            .offset(x: 3, y: -3)
+                    }
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(alertsOpen ? "hide alert stream" : "show alert stream")
+        .animation(DeckMotion.ease(), value: alertsOpen)
+    }
+
+    private var alertStrip: some View {
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 6) {
+                    SectionLabel(text: "alerts")
+                    if hasUnseenAlerts { ScanPulseDot() }
+                    Spacer()
+                    if !model.scanAlerts.isEmpty {
+                        Text("\(model.scanAlerts.count)")
+                            .font(.system(size: 10))
+                            .monospacedDigit()
+                            .foregroundStyle(Theme.dim)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                Divider().overlay(Theme.line)
+                if model.scanAlerts.isEmpty {
+                    VStack(spacing: 6) {
+                        Text("no alerts yet")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Theme.dim)
+                        Text("flag transitions land here when a scan cycle raises a new flag on a symbol")
+                            .font(.system(size: 9))
+                            .foregroundStyle(Theme.dim)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView(showsIndicators: false) {
+                        LazyVStack(spacing: 0) {
+                            ForEach(model.scanAlerts) { alert in
+                                ScanAlertRow(alert: alert, now: context.date) {
+                                    model.selectSymbol(alert.symbol)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(width: 240)
+        .task(id: model.scanAlerts.first?.id) {
+            // The pulse rides a few seconds while the strip is visible,
+            // then the newest alert counts as seen.
+            try? await Task.sleep(for: .seconds(4))
+            lastSeenAlertID = model.scanAlerts.first?.id
+        }
+    }
+
+    // MARK: Filter builder & saved screens
+
+    private var filterBar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Button {
+                    filtersOpen.toggle()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 7, weight: .bold))
+                            .rotationEffect(.degrees(filtersOpen ? 90 : 0))
+                        Text("FILTERS")
+                            .font(.system(size: 10, weight: .semibold))
+                            .tracking(0.8)
+                        if !filters.isEmpty {
+                            Text("\(filters.count)")
+                                .font(.system(size: 9, weight: .semibold))
+                                .monospacedDigit()
+                                .foregroundStyle(Theme.ember)
+                        }
+                    }
+                    .foregroundStyle(filters.isEmpty ? Theme.dim : Theme.bone)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("numeric filters, AND-combined with the active preset")
+                .animation(DeckMotion.ease(), value: filtersOpen)
+                if !filtersOpen && !filters.isEmpty {
+                    Text(filters.map { "\($0.column.title) \($0.op.title) \(ScanFormat.raw($0.value, decimals: 1))" }
+                        .joined(separator: " · "))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(Theme.dim)
+                        .lineLimit(1)
+                }
+                Spacer()
+                screensMenu
+            }
+            if filtersOpen {
+                ForEach($filters) { $filter in
+                    ScanFilterRowView(filter: $filter) {
+                        filters.removeAll { $0.id == filter.id }
+                    }
+                }
+                HStack(spacing: 10) {
+                    Button {
+                        filters.append(ScanFilter())
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "plus")
+                                .font(.system(size: 8, weight: .semibold))
+                            Text("ADD FILTER")
+                                .font(.system(size: 9, weight: .semibold))
+                                .tracking(0.8)
+                        }
+                        .foregroundStyle(Theme.dim)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("add a filter row")
+                    Spacer()
+                    saveScreenField
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    /// Load/delete menu over the saved screens.
+    private var screensMenu: some View {
+        Menu {
+            if screens.screens.isEmpty {
+                Button("no saved screens") {}.disabled(true)
+            }
+            ForEach(screens.screens) { screen in
+                Menu(screen.name) {
+                    Button("load") { load(screen) }
+                    Button("delete", role: .destructive) { screens.delete(id: screen.id) }
+                }
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "square.stack")
+                    .font(.system(size: 8, weight: .semibold))
+                Text("SCREENS")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.8)
+                if !screens.screens.isEmpty {
+                    Text("\(screens.screens.count)")
+                        .font(.system(size: 9, weight: .semibold))
+                        .monospacedDigit()
+                }
+            }
+            .foregroundStyle(Theme.dim)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("saved screens: load or delete")
+    }
+
+    private var saveScreenField: some View {
+        HStack(spacing: 6) {
+            TextField("screen name", text: $screenName)
+                .textFieldStyle(.plain)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(Theme.bone)
+                .frame(width: 120)
+                .onSubmit(saveScreen)
+            Button {
+                saveScreen()
+            } label: {
+                Text("SAVE")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(saveDisabled ? Theme.dim : Theme.ember)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(saveDisabled)
+            .help("save the current preset + filters + sort as a screen")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Theme.panel)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.chipRadius)
+                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+        )
+    }
+
+    private var saveDisabled: Bool {
+        screenName.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    private func saveScreen() {
+        guard screens.save(name: screenName, preset: preset, filters: filters, sort: sort) != nil
+        else { return }
+        screenName = ""
+    }
+
+    private func load(_ screen: SavedScreen) {
+        preset = screen.preset
+        filters = screen.filters
+        sort = screen.sort
+        if !screen.filters.isEmpty { filtersOpen = true }
     }
 
     // MARK: Presets
@@ -381,6 +705,7 @@ struct ScannerView: View {
 
     private func displayRows(_ board: ScanBoard) -> [ScanRow] {
         var rows = preset.apply(board.rows)
+        rows = ScanFilter.apply(filters, to: rows)
         let query = search.trimmingCharacters(in: .whitespaces)
         if !query.isEmpty {
             rows = rows.filter { $0.symbol.localizedCaseInsensitiveContains(query) }
@@ -393,6 +718,10 @@ struct ScannerView: View {
 
     private func table(_ board: ScanBoard) -> some View {
         let rows = displayRows(board)
+        let headlines = ScanNews.latestHeadlines(
+            model.newsBoard?.items ?? [],
+            nowMs: Int64(Date().timeIntervalSince1970 * 1000)
+        )
         return ScrollView([.horizontal, .vertical]) {
             LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
                 Section {
@@ -403,15 +732,25 @@ struct ScannerView: View {
                             .padding(16)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     } else {
-                        ForEach(rows) { row in
+                        ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                             ScanRowView(
                                 row: row,
+                                headline: headlines[row.symbol],
+                                aiDisabled: aiDisabled,
                                 openChart: {
                                     model.selectSymbol(row.symbol)
                                     model.centerMode = .chart
                                 },
                                 openCompany: {
                                     model.openCompany(row.symbol)
+                                },
+                                openNews: {
+                                    model.centerMode = .news
+                                },
+                                explain: {
+                                    aiRequestId = model.askCopilot(
+                                        ScanAI.explainPrompt(row: row, rank: index + 1, of: rows.count)
+                                    )
                                 }
                             )
                         }
@@ -429,7 +768,7 @@ struct ScannerView: View {
             ForEach(ScanColumn.allCases, id: \.self) { col in
                 headerCell(col)
             }
-            Spacer(minLength: ScanCol.company)
+            Spacer(minLength: ScanCol.trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -469,8 +808,13 @@ struct ScannerView: View {
 
 private struct ScanRowView: View {
     let row: ScanRow
+    /// Latest in-window headline title for this symbol; nil = no news glyph.
+    let headline: String?
+    let aiDisabled: Bool
     let openChart: () -> Void
     let openCompany: () -> Void
+    let openNews: () -> Void
+    let explain: () -> Void
     @State private var hovering = false
 
     var body: some View {
@@ -492,6 +836,8 @@ private struct ScanRowView: View {
                 rawCell(ScanFormat.ratio(row.vol_surge), present: row.vol_surge != nil, width: ScanCol.ratio)
                 regimeCell
                 flagsCell
+                newsCell
+                aiCell
                 companyCell
             }
             .padding(.horizontal, 12)
@@ -560,16 +906,7 @@ private struct ScanRowView: View {
         let display = ScanFormat.flagsDisplay(row.flags)
         return HStack(spacing: 4) {
             ForEach(display.shown, id: \.self) { flag in
-                Text(flag)
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(Theme.ember)
-                    .lineLimit(1)
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 2)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: Theme.chipRadius)
-                            .strokeBorder(Theme.ember.opacity(0.45), lineWidth: Theme.hairline)
-                    )
+                ScanFlagChip(text: flag)
             }
             if display.overflow > 0 {
                 Text("+\(display.overflow)")
@@ -580,6 +917,42 @@ private struct ScanRowView: View {
         }
         .frame(width: ScanCol.flags, alignment: .leading)
         .help(row.flags.isEmpty ? "no flags" : row.flags.joined(separator: " · "))
+    }
+
+    /// News-aware marker: shown whenever the symbol has a headline in the
+    /// trailing 24h. Tooltip = the latest title; click jumps to NEWS.
+    /// Always visible (it signals data, not an action). Fixed width.
+    private var newsCell: some View {
+        Group {
+            if let headline {
+                Button(action: openNews) {
+                    Image(systemName: "newspaper")
+                        .font(.system(size: 9))
+                        .foregroundStyle(Theme.dim)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(headline)
+            } else {
+                Color.clear
+            }
+        }
+        .frame(width: ScanCol.news, height: 12)
+    }
+
+    /// Hover affordance: ask cortex to explain this row's rank inline.
+    private var aiCell: some View {
+        Button(action: explain) {
+            Image(systemName: "wand.and.stars")
+                .font(.system(size: 9))
+                .foregroundStyle(aiDisabled ? Theme.dim : Theme.ember)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(aiDisabled)
+        .help("ask cortex why this ranks here")
+        .opacity(hovering ? 1 : 0)
+        .frame(width: ScanCol.ai, height: 12)
     }
 
     /// Hover affordance into COMPANY intelligence — equities only, matching
@@ -601,5 +974,85 @@ private struct ScanRowView: View {
             }
         }
         .frame(width: ScanCol.company, height: 12)
+    }
+}
+
+// MARK: - Filter row
+
+/// One filter-builder row: field menu, op menu, numeric value field, remove.
+private struct ScanFilterRowView: View {
+    @Binding var filter: ScanFilter
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Menu {
+                ForEach(ScanFilter.fields, id: \.self) { column in
+                    Button(column.title) { filter.column = column }
+                }
+            } label: {
+                chipLabel(filter.column.title, width: 72)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("field")
+            Menu {
+                ForEach(ScanFilter.Op.allCases, id: \.self) { op in
+                    Button(op.title) { filter.op = op }
+                }
+            } label: {
+                chipLabel(filter.op.title, width: 30)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("operator")
+            TextField("value", value: $filter.value, format: .number)
+                .textFieldStyle(.plain)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(Theme.bone)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 56)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(Theme.panel)
+                .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.chipRadius)
+                        .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+                )
+            Button(action: remove) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(Theme.dim)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("remove filter")
+            Spacer()
+        }
+    }
+
+    private func chipLabel(_ text: String, width: CGFloat) -> some View {
+        HStack(spacing: 3) {
+            Text(text)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(Theme.bone)
+                .lineLimit(1)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 6, weight: .bold))
+                .foregroundStyle(Theme.dim)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .frame(minWidth: width, alignment: .leading)
+        .background(Theme.panel)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.chipRadius)
+                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+        )
     }
 }

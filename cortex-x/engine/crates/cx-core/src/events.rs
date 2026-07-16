@@ -556,10 +556,34 @@ pub struct ScanRow {
     pub last_close: f64,
 }
 
+/// One SCANNER alert: a flag that TRANSITIONED ON for `symbol` on this scan
+/// cycle (absent on the previous cycle, present now). Steady-state flags
+/// never re-alert — one alert per transition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScanAlert {
+    pub symbol: String,
+    /// One of the [`ScanRow`] flag strings.
+    pub flag: String,
+    pub ts_ms: i64,
+}
+
 /// The SCANNER board, republished every scan cycle.
+///
+/// WIRE COMPAT: `alerts` and `weights_used` are additive, `#[serde(default)]`
+/// fields — payloads without them still decode (empty), and clients (Swift)
+/// must treat them as optional-with-default, never required.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanBoard {
     pub rows: Vec<ScanRow>,
+    /// Flags that transitioned ON this cycle vs the previous one; empty on
+    /// the first cycle (nothing to diff) and whenever no flag changed.
+    #[serde(default)]
+    pub alerts: Vec<ScanAlert>,
+    /// The composite weights this board was actually ranked with (post
+    /// regime shift + hard clamp + renormalization), keyed
+    /// w_trend / w_momentum / w_breakout / w_vol_state / w_meanrev.
+    #[serde(default)]
+    pub weights_used: BTreeMap<String, f64>,
     pub source: String,
     pub ts_ms: i64,
 }
@@ -761,6 +785,41 @@ mod tests {
         assert!(!ev.is_critical(), "news must never starve ticks");
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"type\":\"news\""));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn scan_board_new_fields_are_additive_and_default() {
+        // A pre-alerts/weights payload (no `alerts`, no `weights_used`)
+        // must still decode — the fields are additive with defaults, so an
+        // old engine's frame or a stored snapshot never breaks a client.
+        let old = r#"{"type":"scan","rows":[],"source":"cortex scan","ts_ms":7}"#;
+        let ev: EngineEvent = serde_json::from_str(old).unwrap();
+        let EngineEvent::Scan(board) = &ev else {
+            panic!("decoded wrong variant");
+        };
+        assert!(board.alerts.is_empty());
+        assert!(board.weights_used.is_empty());
+        assert!(!ev.is_critical(), "scan boards must never starve ticks");
+
+        // Populated new fields round-trip.
+        let mut weights_used = BTreeMap::new();
+        weights_used.insert("w_trend".to_string(), 0.30);
+        let ev = EngineEvent::Scan(ScanBoard {
+            rows: vec![],
+            alerts: vec![ScanAlert {
+                symbol: "NVDA".into(),
+                flag: "breakout setup".into(),
+                ts_ms: 8,
+            }],
+            weights_used,
+            source: "cortex scan".into(),
+            ts_ms: 8,
+        });
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"scan\""));
+        assert!(json.contains("\"flag\":\"breakout setup\""));
         let back: EngineEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
     }

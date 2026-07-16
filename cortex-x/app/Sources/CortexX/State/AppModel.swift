@@ -65,6 +65,9 @@ final class AppModel {
     private(set) var regimeBoard: RegimeBoard?
     private(set) var geoPulse: GeoPulse?
     private(set) var scanBoard: ScanBoard?
+    /// SCANNER flag-transition alert feed, accumulated newest-first across
+    /// board publishes (capped; republished alerts never duplicate).
+    private(set) var scanAlerts: [ScanAlert] = []
     private(set) var newsBoard: NewsBoard?
     /// Universe symbols beyond the watchlist — searchable, D1-chartable.
     private(set) var searchUniverse: [String] = []
@@ -388,7 +391,7 @@ final class AppModel {
         case .geo(let pulse):
             geoPulse = pulse
         case .scan(let board):
-            scanBoard = board
+            applyScanBoard(board)
         case .news(let board):
             newsBoard = board
         case .history(let slice):
@@ -451,12 +454,22 @@ final class AppModel {
         for f in snap.feeds ?? [] { feeds[f.feed] = f }
         if let r = snap.regimes { regimeBoard = r }
         if let g = snap.geo { geoPulse = g }
-        if let s = snap.scan { scanBoard = s }
+        if let s = snap.scan { applyScanBoard(s) }
         if let n = snap.news { newsBoard = n }
         for (symbol, byInterval) in rebuilt {
             if sessionOpen[symbol] == nil {
                 sessionOpen[symbol] = byInterval[.m1]?.last?.close ?? byInterval[.h1]?.last?.close
             }
+        }
+    }
+
+    /// Every scan-board arrival (frame or snapshot) replaces the board and
+    /// folds its flag-transition alerts into the accumulated feed. The pure
+    /// merge (order, dedupe, cap) lives in ScanAlertFeed for tests.
+    private func applyScanBoard(_ board: ScanBoard) {
+        scanBoard = board
+        if let alerts = board.alerts, !alerts.isEmpty {
+            scanAlerts = ScanAlertFeed.accumulate(scanAlerts, incoming: alerts)
         }
     }
 

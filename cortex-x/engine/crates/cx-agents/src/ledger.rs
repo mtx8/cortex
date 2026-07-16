@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 
 use cx_core::events::{
     AccountSnapshot, AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, NewsBoard,
-    Position, RegimeBoard, RegimeState, RiskStatus, StrategySignal,
+    Position, RegimeBoard, RegimeState, RiskStatus, ScanBoard, StrategySignal,
 };
 use cx_core::store::BarStore;
 use cx_core::types::{Interval, Severity};
@@ -76,6 +76,9 @@ pub(crate) struct LedgerState {
     /// Latest REGIMES board (cx-intel scanner); render shows breadth plus
     /// configured symbols only.
     pub regime_board: Option<RegimeBoard>,
+    /// Latest SCANNER board (cx-intel); render is ONE bounded line — the
+    /// top-3 composite names plus the cycle's alert count.
+    pub scan: Option<ScanBoard>,
     /// Latest MERIDIAN pulse (cx-intel); render caps forces/chains/assets.
     pub geo: Option<GeoPulse>,
     /// Latest NEWS board (cx-intel); render caps headlines and shows only
@@ -210,6 +213,7 @@ impl ContextLedger {
             }
             EngineEvent::Macro(m) => st.macro_snap = Some(m.clone()),
             EngineEvent::RegimeMap(b) => st.regime_board = Some(b.clone()),
+            EngineEvent::Scan(b) => st.scan = Some(b.clone()),
             EngineEvent::Geo(g) => st.geo = Some(g.clone()),
             EngineEvent::News(n) => st.news = Some(n.clone()),
             EngineEvent::FeedStatus(f) => {
@@ -464,6 +468,26 @@ impl ContextLedger {
                         fin(row.drawdown_pct) * 100.0,
                     ));
                 }
+            }
+        }
+
+        // SCANNER: one bounded line — the strongest composites (rows arrive
+        // composite-sorted from cx-intel) and how many flags transitioned
+        // this cycle. Omitted while no board exists: zero tokens.
+        if let Some(s) = &st.scan {
+            if !s.rows.is_empty() {
+                let top = s
+                    .rows
+                    .iter()
+                    .take(3)
+                    .map(|r| format!("{} {:.0}", snip(&r.symbol, 12), fin(r.composite)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str("\n=== SCANNER ===\n");
+                out.push_str(&format!(
+                    "top composite: {top} | alerts this cycle: {}\n",
+                    s.alerts.len()
+                ));
             }
         }
 
@@ -1044,6 +1068,80 @@ mod tests {
         assert!(!within_days("2026-07-15", now, 14)); // yesterday
         assert!(!within_days("not-a-date", now, 14));
         assert!(!within_days("", now, 14));
+    }
+
+    fn scan_board() -> EngineEvent {
+        let scan_row = |sym: &str, composite: f64| cx_core::events::ScanRow {
+            symbol: sym.into(),
+            asset_class: "equity".into(),
+            composite,
+            momentum: 50.0,
+            trend: 50.0,
+            breakout: 50.0,
+            meanrev: 50.0,
+            vol_state: 50.0,
+            rsi_14: None,
+            zscore_20: None,
+            kalman_tstat: None,
+            ret_1w: None,
+            ret_1m: None,
+            ret_3m: None,
+            dist_52w_high: None,
+            vol_surge: None,
+            regime: None,
+            flags: vec![],
+            last_close: 100.0,
+        };
+        EngineEvent::Scan(ScanBoard {
+            rows: vec![
+                scan_row("NVDA", 88.2),
+                scan_row("AAPL", 74.6),
+                scan_row("MSFT", 71.0),
+                scan_row("SPY", 55.0), // 4th: never renders
+            ],
+            alerts: vec![
+                cx_core::events::ScanAlert {
+                    symbol: "NVDA".into(),
+                    flag: "breakout setup".into(),
+                    ts_ms: 1,
+                },
+                cx_core::events::ScanAlert {
+                    symbol: "MSFT".into(),
+                    flag: "volume spike".into(),
+                    ts_ms: 1,
+                },
+            ],
+            weights_used: BTreeMap::new(),
+            source: "test".into(),
+            ts_ms: 1_000_000,
+        })
+    }
+
+    #[test]
+    fn scanner_line_renders_top3_and_alert_count() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        // No board yet: no section, zero tokens.
+        assert!(!ledger.render(&[]).contains("=== SCANNER ==="));
+
+        ledger.apply(&scan_board());
+        let out = ledger.render(&[]);
+        assert!(out.contains("=== SCANNER ==="), "{out}");
+        assert!(
+            out.contains("top composite: NVDA 88, AAPL 75, MSFT 71 | alerts this cycle: 2"),
+            "{out}"
+        );
+        assert!(!out.contains("SPY 55"), "4th row leaked: {out}");
+
+        // An empty board (no rows) renders nothing either.
+        ledger.apply(&EngineEvent::Scan(ScanBoard {
+            rows: vec![],
+            alerts: vec![],
+            weights_used: BTreeMap::new(),
+            source: "test".into(),
+            ts_ms: 2_000_000,
+        }));
+        assert!(!ledger.render(&[]).contains("=== SCANNER ==="));
     }
 
     #[test]

@@ -81,6 +81,23 @@ async fn main() -> anyhow::Result<()> {
     // Intel squadron: REGIMES scanner + MERIDIAN poller (COMPANY is on-demand).
     cx_intel::start(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
 
+    // AUTORESEARCH (scanner weights): the composite-weight self-optimization
+    // loop — same contract as the strategy loop above (frozen data, bounded
+    // grid, cooldown, one adoption per cycle, ParamUpdate audit + research
+    // Thought) but graded by `cx_intel::scanner::evaluate_weight_variant`
+    // (forward decile spread) instead of cx-sim. Adoptions ride the bus
+    // ONLY: the scan task subscribes to ParamUpdate strategy=="scanner" and
+    // applies them over its clamped route (hard bounds compiled in cx-intel).
+    if cfg.ai.autoresearch_secs > 0 && cfg.intel.enable_scanner {
+        spawn_scanner_autoresearch(
+            Arc::clone(&bus),
+            Arc::clone(&store),
+            cx_intel::regimes::universe(&cfg),
+            cfg.strategy_params.clone(),
+            cfg.ai.autoresearch_secs,
+        );
+    }
+
     // Snapshot assembly + websocket gateway.
     let snap = SnapshotSrc::new(
         cfg.symbols.clone(),
@@ -377,6 +394,216 @@ fn spawn_autoresearch(
     });
 }
 
+/// The SCANNER-weight AUTORESEARCH runner, mirroring [`spawn_autoresearch`].
+/// Each cycle (same validated cadence):
+/// 1. FREEZES the exact D1 window every evaluation reads
+///    ([`freeze_scan_store`]) so incumbent and variants grade against
+///    identical bars while the live store keeps mutating;
+/// 2. builds the bounded grid (<= 10 one-weight variants) around the
+///    current recipe via `ar::scanner_weight_grid`, skipping weights still
+///    in their post-adoption cooldown ([`bars_since_adoption`] must reach
+///    `EVAL_SPAN_BARS` frozen D1 bars — counted in BARS, not calendar
+///    time, since equity D1 bars only print on trading days — so a weight
+///    is not re-graded until the D1 data no longer overlaps the window
+///    that adopted it; the cooldown is per KEY, so consecutive cycles can
+///    still adopt OTHER keys off overlapping windows — a known, accepted
+///    residual);
+/// 3. measures the incumbent once and every variant via
+///    `cx_intel::scanner::evaluate_weight_variant` (spawn_blocking — never
+///    on the async hot path; <= 11 evaluations per cycle);
+/// 4. adopts at most ONE winner per cycle when it clears the bar (positive
+///    forward top-vs-bottom-decile spread, > 20% relative edge): publishes
+///    `ParamUpdate { strategy: "scanner" }` — the scan task applies it over
+///    its clamped bus route (hard bounds compiled in cx-intel) — and always
+///    publishes the written brief as a Thought (squadron "research").
+fn spawn_scanner_autoresearch(
+    bus: Arc<cx_core::Bus>,
+    store: Arc<BarStore>,
+    universe: Vec<String>,
+    cfg_params: std::collections::BTreeMap<String, std::collections::BTreeMap<String, f64>>,
+    cadence_secs: u64,
+) {
+    use cx_agents::autoresearch as ar;
+    use cx_intel::scanner;
+
+    tokio::spawn(async move {
+        let mut current = ar::seeded_scanner_weights(&cfg_params);
+        // Anti-ratchet bookkeeping: weight key -> newest frozen D1 bar ts
+        // at that weight's last adoption.
+        let mut last_adopt: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        let cadence = std::time::Duration::from_secs(cadence_secs);
+        loop {
+            // Sleep first: evaluations need stored D1 history worth grading.
+            tokio::time::sleep(cadence).await;
+
+            let frozen = Arc::new(freeze_scan_store(&store, &universe));
+            let newest = newest_scan_bar(&frozen, &universe);
+
+            let variants: Vec<ar::WeightVariant> = ar::scanner_weight_grid(&current)
+                .into_iter()
+                .filter(|v| match last_adopt.get(&v.key) {
+                    Some(&adopted_ts) => {
+                        let bars = bars_since_adoption(&frozen, &universe, adopted_ts);
+                        let over = bars >= scanner::EVAL_SPAN_BARS;
+                        if !over {
+                            tracing::debug!(
+                                key = %v.key,
+                                bars_since = bars,
+                                need = scanner::EVAL_SPAN_BARS,
+                                "scanner autoresearch cooldown: evaluation window still \
+                                 overlaps the last adoption; skipping variant"
+                            );
+                        }
+                        over
+                    }
+                    None => true,
+                })
+                .collect();
+
+            // The incumbent grades exactly once, on the same frozen data
+            // every variant sees. Without an incumbent spread nothing can
+            // be compared — the (empty-outcomes) brief still publishes.
+            let incumbent: Option<f64> = {
+                let (frozen2, universe2) = (Arc::clone(&frozen), universe.clone());
+                let weights = scanner::BASE_WEIGHTS.with_params(&current);
+                match tokio::task::spawn_blocking(move || {
+                    scanner::evaluate_weight_variant(&frozen2, &universe2, &weights)
+                })
+                .await
+                {
+                    Ok(spread) => spread,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "scanner incumbent evaluation failed");
+                        None
+                    }
+                }
+            };
+
+            let mut outcomes: Vec<ar::WeightOutcome> = Vec::new();
+            if let Some(incumbent_spread) = incumbent {
+                for variant in variants {
+                    let (frozen2, universe2) = (Arc::clone(&frozen), universe.clone());
+                    let weights = scanner::BASE_WEIGHTS.with_params(&variant.weights);
+                    let spread = match tokio::task::spawn_blocking(move || {
+                        scanner::evaluate_weight_variant(&frozen2, &universe2, &weights)
+                    })
+                    .await
+                    {
+                        Ok(Some(spread)) => spread,
+                        Ok(None) => continue, // thin data: no fabricated spread
+                        Err(e) => {
+                            tracing::warn!(error = %e, "scanner variant evaluation failed");
+                            continue;
+                        }
+                    };
+                    outcomes.push(ar::WeightOutcome {
+                        variant,
+                        spread,
+                        incumbent_spread,
+                    });
+                }
+            }
+
+            let adopted = ar::select_weight_adoption(&outcomes).cloned();
+            let brief = ar::format_weight_brief(&outcomes, adopted.as_ref());
+            bus.publish(cx_core::EngineEvent::Thought(cx_core::events::AgentThought {
+                agent: "autoresearch".into(),
+                squadron: "research".into(),
+                severity: if outcomes.is_empty() {
+                    cx_core::types::Severity::Info
+                } else {
+                    cx_core::types::Severity::Insight
+                },
+                text: brief,
+                tags: vec!["autoresearch".into(), "research".into(), "scanner".into()],
+                confidence: if adopted.is_some() { 0.7 } else { 0.5 },
+                symbol: None,
+                ts_ms: cx_core::time::now_ms(),
+            }));
+
+            if let Some(winner) = adopted {
+                current = winner.variant.weights.clone();
+                if let Some(ts) = newest {
+                    last_adopt.insert(winner.variant.key.clone(), ts);
+                }
+                // The audit/palace/UI record AND the application path: the
+                // scan task consumes this over its clamped bus route.
+                bus.publish(cx_core::EngineEvent::ParamUpdate(
+                    cx_core::events::ParamUpdate {
+                        strategy: ar::SCANNER_STRATEGY.into(),
+                        params: current.clone(),
+                        source: "autoresearch".into(),
+                        rationale: format!(
+                            "{} -> {:.2}: forward top-vs-bottom-decile composite return \
+                             spread {:+.1}bps vs incumbent {:+.1}bps on the frozen D1 window \
+                             (>20% relative edge; clamped + renormalized on application)",
+                            winner.variant.key,
+                            winner.variant.value,
+                            winner.spread * 10_000.0,
+                            winner.incumbent_spread * 10_000.0,
+                        ),
+                        ts_ms: cx_core::time::now_ms(),
+                    },
+                ));
+            }
+        }
+    });
+}
+
+/// Snapshot the exact D1 bars every scanner-weight evaluation this cycle
+/// reads into a private store — `evaluate_weight_variant` fetches
+/// `recent(sym, D1, HISTORY + EVAL_SPAN_BARS)`, so freezing precisely that
+/// window makes incumbent/variant grades deterministic and mutually
+/// comparable while the live store keeps mutating.
+fn freeze_scan_store(store: &BarStore, symbols: &[String]) -> BarStore {
+    let frozen = BarStore::new();
+    let depth = cx_intel::scanner::HISTORY + cx_intel::scanner::EVAL_SPAN_BARS;
+    for sym in symbols {
+        for bar in store.recent(sym, cx_core::types::Interval::D1, depth) {
+            frozen.push(bar);
+        }
+    }
+    frozen
+}
+
+/// Newest D1 bar ts across the scan universe — the clock the scanner-weight
+/// cooldown runs on. None when nothing is stored yet.
+fn newest_scan_bar(store: &BarStore, symbols: &[String]) -> Option<i64> {
+    symbols
+        .iter()
+        .filter_map(|s| {
+            store
+                .recent(s, cx_core::types::Interval::D1, 1)
+                .last()
+                .map(|b| b.ts_open_ms)
+        })
+        .max()
+}
+
+/// Frozen D1 bars STRICTLY newer than a scanner weight's adoption stamp,
+/// maxed across the scan universe — the scanner-weight cooldown clock.
+/// Counted in BARS, not wall time: equity D1 bars only print on trading
+/// days (~5/week), so `EVAL_SPAN_BARS` of calendar days would unlock ~50
+/// days early while a third of the evaluation bars still overlapped the
+/// window that adopted the weight — exactly the re-fit the cooldown
+/// exists to prevent. The max mirrors [`newest_scan_bar`], which stamps
+/// adoptions with the newest D1 bar anywhere in the universe.
+fn bars_since_adoption(store: &BarStore, symbols: &[String], adopted_ts: i64) -> usize {
+    let depth = cx_intel::scanner::HISTORY + cx_intel::scanner::EVAL_SPAN_BARS;
+    symbols
+        .iter()
+        .map(|s| {
+            store
+                .recent(s, cx_core::types::Interval::D1, depth)
+                .iter()
+                .filter(|b| b.ts_open_ms > adopted_ts)
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// The configured EQUITY (bare-ticker) symbols — the only underlyings the
 /// options-chain refresh loop targets; dashed crypto products have no
 /// listed CBOE chain.
@@ -535,6 +762,87 @@ mod tests {
         assert_eq!(equity_symbols(&symbols), vec!["SPY", "NVDA"]);
         assert!(equity_symbols(&["BTC-USD".to_string()]).is_empty());
         assert!(equity_symbols(&[]).is_empty());
+    }
+
+    #[test]
+    fn frozen_scan_store_is_immune_to_live_mutation_and_grades_deterministically() {
+        let live = BarStore::new();
+        let symbols: Vec<String> = (0..5).map(|i| format!("S{i}")).collect();
+        for (i, sym) in symbols.iter().enumerate() {
+            let g = 1.0 + (i as f64 - 2.0) / 100.0; // -2% .. +2% per bar
+            for d in 0..300i64 {
+                live.push(bar(sym, Interval::D1, d * 86_400_000, 100.0 * g.powi(d as i32)));
+            }
+        }
+        let frozen = freeze_scan_store(&live, &symbols);
+        assert_eq!(frozen.recent("S0", Interval::D1, 2_000).len(), 300);
+
+        // Live keeps mutating; the frozen snapshot must not move.
+        for d in 300..340i64 {
+            live.push(bar("S0", Interval::D1, d * 86_400_000, 999.0));
+        }
+        assert_eq!(frozen.recent("S0", Interval::D1, 2_000).len(), 300);
+
+        // Grading the frozen store twice yields the identical spread — the
+        // determinism incumbent/variant comparisons rely on.
+        let w = cx_intel::scanner::BASE_WEIGHTS;
+        let s1 = cx_intel::scanner::evaluate_weight_variant(&frozen, &symbols, &w);
+        let s2 = cx_intel::scanner::evaluate_weight_variant(&frozen, &symbols, &w);
+        assert!(s1.is_some(), "fixture has depth for evaluation");
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn newest_scan_bar_tracks_the_freshest_d1_across_the_universe() {
+        let store = BarStore::new();
+        let symbols = vec!["AAPL".to_string(), "NVDA".to_string()];
+        assert_eq!(newest_scan_bar(&store, &symbols), None);
+        store.push(bar("AAPL", Interval::D1, 86_400_000, 200.0));
+        assert_eq!(newest_scan_bar(&store, &symbols), Some(86_400_000));
+        store.push(bar("NVDA", Interval::D1, 2 * 86_400_000, 100.0));
+        assert_eq!(newest_scan_bar(&store, &symbols), Some(2 * 86_400_000));
+        // Symbols outside the universe are ignored; M1 bars are not D1.
+        store.push(bar("BTC-USD", Interval::D1, 9 * 86_400_000, 1.0));
+        assert_eq!(newest_scan_bar(&store, &symbols), Some(2 * 86_400_000));
+    }
+
+    #[test]
+    fn scanner_cooldown_counts_bars_not_calendar_days() {
+        const DAY: i64 = 86_400_000;
+        let store = BarStore::new();
+        let symbols = vec!["AAPL".to_string(), "NVDA".to_string()];
+        // Nothing stored: zero bars have printed since any adoption.
+        assert_eq!(bars_since_adoption(&store, &symbols, 0), 0);
+
+        // AAPL prints ONLY on trading days (weekends skipped): 10 bars
+        // spread over 12 calendar days.
+        let mut aapl_ts = Vec::new();
+        for week in 0..2i64 {
+            for day in 0..5i64 {
+                let t = (week * 7 + day) * DAY;
+                store.push(bar("AAPL", Interval::D1, t, 100.0));
+                aapl_ts.push(t);
+            }
+        }
+        // Adopted at the newest bar: nothing strictly newer counts.
+        assert_eq!(bars_since_adoption(&store, &symbols, *aapl_ts.last().unwrap()), 0);
+        // Adopted before everything: all 10 bars count.
+        assert_eq!(bars_since_adoption(&store, &symbols, -1), 10);
+        // Adopted mid-window (day-2 bar): only the 7 BARS after the stamp
+        // count — a calendar-day clock over the same stretch would read 9
+        // days and unlock early across the weekend gap.
+        assert_eq!(bars_since_adoption(&store, &symbols, 2 * DAY), 7);
+
+        // Max across the universe: a symbol that prints every calendar
+        // day (crypto-style) has MORE bars since the stamp — max governs,
+        // mirroring the newest_scan_bar adoption stamp.
+        for d in 0..14i64 {
+            store.push(bar("NVDA", Interval::D1, d * DAY, 50.0));
+        }
+        assert_eq!(bars_since_adoption(&store, &symbols, 2 * DAY), 11);
+        // Symbols outside the universe never count.
+        store.push(bar("BTC-USD", Interval::D1, 30 * DAY, 1.0));
+        assert_eq!(bars_since_adoption(&store, &symbols, 2 * DAY), 11);
     }
 
     #[test]
