@@ -62,6 +62,18 @@ struct FilingsView: View {
         .task(id: model.filingsQuery) {
             if !model.filingsQuery.isEmpty { query = model.filingsQuery }
         }
+        // Open the tab and it pulls the current equity's filings straight
+        // away — no blank prompt. Crypto has no SEC filer, so it keeps the
+        // "search a ticker" state. Guarded so a loaded report is never
+        // clobbered and EDGAR isn't re-hit on every re-entry.
+        .onAppear {
+            guard model.filingsReport == nil, !model.filingsLoading else { return }
+            let seed = model.filingsQuery.isEmpty ? model.selectedSymbol : model.filingsQuery
+            if AppModel.isEquity(seed) {
+                query = seed
+                model.requestFilings(query: seed, text: "")
+            }
+        }
     }
 
     // MARK: Actions

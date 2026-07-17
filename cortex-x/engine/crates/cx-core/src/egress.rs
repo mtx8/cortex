@@ -57,7 +57,10 @@ impl Egress {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(TIMEOUT_SECS))
-            .user_agent("cortex-x/0.1 (MTX Labs)")
+            // SEC's edge (Akamai) 403s a generic UA — their access policy
+            // requires a contact-identifying User-Agent. A role alias, never
+            // a personal address. Harmless for every other allowlisted host.
+            .user_agent("MTX Labs Cortex-X admin@mtxlabs.io")
             .build()
             .expect("reqwest client");
         Self { client }
