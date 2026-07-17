@@ -10,6 +10,7 @@
 
 pub mod causal_rules;
 pub mod company;
+pub mod filings;
 pub mod meridian;
 pub mod news;
 pub mod regimes;
@@ -57,4 +58,13 @@ pub fn serve_company(bus: Arc<Bus>, symbol: String, enabled: bool) {
         let profile = company::fetch_company(&egress, &symbol).await;
         bus.publish(EngineEvent::Company(profile));
     });
+}
+
+/// Handle `Command::GetFilings`: browse a filer's SEC EDGAR filings (submissions
+/// list, or a full-text search when `text` is set). Spawns, resolves the query,
+/// fetches through the hardened egress, and publishes exactly one
+/// `EngineEvent::Filings`. Never errors outward — an unresolved query or a
+/// failed/degraded fetch is disclosed in the report's `note`.
+pub fn serve_filings(bus: Arc<Bus>, query: String, form_filter: String, text: String) {
+    filings::serve_filings(bus, query, form_filter, text);
 }

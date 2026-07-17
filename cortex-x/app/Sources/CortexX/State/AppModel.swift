@@ -56,7 +56,7 @@ final class AppModel {
     private(set) var feeds: [String: FeedStatus] = [:]
 
     // MARK: Center sections
-    enum CenterMode: String, CaseIterable { case chart, scanner, news, company, options, foundry, regimes, meridian }
+    enum CenterMode: String, CaseIterable { case chart, scanner, news, filings, company, options, foundry, regimes, meridian }
     var centerMode: CenterMode = .chart
     private(set) var optionsChain: OptionsChain?
     private(set) var chainLoading = false
@@ -81,6 +81,16 @@ final class AppModel {
     private(set) var newsBoard: NewsBoard?
     /// Universe symbols beyond the watchlist — searchable, D1-chartable.
     private(set) var searchUniverse: [String] = []
+
+    // MARK: Filings (SEC EDGAR — dedicated FILINGS section)
+    /// The most recent filings pull, answered on demand (like COMPANY) and
+    /// never part of the snapshot.
+    private(set) var filingsReport: FilingsReport?
+    private(set) var filingsLoading = false
+    /// The last query submitted — so the FILINGS search field can reflect the
+    /// active symbol when arriving via `openFilings`.
+    private(set) var filingsQuery: String = ""
+    private var filingsRequestSeq = 0
 
     // MARK: Copilot
     private(set) var copilot: [CopilotMessage] = []
@@ -208,6 +218,34 @@ final class AppModel {
         companySymbol = symbol.uppercased()
         centerMode = .company
         requestCompany(companySymbol)
+    }
+
+    /// Jump to the dedicated FILINGS section for a symbol and pull its EDGAR
+    /// filings. Called from the COMPANY board's "all filings" affordance.
+    func openFilings(_ symbol: String) {
+        centerMode = .filings
+        requestFilings(query: symbol.uppercased())
+    }
+
+    /// Ask the engine for a symbol/company's SEC EDGAR filings. `formFilter`
+    /// and `text` are optional server-side narrowing (empty = none); the form-
+    /// type chips filter the loaded result client-side. Re-request on every
+    /// submit — stale reports must never masquerade as current. A watchdog
+    /// clears the spinner if the engine never answers (e.g. an older build
+    /// without FILINGS support). Blank queries are ignored.
+    func requestFilings(query: String, formFilter: String = "", text: String = "") {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return }
+        filingsQuery = q
+        filingsLoading = true
+        filingsRequestSeq += 1
+        let seq = filingsRequestSeq
+        send(.getFilings(query: q, formFilter: formFilter, text: text))
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(20))
+            guard let self, self.filingsRequestSeq == seq, self.filingsLoading else { return }
+            self.filingsLoading = false
+        }
     }
 
     /// Select a symbol for the chart/watchlist context. If the current
@@ -455,6 +493,17 @@ final class AppModel {
             applyScanBoard(board)
         case .news(let board):
             newsBoard = board
+        case .filings(let report):
+            // Answered on demand, one tokio task per request with no ordering
+            // guarantee — a slow full-text pull for an earlier query can land
+            // AFTER a fast submissions pull for a newer one. Guard by the
+            // echoed query (the engine returns it verbatim; `filingsQuery`
+            // holds the latest request) so a superseded response can never
+            // overwrite the current entity or clear the spinner for a request
+            // still in flight. The watchdog handles the never-answered case.
+            guard report.query == filingsQuery else { break }
+            filingsReport = report
+            filingsLoading = false
         case .history(let slice):
             guard !slice.bars.isEmpty else {
                 // The engine answered "no data" (unresolvable ticker or a

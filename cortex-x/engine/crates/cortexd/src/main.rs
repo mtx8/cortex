@@ -187,6 +187,13 @@ async fn main() -> anyhow::Result<()> {
             Command::GetCompany { symbol } => {
                 cx_intel::serve_company(Arc::clone(&bus), symbol, cfg.intel.enable_company);
             }
+            Command::GetFilings {
+                query,
+                form_filter,
+                text,
+            } => {
+                cx_intel::serve_filings(Arc::clone(&bus), query, form_filter, text);
+            }
             Command::GetHistory { symbol } => {
                 let bus = Arc::clone(&bus);
                 let store = Arc::clone(&store);

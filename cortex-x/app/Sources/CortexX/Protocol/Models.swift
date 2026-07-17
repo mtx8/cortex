@@ -732,6 +732,114 @@ struct HistorySlice: Codable, Equatable {
     var ts_ms: Int64
 }
 
+// MARK: - Intel: FILINGS (SEC EDGAR, on-demand)
+
+/// One SEC EDGAR filing entry for the dedicated FILINGS section. A richer
+/// sibling of `Filing` (which stays a slim COMPANY-card reference) — this
+/// carries the fields the standalone filings table needs. Mirror of the engine
+/// `FilingEntry` contract type, field-for-field (serde snake_case). All fields
+/// decode defensively (absent → the natural empty/zero) so a leaner engine
+/// payload never fails the whole frame.
+struct FilingEntry: Codable, Equatable, Identifiable {
+    /// The form type — "10-K", "10-Q", "8-K", "S-1", "DEF 14A", "4", …
+    var form: String
+    /// filingDate, "YYYY-MM-DD".
+    var filed: String
+    /// Period of report (reportDate), "YYYY-MM-DD"; may be "".
+    var report_date: String
+    /// Accession number "0000320193-26-000005".
+    var accession: String
+    /// primaryDocument filename "aapl-20251228.htm"; may be "".
+    var primary_doc: String
+    /// Direct link to the primary document (opened through the http(s) guard).
+    var primary_doc_url: String
+    /// The filing index page (fallback target when `primary_doc` is empty).
+    var filing_index_url: String
+    /// primaryDocDescription or a human form name; may be "".
+    var description: String
+    /// 8-K item codes as CSV; may be "".
+    var items: String
+    /// Primary-document size in bytes; 0 when unknown.
+    var size: UInt64
+    /// isXBRL == 1.
+    var is_xbrl: Bool
+
+    /// Accession is the natural unique key; fall back to a composite when a
+    /// lean payload omitted it, so ForEach identity stays stable.
+    var id: String {
+        accession.isEmpty ? "\(form)-\(filed)-\(primary_doc_url)" : accession
+    }
+}
+
+extension FilingEntry {
+    enum CodingKeys: String, CodingKey {
+        case form, filed, report_date, accession, primary_doc, primary_doc_url
+        case filing_index_url, description, items, size, is_xbrl
+    }
+
+    // Every field decodes defensively so a leaner engine payload (or an
+    // absent optional) yields the natural empty/zero rather than failing the
+    // frame. Declared in an extension so the memberwise initializer survives
+    // for construction/tests; `encode(to:)` stays synthesized.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        form = try c.decodeIfPresent(String.self, forKey: .form) ?? ""
+        filed = try c.decodeIfPresent(String.self, forKey: .filed) ?? ""
+        report_date = try c.decodeIfPresent(String.self, forKey: .report_date) ?? ""
+        accession = try c.decodeIfPresent(String.self, forKey: .accession) ?? ""
+        primary_doc = try c.decodeIfPresent(String.self, forKey: .primary_doc) ?? ""
+        primary_doc_url = try c.decodeIfPresent(String.self, forKey: .primary_doc_url) ?? ""
+        filing_index_url = try c.decodeIfPresent(String.self, forKey: .filing_index_url) ?? ""
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        items = try c.decodeIfPresent(String.self, forKey: .items) ?? ""
+        size = try c.decodeIfPresent(UInt64.self, forKey: .size) ?? 0
+        is_xbrl = try c.decodeIfPresent(Bool.self, forKey: .is_xbrl) ?? false
+    }
+}
+
+/// The FILINGS report: a resolved SEC entity plus its recent filings,
+/// answered on demand (like COMPANY) — never part of the snapshot. Mirror of
+/// the engine `FilingsReport` contract type. `note` carries an honest
+/// explanation whenever the pull was partial or unresolved.
+struct FilingsReport: Codable, Equatable {
+    var query: String
+    /// Zero-padded 10-digit CIK "0000320193" ("" if unresolved).
+    var cik: String
+    /// Resolved entity name "Apple Inc." ("" if unresolved).
+    var name: String
+    /// Resolved ticker or "".
+    var ticker: String
+    var filings: [FilingEntry]
+    /// "SEC EDGAR submissions (data.sec.gov)" or
+    /// "SEC EDGAR full-text (efts.sec.gov)".
+    var source: String
+    /// "" or an honest explanation ("ticker not found in SEC map",
+    /// "fetch failed", …).
+    var note: String
+    var ts_ms: Int64
+}
+
+extension FilingsReport {
+    enum CodingKeys: String, CodingKey {
+        case query, cik, name, ticker, filings, source, note, ts_ms
+    }
+
+    // Defensive decode: absent string/array fields default to empty so a
+    // partial engine payload still renders (with an honest empty state)
+    // rather than failing the frame. Memberwise init preserved via extension.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        query = try c.decodeIfPresent(String.self, forKey: .query) ?? ""
+        cik = try c.decodeIfPresent(String.self, forKey: .cik) ?? ""
+        name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
+        ticker = try c.decodeIfPresent(String.self, forKey: .ticker) ?? ""
+        filings = try c.decodeIfPresent([FilingEntry].self, forKey: .filings) ?? []
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
+        note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
+        ts_ms = try c.decodeIfPresent(Int64.self, forKey: .ts_ms) ?? 0
+    }
+}
+
 // MARK: - Snapshot (initial state replay from cortexd)
 
 struct EngineSnapshot: Codable {
@@ -781,6 +889,7 @@ enum ServerFrame {
     case scan(ScanBoard)
     case news(NewsBoard)
     case history(HistorySlice)
+    case filings(FilingsReport)
     case gap(dropped: Int)
     case error(detail: String)
     case unknown(type: String)
@@ -820,6 +929,7 @@ enum ServerFrame {
         case "scan": return .scan(try dec.decode(ScanBoard.self, from: data))
         case "news": return .news(try dec.decode(NewsBoard.self, from: data))
         case "history": return .history(try dec.decode(HistorySlice.self, from: data))
+        case "filings": return .filings(try dec.decode(FilingsReport.self, from: data))
         case "gap":
             struct Gap: Codable { var dropped: Int }
             return .gap(dropped: try dec.decode(Gap.self, from: data).dropped)
@@ -847,6 +957,7 @@ enum Command {
     case runSimulation
     case getCompany(symbol: String)
     case getHistory(symbol: String)
+    case getFilings(query: String, formFilter: String, text: String)
 
     func encoded() throws -> Data {
         var obj: [String: Any]
@@ -880,6 +991,13 @@ enum Command {
             obj = ["cmd": "get_company", "symbol": symbol]
         case let .getHistory(symbol):
             obj = ["cmd": "get_history", "symbol": symbol]
+        case let .getFilings(query, formFilter, text):
+            // form_filter + text are always present (empty string when unused)
+            // so the wire shape matches the contract exactly.
+            obj = [
+                "cmd": "get_filings", "query": query,
+                "form_filter": formFilter, "text": text,
+            ]
         }
         return try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])
     }

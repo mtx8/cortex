@@ -371,6 +371,10 @@ struct CompanyView: View {
                             .numeric(size: 10)
                             .foregroundStyle(Theme.dim)
                     }
+                    Spacer(minLength: 8)
+                    if AppModel.isEquity(p.symbol) {
+                        AllFilingsButton { model.openFilings(p.symbol) }
+                    }
                 }
                 if ordered.isEmpty {
                     Text("no filings from EDGAR")
@@ -524,6 +528,34 @@ private struct RelationCard: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         .panel(highlighted: clickable && hovering)
+    }
+}
+
+// MARK: - All-filings affordance
+
+/// A quiet "all filings →" link in the LATEST FILINGS header: jumps to the
+/// dedicated FILINGS section for this symbol (model.openFilings). Dim, ember on
+/// hover — never a standing accent.
+private struct AllFilingsButton: View {
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Text("ALL FILINGS")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(0.8)
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .foregroundStyle(hovering ? Theme.ember : Theme.dim)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(DeckMotion.ease(), value: hovering)
+        .help("open the dedicated EDGAR filings desk for this symbol")
     }
 }
 

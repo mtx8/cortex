@@ -57,9 +57,45 @@ pub enum Command {
     GetCompany {
         symbol: String,
     },
+    /// Browse a filer's SEC EDGAR filings (dedicated, richer than the COMPANY
+    /// card's cadence summary). `query` is a ticker, company name, or raw CIK;
+    /// `form_filter` keeps only forms with that prefix (empty = all);
+    /// `text` runs an EDGAR full-text search over the filer's filings (empty =
+    /// the recent-submissions list). Answered via `EngineEvent::Filings`.
+    GetFilings {
+        query: String,
+        form_filter: String,
+        text: String,
+    },
     /// Fetch daily history for any symbol (searched tickers outside the
     /// configured feed set). Answered via `EngineEvent::History`.
     GetHistory {
         symbol: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_filings_decodes_from_the_wire_contract() {
+        // The exact client -> server frame the Swift mirror sends.
+        let raw = r#"{"cmd":"get_filings","query":"AAPL","form_filter":"10-K","text":""}"#;
+        let cmd: Command = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            cmd,
+            Command::GetFilings {
+                query: "AAPL".into(),
+                form_filter: "10-K".into(),
+                text: String::new(),
+            }
+        );
+        // Round-trips with the `cmd` tag and snake_case fields.
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"cmd\":\"get_filings\""));
+        assert!(json.contains("\"form_filter\":\"10-K\""));
+        let back: Command = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cmd);
+    }
 }

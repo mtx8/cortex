@@ -6,10 +6,12 @@ import XCTest
 
 @MainActor
 final class ShellTests: XCTestCase {
-    func testCenterModeHasEightCasesInRailOrder() {
+    func testCenterModeHasNineCasesInRailOrder() {
+        // FILINGS sits right after NEWS — the icon rail derives its cmd-number
+        // shortcuts from this order, so the two must stay in lockstep.
         XCTAssertEqual(
             AppModel.CenterMode.allCases,
-            [.chart, .scanner, .news, .company, .options, .foundry, .regimes, .meridian]
+            [.chart, .scanner, .news, .filings, .company, .options, .foundry, .regimes, .meridian]
         )
     }
 

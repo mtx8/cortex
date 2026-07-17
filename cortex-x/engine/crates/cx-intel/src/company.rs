@@ -230,7 +230,9 @@ pub(crate) fn parse_submissions_filings(cik: u64, raw: &str) -> Vec<Filing> {
 
 /// Resolve a ticker to its CIK, refreshing the shared map at most once
 /// per 24h. `Ok(None)` = ticker unknown to the SEC (honest, not an error).
-async fn cik_for(egress: &Egress, symbol: &str) -> Result<Option<u64>, CxError> {
+/// `pub(crate)` so the dedicated FILINGS browser reuses the SAME cached
+/// ticker map (`symbol` must already be trimmed/uppercased).
+pub(crate) async fn cik_for(egress: &Egress, symbol: &str) -> Result<Option<u64>, CxError> {
     if let Some(map) = cached_cik_map() {
         return Ok(map.get(symbol).copied());
     }

@@ -451,6 +451,62 @@ pub struct CompanyProfile {
     pub ts_ms: i64,
 }
 
+/// One filing row for the dedicated FILINGS browser — richer than
+/// [`Filing`] (which the COMPANY card carries as a cadence summary). Every
+/// field is a plain string/number so the Swift mirror can decode it 1:1; a
+/// field the source did not supply is "" / 0 / false, never a fabricated
+/// value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilingEntry {
+    /// Filing form type, e.g. "10-K", "10-Q/A", "8-K", "S-1", "DEF 14A".
+    pub form: String,
+    /// Filing date, "YYYY-MM-DD".
+    pub filed: String,
+    /// Period of report ("YYYY-MM-DD"); "" for forms with no reporting period.
+    pub report_date: String,
+    /// Dashed accession number, e.g. "0000320193-26-000005".
+    pub accession: String,
+    /// Primary document filename, e.g. "aapl-20251228.htm"; may be "".
+    pub primary_doc: String,
+    /// Direct link to the primary document on www.sec.gov; "" when unknown.
+    pub primary_doc_url: String,
+    /// Link to the filing's index page on www.sec.gov (always resolvable).
+    pub filing_index_url: String,
+    /// Human description (EDGAR primaryDocDescription, else the form's human
+    /// name); may be "".
+    pub description: String,
+    /// 8-K item codes as a CSV, e.g. "2.02,9.01"; may be "".
+    pub items: String,
+    /// Primary document size in bytes (0 when the source did not report it).
+    pub size: u64,
+    /// True when the filing is XBRL-tagged (EDGAR isXBRL == 1).
+    pub is_xbrl: bool,
+}
+
+/// A dedicated SEC EDGAR FILINGS report for one filer, served on demand via
+/// `Command::GetFilings`. Sources are always disclosed; an unresolved query
+/// or a failed fetch yields an empty list plus an honest `note`, never an
+/// error. Answered on demand like COMPANY — never part of the snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FilingsReport {
+    /// The original query as asked (ticker, company name, or raw CIK).
+    pub query: String,
+    /// Zero-padded 10-digit CIK, e.g. "0000320193"; "" when unresolved.
+    pub cik: String,
+    /// Filer legal name, e.g. "Apple Inc."; "" when unresolved.
+    pub name: String,
+    /// Resolved ticker, e.g. "AAPL"; "" when unknown.
+    pub ticker: String,
+    pub filings: Vec<FilingEntry>,
+    /// e.g. "SEC EDGAR submissions (data.sec.gov)" or
+    /// "SEC EDGAR full-text (efts.sec.gov)".
+    pub source: String,
+    /// "" on success, else an honest explanation ("ticker not found in SEC
+    /// map", "submissions fetch failed", ...).
+    pub note: String,
+    pub ts_ms: i64,
+}
+
 /// Secular market state of one symbol, classified on daily bars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -732,6 +788,7 @@ pub enum EngineEvent {
     AiAnswer(AiAnswer),
     ParamUpdate(ParamUpdate),
     Company(CompanyProfile),
+    Filings(FilingsReport),
     RegimeMap(RegimeBoard),
     Geo(GeoPulse),
     Scan(ScanBoard),
@@ -773,6 +830,7 @@ impl EngineEvent {
             EngineEvent::AiAnswer(_) => "ai_answer",
             EngineEvent::ParamUpdate(_) => "param_update",
             EngineEvent::Company(_) => "company",
+            EngineEvent::Filings(_) => "filings",
             EngineEvent::RegimeMap(_) => "regime_map",
             EngineEvent::Geo(_) => "geo",
             EngineEvent::Scan(_) => "scan",
@@ -962,6 +1020,46 @@ mod tests {
         assert!(json.contains("\"type\":\"company\""));
         assert!(json.contains("\"public_float_usd\":2600000000000.0"));
         assert!(json.contains("\"filings_source\":\"sec-edgar submissions\""));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn filings_event_is_type_tagged_and_not_critical() {
+        let ev = EngineEvent::Filings(FilingsReport {
+            query: "AAPL".into(),
+            cik: "0000320193".into(),
+            name: "Apple Inc.".into(),
+            ticker: "AAPL".into(),
+            filings: vec![FilingEntry {
+                form: "10-K".into(),
+                filed: "2026-02-15".into(),
+                report_date: "2025-12-28".into(),
+                accession: "0000320193-26-000005".into(),
+                primary_doc: "aapl-20251228.htm".into(),
+                primary_doc_url:
+                    "https://www.sec.gov/Archives/edgar/data/320193/000032019326000005/aapl-20251228.htm"
+                        .into(),
+                filing_index_url:
+                    "https://www.sec.gov/Archives/edgar/data/320193/000032019326000005/0000320193-26-000005-index.htm"
+                        .into(),
+                description: "Annual report".into(),
+                items: String::new(),
+                size: 1_200_000,
+                is_xbrl: true,
+            }],
+            source: "SEC EDGAR submissions (data.sec.gov)".into(),
+            note: String::new(),
+            ts_ms: 9,
+        });
+        assert_eq!(ev.kind(), "filings");
+        assert!(!ev.is_critical(), "filings reports must never starve ticks");
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"filings\""));
+        // snake_case field names the Swift mirror decodes 1:1.
+        assert!(json.contains("\"report_date\":\"2025-12-28\""));
+        assert!(json.contains("\"is_xbrl\":true"));
+        assert!(json.contains("\"filing_index_url\""));
         let back: EngineEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
     }

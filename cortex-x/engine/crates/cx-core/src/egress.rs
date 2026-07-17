@@ -18,6 +18,9 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     "query1.finance.yahoo.com",
     "data.sec.gov",
     "www.sec.gov",
+    // EDGAR full-text search (intel/FILINGS dedicated browser). Same hardened
+    // egress: https-only, no redirects, byte cap, timeout; keyless, no secrets.
+    "efts.sec.gov",
     "api.gdeltproject.org",
     // Read-only news/RSS + Atom feeds (intel/NEWS side only). Same hardened
     // egress: https-only, no redirects, byte cap, timeout. No credentials
@@ -166,6 +169,22 @@ mod tests {
         assert!(Egress::check_url("http://home.treasury.gov/x").is_err());
         assert!(Egress::check_url("https://home.treasury.gov/x").is_ok());
         assert!(Egress::check_url("http://127.0.0.1:11434/v1/chat").is_ok());
+    }
+
+    #[test]
+    fn sec_edgar_hosts_are_allowlisted_https_only() {
+        // The FILINGS browser reaches submissions (data.sec.gov), archives
+        // (www.sec.gov) and full-text search (efts.sec.gov) — all https-only.
+        for host in ["data.sec.gov", "www.sec.gov", "efts.sec.gov"] {
+            assert!(
+                Egress::check_url(&format!("https://{host}/LATEST/search-index?q=x")).is_ok(),
+                "{host} should be allowlisted"
+            );
+            assert!(
+                Egress::check_url(&format!("http://{host}/x")).is_err(),
+                "{host} must be https-only"
+            );
+        }
     }
 
     #[test]
