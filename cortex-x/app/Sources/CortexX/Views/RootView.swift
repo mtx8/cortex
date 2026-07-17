@@ -209,6 +209,7 @@ private struct ReopenHandle: View {
 /// Panel visibility toggles live at their panels (PanelCollapseButton).
 private struct IconRail: View {
     @Environment(AppModel.self) private var model
+    @State private var hovered: AppModel.CenterMode?
 
     private static let sections: [(mode: AppModel.CenterMode, icon: String, name: String)] = [
         (.chart, "chart.xyaxis.line", "terminal"),
@@ -241,16 +242,17 @@ private struct IconRail: View {
         digit: Int
     ) -> some View {
         let active = model.centerMode == section.mode
+        let isHovered = hovered == section.mode
         return Button {
             model.centerMode = section.mode
         } label: {
             Image(systemName: section.icon)
                 .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(active ? Theme.ember : Theme.dim)
+                .foregroundStyle(active || isHovered ? Theme.ember : Theme.dim)
                 .frame(width: 28, height: 28)
                 .background(
                     RoundedRectangle(cornerRadius: 6)
-                        .fill(active ? Theme.emberTint : .clear)
+                        .fill(active ? Theme.emberTint : (isHovered ? Theme.panelHi : .clear))
                 )
                 .frame(width: 40, height: 36)
                 .contentShape(Rectangle())
@@ -258,6 +260,33 @@ private struct IconRail: View {
         .buttonStyle(.plain)
         .keyboardShortcut(KeyEquivalent(Character("\(digit)")), modifiers: .command)
         .help(section.name)
+        .onHover { hovered = $0 ? section.mode : (hovered == section.mode ? nil : hovered) }
+        // Instant on-brand title flyout to the right of the icon (the native
+        // .help tooltip is slow and easy to miss). Non-interactive; drawn
+        // above siblings so it never gets clipped by the next row.
+        .overlay(alignment: .leading) {
+            if isHovered {
+                Text(section.name.uppercased())
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(Theme.bone)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(Theme.panel)
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+                    )
+                    .offset(x: 46)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+        }
+        .zIndex(isHovered ? 1 : 0)
+        .animation(DeckMotion.ease(), value: isHovered)
     }
 
     private var connectionDot: some View {
