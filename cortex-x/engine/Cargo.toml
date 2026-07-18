@@ -6,6 +6,7 @@ members = [
     "crates/cx-md",
     "crates/cx-risk",
     "crates/cx-oms",
+    "crates/cx-broker",
     "crates/cx-sim",
     "crates/cx-strategy",
     "crates/cx-agents",
@@ -37,12 +38,18 @@ toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip"] }
 async-trait = "0.1"
 dirs = "5"
+# Interactive Brokers TWS API client. OPTIONAL and behind the cx-broker
+# `ibkr` feature only — the default workspace build never compiles it, so the
+# paper path carries no live-broker dependency. Async (tokio) API to match the
+# engine runtime. See docs/IBKR.md.
+ibapi = { version = "3.3", default-features = false, features = ["async"] }
 
 cx-core = { path = "crates/cx-core" }
 cx-ta = { path = "crates/cx-ta" }
 cx-md = { path = "crates/cx-md" }
 cx-risk = { path = "crates/cx-risk" }
 cx-oms = { path = "crates/cx-oms" }
+cx-broker = { path = "crates/cx-broker" }
 cx-sim = { path = "crates/cx-sim" }
 cx-strategy = { path = "crates/cx-strategy" }
 cx-agents = { path = "crates/cx-agents" }

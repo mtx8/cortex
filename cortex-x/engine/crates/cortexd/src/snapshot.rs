@@ -12,6 +12,7 @@ use cx_core::events::{
     AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, NewsBoard, OrderUpdate,
     RegimeBoard, ScanBoard,
 };
+use cx_broker::Broker;
 use cx_core::store::BarStore;
 use cx_core::types::Interval;
 use cx_core::Bus;
@@ -31,6 +32,10 @@ pub struct SnapshotSrc {
     oms: Arc<Oms>,
     risk: Arc<RiskEngine>,
     dial: Arc<AutonomyDial>,
+    /// The ACTIVE order sink, so the connect-time snapshot carries the true
+    /// broker posture (paper / ibkr_paper / ibkr_live + connected + masked
+    /// account) instead of leaving the app to default the badge to PAPER.
+    broker: Arc<dyn Broker>,
     thoughts: Mutex<VecDeque<AgentThought>>,
     orders: Mutex<VecDeque<OrderUpdate>>,
     macro_last: Mutex<Option<MacroSnapshot>>,
@@ -49,6 +54,7 @@ impl SnapshotSrc {
         oms: Arc<Oms>,
         risk: Arc<RiskEngine>,
         dial: Arc<AutonomyDial>,
+        broker: Arc<dyn Broker>,
     ) -> Arc<Self> {
         let universe: Vec<String> = universe
             .into_iter()
@@ -61,6 +67,7 @@ impl SnapshotSrc {
             oms,
             risk,
             dial,
+            broker,
             thoughts: Mutex::new(VecDeque::new()),
             orders: Mutex::new(VecDeque::new()),
             macro_last: Mutex::new(None),
@@ -225,6 +232,10 @@ impl SnapshotSource for SnapshotSrc {
             "scan": scan_last,
             "news": news_last,
             "search_universe": self.universe,
+            // The true broker posture at connect. The app reads LIVE only for
+            // ibkr_live + connected, so a paper/fallback engine can never
+            // mislabel — and an older app that ignores the field is unaffected.
+            "broker": self.broker.status(),
         })
     }
 }

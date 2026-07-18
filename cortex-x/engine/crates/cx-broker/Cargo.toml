@@ -1,0 +1,29 @@
+[package]
+name = "cx-broker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+# Default is PAPER-ONLY: the IBKR wire layer (and the heavy `ibapi`
+# dependency) is not compiled at all. The safe abstraction — the Broker trait,
+# PaperBroker, OrderIntent->IBKR translation, the LIVE hard-limit guard, config
+# gating and fallback-to-paper — is ALWAYS compiled and unit-tested offline.
+default = []
+# Compiles the real IB Gateway / TWS socket integration into IbkrBroker.
+# Enable via cortexd's `ibkr-live` feature. Requires a running Gateway to
+# exercise end-to-end (see docs/IBKR.md).
+ibkr = ["dep:ibapi"]
+
+[dependencies]
+cx-core = { workspace = true }
+cx-oms = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+ibapi = { workspace = true, optional = true }
+
+[dev-dependencies]

@@ -15,6 +15,7 @@ use cx_core::store::BarStore;
 use cx_core::time::now_ms;
 use cx_core::types::{Interval, OrderType, Severity, Side, Tif};
 use cx_core::{Bus, Command, Config, KillSwitch};
+use cx_broker::Broker;
 use cx_oms::Oms;
 use cx_risk::{RiskDecision, RiskEngine};
 use cx_ta::corr::EwmaCorr;
@@ -46,7 +47,12 @@ struct TrailMark {
 pub struct TradePipeline {
     bus: Arc<Bus>,
     store: Arc<BarStore>,
+    /// The paper OMS: the source of truth for the portfolio VIEW handed to
+    /// risk, the marker, and the snapshot — in every mode. Orders are SUNK
+    /// through `broker`, which in paper mode delegates straight back here.
     oms: Arc<Oms>,
+    /// The active order sink (paper or IBKR), downstream of risk approval.
+    broker: Arc<dyn Broker>,
     risk: Arc<RiskEngine>,
     dial: Arc<AutonomyDial>,
     kill: Arc<KillSwitch>,
@@ -77,6 +83,7 @@ impl TradePipeline {
         bus: Arc<Bus>,
         store: Arc<BarStore>,
         oms: Arc<Oms>,
+        broker: Arc<dyn Broker>,
         risk: Arc<RiskEngine>,
         dial: Arc<AutonomyDial>,
         kill: Arc<KillSwitch>,
@@ -87,6 +94,7 @@ impl TradePipeline {
             bus,
             store,
             oms,
+            broker,
             risk,
             dial,
             kill,
@@ -176,7 +184,11 @@ impl TradePipeline {
                     self.thought(Severity::Critical, None, &format!("drawdown clock: {transition}"));
                     self.publish_risk_status();
                     if self.kill.is_engaged() {
-                        let ids = self.oms.flatten_all("drawdown kill switch").await;
+                        // Kill reaches the ACTIVE broker: cancel every working
+                        // order + flatten. For IBKR this cancels working IBKR
+                        // orders and flattens the live account; the sync
+                        // Phase-1 kill already blocks new orders instantly.
+                        let ids = self.broker.flatten_all("drawdown kill switch").await;
                         self.thought(
                             Severity::Critical,
                             None,
@@ -444,7 +456,15 @@ impl TradePipeline {
                     );
                 }
                 intent.qty = *qty;
-                self.oms.submit(intent).await;
+                // The active broker is the SINK, downstream of this approval.
+                // In paper mode this is byte-for-byte `oms.submit`; in live
+                // mode it is the IBKR adapter (with its own LIVE hard limits).
+                if let Err(e) = self.broker.place(intent.clone()).await {
+                    // A broker-level rejection (e.g. a LIVE hard limit) is
+                    // already surfaced on the bus by the adapter; log for the
+                    // operator. The risk decision itself stands.
+                    tracing::warn!(order = intent.id, "broker rejected order: {e}");
+                }
             }
             RiskDecision::Rejected { reason } => {
                 self.bus.publish(EngineEvent::OrderUpdate(OrderUpdate {
@@ -506,12 +526,24 @@ impl TradePipeline {
                 self.submit_through_risk(intent, last_px).await;
             }
             Command::CancelOrder { order_id } => {
-                self.oms.cancel(order_id, "operator cancel").await;
+                self.broker.cancel(order_id).await;
             }
             Command::SetKillSwitch { engaged, reason } => {
                 if engaged {
                     self.kill.engage(reason.clone());
                     self.thought(Severity::Critical, None, &format!("kill switch engaged: {reason}"));
+                    // The operator's emergency stop must REACH the venue, not
+                    // merely block new orders: cancel every working order then
+                    // flatten every position at the active broker (invariant #4
+                    // in cx-broker). Without this a resting live GTC order can
+                    // still fill after the switch is thrown. Mirrors the
+                    // drawdown auto-kill path; on paper it is oms.flatten_all.
+                    let ids = self.broker.flatten_all("kill switch").await;
+                    self.thought(
+                        Severity::Critical,
+                        None,
+                        &format!("kill switch: flattened {} positions at the broker", ids.len()),
+                    );
                 } else if self.kill.disengage(reason.clone()) {
                     self.thought(Severity::Critical, None, &format!("kill switch disengaged: {reason}"));
                 }
@@ -523,7 +555,9 @@ impl TradePipeline {
                 self.publish_risk_status();
             }
             Command::FlattenAll { reason } => {
-                let ids = self.oms.flatten_all(&reason).await;
+                // Operator flatten routes through the active broker: cancel all
+                // working orders + flatten (reduce-only) at the live venue.
+                let ids = self.broker.flatten_all(&reason).await;
                 self.thought(
                     Severity::Warning,
                     None,
@@ -566,11 +600,14 @@ mod tests {
     }
 
     /// Dial parked at Manual on purpose: the trail must fire anyway,
-    /// proving the autonomy dial never gates a risk reduction.
+    /// proving the autonomy dial never gates a risk reduction. The active
+    /// broker is the paper broker, so every order path is byte-for-byte the
+    /// existing paper engine (`broker.place` == `oms.submit`).
     fn setup(cfg: Config) -> (Arc<Bus>, Arc<BarStore>, Arc<Oms>, Arc<TradePipeline>) {
         let bus = Bus::new(1024);
         let store = Arc::new(BarStore::new());
         let oms = Oms::new(Arc::clone(&bus), Arc::clone(&store), cfg.paper.clone());
+        let broker: Arc<dyn Broker> = cx_broker::PaperBroker::new(Arc::clone(&oms));
         let kill = Arc::new(KillSwitch::new());
         let risk = Arc::new(RiskEngine::new(cfg.risk.clone(), Arc::clone(&kill)));
         let dial = Arc::new(AutonomyDial::new(AutonomyLevel::Manual));
@@ -578,12 +615,199 @@ mod tests {
             Arc::clone(&bus),
             Arc::clone(&store),
             Arc::clone(&oms),
+            broker,
             risk,
             dial,
             kill,
             cfg,
         );
         (bus, store, oms, pipeline)
+    }
+
+    /// A broker that records every emergency-exit call routed through the
+    /// trait, so a test can assert the kill/flatten path reaches the broker.
+    struct RecordingBroker {
+        flatten_calls: std::sync::Mutex<Vec<String>>,
+        cancel_all_calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingBroker {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                flatten_calls: std::sync::Mutex::new(Vec::new()),
+                cancel_all_calls: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Broker for RecordingBroker {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+        async fn connect(&self) -> Result<(), cx_broker::BrokerError> {
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+        async fn place(
+            &self,
+            intent: OrderIntent,
+        ) -> Result<cx_broker::BrokerOrderId, cx_broker::BrokerError> {
+            Ok(cx_broker::BrokerOrderId::paper(intent.id))
+        }
+        async fn cancel(&self, _order_id: u64) -> bool {
+            true
+        }
+        async fn cancel_all(&self, reason: &str) {
+            self.cancel_all_calls.lock().unwrap().push(reason.to_string());
+        }
+        async fn flatten_all(&self, reason: &str) -> Vec<u64> {
+            self.flatten_calls.lock().unwrap().push(reason.to_string());
+            vec![1]
+        }
+        fn positions(&self) -> Vec<cx_core::events::Position> {
+            Vec::new()
+        }
+        fn account(&self) -> cx_core::events::AccountSnapshot {
+            self.oms_snapshot()
+        }
+        fn status(&self) -> cx_core::events::BrokerStatus {
+            cx_core::events::BrokerStatus {
+                mode: cx_core::events::BrokerMode::Paper,
+                connected: true,
+                account_masked: None,
+            }
+        }
+    }
+
+    impl RecordingBroker {
+        fn oms_snapshot(&self) -> cx_core::events::AccountSnapshot {
+            cx_core::events::AccountSnapshot {
+                equity: 100_000.0,
+                cash: 100_000.0,
+                gross_exposure: 0.0,
+                net_exposure: 0.0,
+                unrealized_pnl: 0.0,
+                realized_pnl_day: 0.0,
+                fees_paid: 0.0,
+                open_orders: 0,
+                daily_trades: 0,
+                drawdown_day: 0.0,
+                drawdown_total: 0.0,
+                ts_ms: now_ms(),
+            }
+        }
+    }
+
+    fn setup_with_broker(
+        cfg: Config,
+        broker: Arc<dyn Broker>,
+    ) -> (Arc<Bus>, Arc<BarStore>, Arc<Oms>, Arc<KillSwitch>, Arc<TradePipeline>) {
+        let bus = Bus::new(1024);
+        let store = Arc::new(BarStore::new());
+        let oms = Oms::new(Arc::clone(&bus), Arc::clone(&store), cfg.paper.clone());
+        let kill = Arc::new(KillSwitch::new());
+        let risk = Arc::new(RiskEngine::new(cfg.risk.clone(), Arc::clone(&kill)));
+        let dial = Arc::new(AutonomyDial::new(AutonomyLevel::FullAuto));
+        let pipeline = TradePipeline::new(
+            Arc::clone(&bus),
+            Arc::clone(&store),
+            Arc::clone(&oms),
+            broker,
+            risk,
+            Arc::clone(&dial),
+            Arc::clone(&kill),
+            cfg,
+        );
+        (bus, store, oms, kill, pipeline)
+    }
+
+    #[tokio::test]
+    async fn operator_flatten_routes_through_the_active_broker() {
+        let rec = RecordingBroker::new();
+        let (_bus, _store, _oms, _kill, pipeline) =
+            setup_with_broker(test_cfg(), Arc::clone(&rec) as Arc<dyn Broker>);
+        pipeline
+            .handle_command(Command::FlattenAll {
+                reason: "operator drill".into(),
+            })
+            .await;
+        let calls = rec.flatten_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "flatten must reach the broker");
+        assert_eq!(calls[0], "operator drill");
+    }
+
+    #[tokio::test]
+    async fn drawdown_kill_flattens_through_the_broker() {
+        let rec = RecordingBroker::new();
+        let (bus, _store, _oms, kill, pipeline) =
+            setup_with_broker(test_cfg(), Arc::clone(&rec) as Arc<dyn Broker>);
+        // Engage the kill switch, then drive the drawdown clock past its hard
+        // breach so the Account handler flattens through the broker.
+        pipeline
+            .on_event(&EngineEvent::Account(account(100_000.0, 0)))
+            .await;
+        pipeline
+            .on_event(&EngineEvent::Account(account(90_000.0, 1)))
+            .await;
+        assert!(kill.is_engaged(), "hard drawdown breach must engage the kill");
+        let calls = rec.flatten_calls.lock().unwrap();
+        assert!(!calls.is_empty(), "kill must flatten through the broker");
+        let _ = bus;
+    }
+
+    #[tokio::test]
+    async fn manual_kill_switch_flattens_through_the_broker() {
+        // The operator's emergency stop must cancel working orders + flatten at
+        // the venue, not merely block new orders — otherwise a resting live GTC
+        // order can still fill after the switch is thrown (invariant #4).
+        let rec = RecordingBroker::new();
+        let (_bus, _store, _oms, kill, pipeline) =
+            setup_with_broker(test_cfg(), Arc::clone(&rec) as Arc<dyn Broker>);
+        pipeline
+            .handle_command(Command::SetKillSwitch {
+                engaged: true,
+                reason: "operator emergency stop".into(),
+            })
+            .await;
+        assert!(kill.is_engaged(), "the switch must be engaged");
+        let calls = rec.flatten_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "manual kill must flatten exactly once");
+        assert_eq!(calls[0], "kill switch");
+    }
+
+    #[tokio::test]
+    async fn disengaging_the_kill_switch_does_not_flatten() {
+        // Standing down the kill is not an exit event — it must never issue a
+        // flatten at the broker.
+        let rec = RecordingBroker::new();
+        let (_bus, _store, _oms, _kill, pipeline) =
+            setup_with_broker(test_cfg(), Arc::clone(&rec) as Arc<dyn Broker>);
+        pipeline
+            .handle_command(Command::SetKillSwitch { engaged: true, reason: "stop".into() })
+            .await;
+        pipeline
+            .handle_command(Command::SetKillSwitch { engaged: false, reason: "resume".into() })
+            .await;
+        // Exactly one flatten (from the engage), none from the disengage.
+        assert_eq!(rec.flatten_calls.lock().unwrap().len(), 1);
+    }
+
+    fn account(equity: f64, ts_ms: i64) -> cx_core::events::AccountSnapshot {
+        cx_core::events::AccountSnapshot {
+            equity,
+            cash: equity,
+            gross_exposure: 0.0,
+            net_exposure: 0.0,
+            unrealized_pnl: 0.0,
+            realized_pnl_day: 0.0,
+            fees_paid: 0.0,
+            open_orders: 0,
+            daily_trades: 0,
+            drawdown_day: 0.0,
+            drawdown_total: 0.0,
+            ts_ms,
+        }
     }
 
     fn m1(symbol: &str, i: i64, high: f64, low: f64, close: f64) -> EngineEvent {
@@ -743,12 +967,10 @@ mod tests {
         // HWM parks at 101.
         pipeline.on_event(&m1("BTC-USD", 20, 101.5, 100.5, 101.0)).await;
 
-        pipeline
-            .handle_command(Command::SetKillSwitch {
-                engaged: true,
-                reason: "test".into(),
-            })
-            .await;
+        // Engage the kill DIRECTLY (not via the command): the command path now
+        // also flattens at the broker, which would close the very position this
+        // test needs open to exercise the rejected-exit watermark restore.
+        pipeline.kill.engage("test");
 
         let mut rx = bus.subscribe();
         // Deep retrace fires the trail, but Agent("protector") is not

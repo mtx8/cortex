@@ -36,18 +36,34 @@ async fn main() -> anyhow::Result<()> {
     // Market data squadron: live feed (+ synthetic fallback), bars, backfill.
     cx_md::MarketData::start(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
 
-    // OMS: paper execution, positions, account.
+    // OMS: paper execution, positions, account. The paper OMS runs in EVERY
+    // mode — it is the paper broker's engine and the snapshot/risk view's
+    // book. In live mode the IBKR adapter is the order SINK on top of it.
     let oms = cx_oms::Oms::new(Arc::clone(&bus), Arc::clone(&store), cfg.paper.clone());
     oms.spawn_marker();
+
+    // Active broker: PAPER by default. mode="ibkr" attempts a Gateway
+    // connection and, on ANY failure, falls back to paper with a loud critical
+    // thought — never crashes, never silently live (see cx-broker + docs/IBKR.md).
+    let broker = cx_broker::build_active_broker(&cfg.broker, Arc::clone(&bus), Arc::clone(&oms)).await;
+    tracing::info!(broker = broker.name(), "active broker selected");
+    // Announce the TRUE broker posture so the app badge reflects real money
+    // from the first frame. build_active_broker already fell back to paper on
+    // any failure, so this reports paper / ibkr_paper / ibkr_live per what is
+    // actually wired. Re-published in every connect-time snapshot too, so a
+    // client that reconnects always re-learns the posture.
+    bus.publish(cx_core::EngineEvent::BrokerStatus(broker.status()));
 
     // ECHO: the risk engine every order faces.
     let risk = Arc::new(cx_risk::RiskEngine::new(cfg.risk.clone(), Arc::clone(&kill)));
 
-    // The single order path.
+    // The single order path. Risk-approved orders are handed to the active
+    // broker; the broker is only ever a SINK downstream of risk.
     let pipeline = TradePipeline::new(
         Arc::clone(&bus),
         Arc::clone(&store),
         Arc::clone(&oms),
+        Arc::clone(&broker),
         Arc::clone(&risk),
         Arc::clone(&dial),
         Arc::clone(&kill),
@@ -106,6 +122,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&oms),
         Arc::clone(&risk),
         Arc::clone(&dial),
+        Arc::clone(&broker),
     );
     snap.spawn_collector(Arc::clone(&bus));
 

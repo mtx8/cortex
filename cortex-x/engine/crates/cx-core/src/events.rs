@@ -239,6 +239,55 @@ pub struct FeedStatus {
     pub ts_ms: i64,
 }
 
+/// The execution venue the engine is actually wired to. `Paper` is the internal
+/// simulator (no external broker, no real money). `IbkrPaper` / `IbkrLive` mean
+/// the IBKR adapter is the active order sink, configured for a paper or a live
+/// (real-money) account. Serializes snake_case ("paper" / "ibkr_paper" /
+/// "ibkr_live") — the exact wire literals the macOS app matches on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrokerMode {
+    Paper,
+    IbkrPaper,
+    IbkrLive,
+}
+
+/// Broker-link posture, published so the operator always knows whether real
+/// money is at play. Additive/optional on the wire: it rides its own
+/// `broker_status` event AND the connect-time snapshot's `broker` field. The
+/// macOS `BrokerStatus` decode mirrors this contract and reads as LIVE only
+/// for `IbkrLive` that is also `connected` — never off an absent field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrokerStatus {
+    pub mode: BrokerMode,
+    /// Whether the venue session is up. Paper is always connected (the
+    /// simulator is in-process); IBKR reflects the live socket.
+    pub connected: bool,
+    /// Display-only MASKED account id ("U12****89"); never the raw id, which
+    /// stays in `Secret` and is never logged. Absent for the paper simulator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_masked: Option<String>,
+}
+
+/// Mask a broker account id for DISPLAY only: keep the first two and last two
+/// characters, star the middle, so the operator can recognize the account
+/// without the raw id ever leaving `Secret`. Empty input yields `None`; short
+/// ids (<= 4 chars) are fully starred so nothing meaningful leaks.
+pub fn mask_account(id: &str) -> Option<String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= 4 {
+        return Some("*".repeat(chars.len()));
+    }
+    let head: String = chars[..2].iter().collect();
+    let tail: String = chars[chars.len() - 2..].iter().collect();
+    let stars = "*".repeat(chars.len() - 4);
+    Some(format!("{head}{stars}{tail}"))
+}
+
 /// A tighten-only caution request from any agent. The risk engine applies it
 /// through its CautionBook, which enforces the invariant: caution can only
 /// shrink size, never grow it, never zero it, and always expires.
@@ -790,6 +839,7 @@ pub enum EngineEvent {
     Signal(StrategySignal),
     Macro(MacroSnapshot),
     FeedStatus(FeedStatus),
+    BrokerStatus(BrokerStatus),
     Caution(CautionUpdate),
     OptionsChain(OptionsChain),
     Sim(SimReport),
@@ -832,6 +882,7 @@ impl EngineEvent {
             EngineEvent::Signal(_) => "signal",
             EngineEvent::Macro(_) => "macro",
             EngineEvent::FeedStatus(_) => "feed_status",
+            EngineEvent::BrokerStatus(_) => "broker_status",
             EngineEvent::Caution(_) => "caution",
             EngineEvent::OptionsChain(_) => "options_chain",
             EngineEvent::Sim(_) => "sim",
@@ -1119,5 +1170,72 @@ mod tests {
         assert!(json.contains("\"type\":\"tick\""));
         let back: EngineEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn broker_status_event_is_type_tagged_and_not_critical() {
+        // The producer frame the macOS badge consumes: a live posture rides
+        // the bus as `{"type":"broker_status","mode":"ibkr_live",...}` with the
+        // struct fields flattened alongside the tag (serde tag = "type").
+        let ev = EngineEvent::BrokerStatus(BrokerStatus {
+            mode: BrokerMode::IbkrLive,
+            connected: true,
+            account_masked: Some("U12****89".into()),
+        });
+        assert_eq!(ev.kind(), "broker_status");
+        assert!(!ev.is_critical(), "broker status must never starve ticks");
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"broker_status\""));
+        assert!(json.contains("\"mode\":\"ibkr_live\""));
+        assert!(json.contains("\"account_masked\":\"U12****89\""));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn broker_mode_serializes_the_exact_wire_literals() {
+        // The app matches on these literals verbatim; a rename would silently
+        // demote a live badge to the safe paper default. Pin them.
+        assert_eq!(
+            serde_json::to_string(&BrokerMode::Paper).unwrap(),
+            "\"paper\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BrokerMode::IbkrPaper).unwrap(),
+            "\"ibkr_paper\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BrokerMode::IbkrLive).unwrap(),
+            "\"ibkr_live\""
+        );
+    }
+
+    #[test]
+    fn broker_status_account_is_optional_on_the_wire() {
+        // The paper simulator carries no account: the field is skipped on
+        // serialize and decodes back to None, so absence is never live-implying.
+        let ev = EngineEvent::BrokerStatus(BrokerStatus {
+            mode: BrokerMode::Paper,
+            connected: true,
+            account_masked: None,
+        });
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(!json.contains("account_masked"), "None account must be omitted");
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn mask_account_never_reveals_the_raw_id() {
+        // A live-looking id keeps only the first two + last two characters.
+        let masked = mask_account("U1234567").unwrap();
+        assert_eq!(masked, "U1****67");
+        assert!(!masked.contains("2345"), "middle must be starred");
+        // A paper id masks the same way.
+        assert_eq!(mask_account("DU1234567").unwrap(), "DU*****67");
+        // Short / empty ids leak nothing.
+        assert_eq!(mask_account("U12").unwrap(), "***");
+        assert_eq!(mask_account("  "), None);
+        assert_eq!(mask_account(""), None);
     }
 }

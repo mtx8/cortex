@@ -9,12 +9,19 @@ license.workspace = true
 name = "cortexd"
 path = "src/main.rs"
 
+[features]
+default = []
+# Compiles the real IBKR socket layer into the daemon. Without it, mode="ibkr"
+# still runs, but the adapter reports "not compiled" and falls back to paper.
+ibkr-live = ["cx-broker/ibkr"]
+
 [dependencies]
 cx-core = { workspace = true }
 cx-ta = { workspace = true }
 cx-md = { workspace = true }
 cx-risk = { workspace = true }
 cx-oms = { workspace = true }
+cx-broker = { workspace = true }
 cx-sim = { workspace = true }
 cx-strategy = { workspace = true }
 cx-agents = { workspace = true }
@@ -27,3 +34,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }

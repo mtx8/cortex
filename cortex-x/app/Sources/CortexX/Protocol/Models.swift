@@ -75,6 +75,23 @@ enum FeedHealth: String, Codable {
     case live, degraded, synthetic_fallback, down
 }
 
+/// The execution venue the engine is wired to. `paper` is the internal
+/// simulator (no external broker, no real money). `ibkr_paper`/`ibkr_live`
+/// mean the IBKR adapter is configured for a paper or a live account.
+/// Case names equal the serde snake_case wire values verbatim.
+enum BrokerMode: String, Codable, Equatable {
+    case paper, ibkr_paper, ibkr_live
+
+    /// Safety default: an unknown / future / garbled wire value decodes to
+    /// `.paper`. The app must NEVER upgrade itself into a live-money posture
+    /// off a string it does not explicitly recognize — only the exact literal
+    /// "ibkr_live" can ever mean real money.
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = BrokerMode(rawValue: raw) ?? .paper
+    }
+}
+
 // MARK: - Payloads
 
 struct Tick: Codable, Equatable {
@@ -351,6 +368,34 @@ struct FeedStatus: Codable, Equatable {
     var health: FeedHealth
     var detail: String
     var ts_ms: Int64
+}
+
+/// Broker-link posture, so the operator always knows whether real money is at
+/// play: the execution `mode`, whether the broker session is `connected`, and
+/// a display-only masked account id. Additive/optional on the wire — older
+/// engines never send it, so the app defaults to the safe `paper` posture.
+/// Mirror of the engine `BrokerStatus` contract type (serde snake_case).
+struct BrokerStatus: Codable, Equatable {
+    var mode: BrokerMode
+    var connected: Bool
+    /// Masked broker account id ("U12****89") — display-only; may be absent.
+    var account_masked: String? = nil
+}
+
+extension BrokerStatus {
+    enum CodingKeys: String, CodingKey { case mode, connected, account_masked }
+
+    // Defensive decode: a partial payload must never fail the frame and must
+    // never imply live — an absent `mode` defaults to `.paper` and an absent
+    // `connected` to `false`, so a missing field can only ever be SAFER, never
+    // more permissive. Memberwise init preserved via the extension; `encode`
+    // stays synthesized.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try c.decodeIfPresent(BrokerMode.self, forKey: .mode) ?? .paper
+        connected = try c.decodeIfPresent(Bool.self, forKey: .connected) ?? false
+        account_masked = try c.decodeIfPresent(String.self, forKey: .account_masked)
+    }
 }
 
 enum OptionRight: String, Codable { case call, put }
@@ -868,6 +913,10 @@ struct EngineSnapshot: Codable {
     var news: NewsBoard?
     /// Scan-universe symbols beyond the watchlist (D1 charts + search).
     var search_universe: [String]?
+    /// NEW OPTIONAL wire field — the broker-link posture at connect. Older
+    /// engines omit it entirely, so it decodes nil (the app then shows the
+    /// safe `paper` default) rather than failing the snapshot.
+    var broker: BrokerStatus? = nil
 }
 
 // MARK: - Inbound frame (server -> client), tag field "type"
@@ -888,6 +937,7 @@ enum ServerFrame {
     case signal(StrategySignal)
     case macro(MacroSnapshot)
     case feedStatus(FeedStatus)
+    case brokerStatus(BrokerStatus)
     case caution(CautionUpdate)
     case optionsChain(OptionsChain)
     case sim(SimReport)
@@ -928,6 +978,7 @@ enum ServerFrame {
         case "signal": return .signal(try dec.decode(StrategySignal.self, from: data))
         case "macro": return .macro(try dec.decode(MacroSnapshot.self, from: data))
         case "feed_status": return .feedStatus(try dec.decode(FeedStatus.self, from: data))
+        case "broker_status": return .brokerStatus(try dec.decode(BrokerStatus.self, from: data))
         case "caution": return .caution(try dec.decode(CautionUpdate.self, from: data))
         case "options_chain": return .optionsChain(try dec.decode(OptionsChain.self, from: data))
         case "sim": return .sim(try dec.decode(SimReport.self, from: data))

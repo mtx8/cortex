@@ -54,6 +54,11 @@ final class AppModel {
     private(set) var signals: [StrategySignal] = []
     private(set) var macro: MacroSnapshot?
     private(set) var feeds: [String: FeedStatus] = [:]
+    /// Broker-link posture. nil = the engine has not vouched for a broker, so
+    /// the UI shows the safe `paper` default. Cleared on any disconnect so a
+    /// stale "IBKR LIVE" can never linger while the engine is unreachable —
+    /// LIVE must be current and connected or it must not read as live at all.
+    private(set) var broker: BrokerStatus?
 
     // MARK: Center sections
     enum CenterMode: String, CaseIterable { case chart, scanner, news, company, options, foundry, regimes, meridian }
@@ -142,7 +147,13 @@ final class AppModel {
         // A dropped connection orphans any in-flight ask: the engine answers
         // by exact request id only, and a fresh connection knows nothing
         // about it — without this every ASK surface stays disabled forever.
-        if s != .connected { failPendingAsk("connection lost — ask again") }
+        if s != .connected {
+            failPendingAsk("connection lost — ask again")
+            // Drop the broker posture too: while the engine is unreachable we
+            // cannot claim a live+connected broker, so fall back to the safe
+            // paper default until the next snapshot re-vouches for it.
+            broker = nil
+        }
     }
 
     func start() { client.start() }
@@ -477,6 +488,8 @@ final class AppModel {
             macro = m
         case .feedStatus(let f):
             feeds[f.feed] = f
+        case .brokerStatus(let b):
+            broker = b
         case .caution(let c):
             // Surface caution requests in the agent feed as warning thoughts.
             thoughts.insert(AgentThought(
@@ -589,6 +602,10 @@ final class AppModel {
         orders = snap.orders.sorted { $0.ts_ms > $1.ts_ms }
         if let m = snap.macro { macro = m }
         for f in snap.feeds ?? [] { feeds[f.feed] = f }
+        // Only adopt a broker posture the snapshot actually carries — a lean
+        // re-sync snapshot that omits it must not wipe a live posture a
+        // standalone broker_status frame already established.
+        if let b = snap.broker { broker = b }
         if let r = snap.regimes { regimeBoard = r }
         if let g = snap.geo { geoPulse = g }
         if let s = snap.scan { applyScanBoard(s) }

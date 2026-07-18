@@ -125,6 +125,85 @@ impl Default for PaperConfig {
     }
 }
 
+/// TWS / IB Gateway API ports. The two PAPER ports are the only safe
+/// defaults; the two LIVE (real-money) ports are gated behind `allow_live`.
+pub const IBKR_LIVE_PORTS: [u16; 2] = [7496, 4001];
+pub const IBKR_PAPER_PORTS: [u16; 2] = [7497, 4002];
+
+/// True when `port` is a known LIVE (real-money) TWS/Gateway API port. Any
+/// other port (including the paper ports and non-standard ones) reads false —
+/// only the two documented live ports arm the real-money gate.
+pub fn is_ibkr_live_port(port: u16) -> bool {
+    IBKR_LIVE_PORTS.contains(&port)
+}
+
+/// Live-trading broker routing. PAPER-FIRST: with the defaults (mode "paper",
+/// a PAPER port, `allow_live` false) the engine never reaches a live account.
+///
+/// Reaching a real-money account requires TWO explicit gates:
+/// 1. `mode = "ibkr"`, and
+/// 2. a LIVE port (7496 TWS / 4001 Gateway) WITH `allow_live = true`.
+///
+/// A live port with `allow_live = false` is a hard [`Config`] error (and the
+/// adapter refuses to connect) — never a silent live reach.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BrokerConfig {
+    /// "paper" (default — the built-in paper exchange) or "ibkr".
+    pub mode: String,
+    /// The user's local TWS / IB Gateway host. Localhost by default: the
+    /// IBKR socket is a direct localhost connection to the operator's own
+    /// Gateway, NOT through the hardened HTTP egress.
+    pub ibkr_host: String,
+    /// TWS/Gateway API socket port. Default 7497 = TWS PAPER. Live ports
+    /// (7496 TWS / 4001 Gateway) additionally require `allow_live`.
+    pub ibkr_port: u16,
+    /// API client id the adapter connects with.
+    pub ibkr_client_id: i32,
+    /// IBKR account id to trade (e.g. "DU1234567" paper / "U1234567" live).
+    /// Held as a [`Secret`]: an account id is never logged (invariant).
+    pub ibkr_account: Secret,
+    /// Order routing venue. "SMART" = IBKR SmartRouting (default); a direct
+    /// venue code ("ARCA", "ISLAND", "NYSE", "IEX", ...) routes for true DMA.
+    pub ibkr_route: String,
+    /// The real-money master switch. Must be `true` to connect on a LIVE port.
+    pub allow_live: bool,
+    /// LIVE hard limit: reject any single order whose notional exceeds this.
+    pub max_live_order_notional: f64,
+    /// LIVE hard limit: reject any order that would push a symbol's live
+    /// position notional past this.
+    pub max_live_position_notional: f64,
+    /// LIVE hard limit: once the live realized day loss reaches this, HALT
+    /// (cancel working orders + flatten, then block new orders for the day).
+    pub max_live_daily_loss: f64,
+}
+
+impl Default for BrokerConfig {
+    fn default() -> Self {
+        Self {
+            mode: "paper".into(),
+            ibkr_host: "127.0.0.1".into(),
+            ibkr_port: 7497, // TWS PAPER — never a live port by default
+            ibkr_client_id: 11,
+            ibkr_account: Secret::default(),
+            ibkr_route: "SMART".into(),
+            allow_live: false,
+            max_live_order_notional: 2_000.0,
+            max_live_position_notional: 5_000.0,
+            max_live_daily_loss: 500.0,
+        }
+    }
+}
+
+impl BrokerConfig {
+    /// True only when BOTH live gates are satisfied: a live port AND the
+    /// operator's explicit `allow_live`. The adapter uses this to decide
+    /// whether a connection is a real-money one.
+    pub fn is_live(&self) -> bool {
+        is_ibkr_live_port(self.ibkr_port) && self.allow_live
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AiConfig {
@@ -244,6 +323,8 @@ pub struct Config {
     pub ai: AiConfig,
     pub server: ServerConfig,
     pub intel: IntelConfig,
+    /// Live-trading broker routing. Defaults to the paper exchange.
+    pub broker: BrokerConfig,
     /// Extra free-form knobs for strategies, keyed by strategy name.
     pub strategy_params: BTreeMap<String, BTreeMap<String, f64>>,
 }
@@ -265,6 +346,7 @@ impl Default for Config {
             ai: AiConfig::default(),
             server: ServerConfig::default(),
             intel: IntelConfig::default(),
+            broker: BrokerConfig::default(),
             strategy_params: BTreeMap::new(),
         }
     }
@@ -367,6 +449,80 @@ impl Config {
             return Err(CxError::Config(
                 "ai.web_budget_per_query must be in [1, 32]".into(),
             ));
+        }
+        self.broker.validate()?;
+        Ok(())
+    }
+}
+
+impl BrokerConfig {
+    /// Fails closed on any live-safety misconfiguration. Invariants:
+    /// a LIVE port ALWAYS requires `allow_live` (else refuse); an IBKR session
+    /// ALWAYS requires an account id (the daily-loss halt subscribes to it); a
+    /// live-LOOKING account (not `DU...`) requires `allow_live` regardless of
+    /// port; and every LIVE hard limit must be a finite, strictly positive
+    /// number so the real-money guard can never be defeated by a NaN / 0 /
+    /// negative cap.
+    pub fn validate(&self) -> Result<(), CxError> {
+        match self.mode.as_str() {
+            "paper" | "ibkr" => {}
+            other => {
+                return Err(CxError::Config(format!(
+                    "broker.mode must be \"paper\" or \"ibkr\", got {other:?}"
+                )))
+            }
+        }
+        // The real-money gate: a LIVE port without `allow_live` is a hard
+        // error at load, regardless of mode — a live port must never sit in
+        // the config as a one-typo-from-live foot-gun.
+        if is_ibkr_live_port(self.ibkr_port) && !self.allow_live {
+            return Err(CxError::Config(format!(
+                "broker.ibkr_port {} is a LIVE (real-money) port; set broker.allow_live = true \
+                 to trade live, or use a PAPER port (7497 TWS / 4002 Gateway)",
+                self.ibkr_port
+            )));
+        }
+        // An IBKR session (paper OR live) REQUIRES an account id: the
+        // max_live_daily_loss circuit breaker subscribes to that account's
+        // PnL, and without it the daily-loss halt is silently unarmed while
+        // orders still route (a single-account login infers the account). Fail
+        // closed at load rather than trade live with the breaker disarmed.
+        if self.mode == "ibkr" {
+            let acct = self.ibkr_account.expose().trim();
+            if acct.is_empty() {
+                return Err(CxError::Config(
+                    "broker.ibkr_account is required when broker.mode = \"ibkr\" — the \
+                     max_live_daily_loss circuit breaker subscribes to it; set your paper \
+                     (DU...) or live (U...) account id"
+                        .into(),
+                ));
+            }
+            // Account-identity gate (defense in depth with the port gate): a
+            // live-LOOKING account (paper accounts start "DU"; live start "U")
+            // reachable without `allow_live` is a real-money foot-gun even on a
+            // paper port (a live TWS set to 7497). Make the gate depend on the
+            // account identity, not just a mutable port number.
+            if !acct.starts_with("DU") && !self.allow_live {
+                // Never echo the account id itself (invariant: it is never
+                // logged, and a Config error is surfaced/logged).
+                return Err(CxError::Config(
+                    "broker.ibkr_account looks like a LIVE account (does not start with \"DU\"); \
+                     set broker.allow_live = true to trade real money, or use a paper (DU...) \
+                     account"
+                        .into(),
+                ));
+            }
+        }
+        for (name, v) in [
+            ("max_live_order_notional", self.max_live_order_notional),
+            ("max_live_position_notional", self.max_live_position_notional),
+            ("max_live_daily_loss", self.max_live_daily_loss),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(CxError::Config(format!(
+                    "broker.{name} must be a finite number > 0"
+                )));
+            }
         }
         Ok(())
     }
@@ -475,6 +631,153 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.intel.news_poll_secs, 600);
         assert!(cfg.intel.enable_news_rss, "missing flag must default on");
+    }
+
+    #[test]
+    fn broker_defaults_are_paper_and_safe() {
+        let b = BrokerConfig::default();
+        assert_eq!(b.mode, "paper");
+        assert_eq!(b.ibkr_host, "127.0.0.1");
+        assert_eq!(b.ibkr_port, 7497); // TWS PAPER
+        assert!(!is_ibkr_live_port(b.ibkr_port), "default port must be paper");
+        assert!(!b.allow_live);
+        assert!(!b.is_live(), "the default config must never be a live reach");
+        assert_eq!(b.ibkr_route, "SMART");
+        assert_eq!(b.max_live_order_notional, 2_000.0);
+        assert_eq!(b.max_live_position_notional, 5_000.0);
+        assert_eq!(b.max_live_daily_loss, 500.0);
+        Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn live_port_requires_allow_live() {
+        // Both live ports are rejected without the explicit allow_live gate.
+        for port in IBKR_LIVE_PORTS {
+            let mut cfg = Config::default();
+            cfg.broker.ibkr_port = port;
+            cfg.broker.allow_live = false;
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("LIVE"), "expected a loud live-port refusal: {err}");
+            assert!(!cfg.broker.is_live());
+
+            // Same live port WITH allow_live now validates and reads live.
+            cfg.broker.allow_live = true;
+            assert!(cfg.validate().is_ok());
+            assert!(cfg.broker.is_live());
+        }
+    }
+
+    #[test]
+    fn paper_ports_never_require_allow_live() {
+        for port in IBKR_PAPER_PORTS {
+            let mut cfg = Config::default();
+            cfg.broker.ibkr_port = port;
+            cfg.broker.allow_live = false;
+            assert!(cfg.validate().is_ok(), "paper port {port} must not gate");
+            assert!(!cfg.broker.is_live());
+        }
+    }
+
+    #[test]
+    fn broker_mode_and_limits_are_validated() {
+        let mut cfg = Config::default();
+        cfg.broker.mode = "live".into(); // not a valid mode string
+        assert!(cfg.validate().is_err());
+        cfg.broker.mode = "ibkr".into();
+        // ibkr mode requires an account id; a paper (DU...) one validates.
+        cfg.broker.ibkr_account = Secret("DU1234567".into());
+        assert!(cfg.validate().is_ok());
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut cfg = Config::default();
+            cfg.broker.max_live_order_notional = bad;
+            assert!(cfg.validate().is_err(), "order notional {bad} must reject");
+            let mut cfg = Config::default();
+            cfg.broker.max_live_position_notional = bad;
+            assert!(cfg.validate().is_err(), "position notional {bad} must reject");
+            let mut cfg = Config::default();
+            cfg.broker.max_live_daily_loss = bad;
+            assert!(cfg.validate().is_err(), "daily loss {bad} must reject");
+        }
+    }
+
+    #[test]
+    fn broker_toml_without_section_defaults_to_paper() {
+        // An older config file predates [broker]; the container-level
+        // serde(default) fills it from BrokerConfig::default() (paper).
+        let cfg: Config = toml::from_str(
+            r#"
+            symbols = ["BTC-USD"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.broker.mode, "paper");
+        assert_eq!(cfg.broker.ibkr_port, 7497);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn broker_account_id_never_debug_prints() {
+        // Invariant: account ids are never logged. The Secret wrapper masks
+        // it even if the whole BrokerConfig is Debug-formatted.
+        let cfg: Config = toml::from_str(
+            r#"
+            symbols = ["BTC-USD"]
+            [broker]
+            ibkr_account = "DU1234567"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.broker.ibkr_account.expose(), "DU1234567");
+        let dump = format!("{:?}", cfg.broker);
+        assert!(!dump.contains("DU1234567"), "account id leaked into Debug: {dump}");
+        assert!(dump.contains("Secret(***)"));
+    }
+
+    #[test]
+    fn ibkr_mode_requires_an_account() {
+        // The daily-loss circuit breaker subscribes to the account's PnL; with
+        // no account it is silently unarmed, so mode=="ibkr" refuses at load.
+        let mut cfg = Config::default();
+        cfg.broker.mode = "ibkr".into();
+        assert!(cfg.broker.ibkr_account.is_empty());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("ibkr_account"), "expected an account requirement: {err}");
+
+        // A paper account id satisfies it.
+        cfg.broker.ibkr_account = Secret("DU1234567".into());
+        assert!(cfg.validate().is_ok());
+
+        // Paper mode never requires an account.
+        let mut cfg = Config::default();
+        cfg.broker.mode = "paper".into();
+        assert!(cfg.broker.ibkr_account.is_empty());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn live_looking_account_requires_allow_live() {
+        // A live-looking account (no "DU" prefix) on a PAPER port, without
+        // allow_live, is refused — the real-money gate depends on the account
+        // identity, not just a mutable port number.
+        let mut cfg = Config::default();
+        cfg.broker.mode = "ibkr".into();
+        cfg.broker.ibkr_port = 7497; // paper port
+        cfg.broker.allow_live = false;
+        cfg.broker.ibkr_account = Secret("U1234567".into()); // looks live
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("LIVE account"), "expected an identity refusal: {err}");
+        assert!(!err.contains("U1234567"), "the account id must never appear in the error");
+
+        // The same live account WITH allow_live validates (operator opted in).
+        cfg.broker.allow_live = true;
+        assert!(cfg.validate().is_ok());
+
+        // A paper (DU...) account never trips the identity gate.
+        let mut cfg = Config::default();
+        cfg.broker.mode = "ibkr".into();
+        cfg.broker.ibkr_account = Secret("DU7654321".into());
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
