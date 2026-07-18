@@ -32,7 +32,6 @@ struct RootView: View {
                         case .chart: ChartGrid()
                         case .scanner: ScannerView()
                         case .news: NewsView()
-                        case .filings: FilingsView()
                         case .company: CompanyView()
                         case .options: OptionsChainView()
                         case .foundry: FoundryView()
@@ -215,7 +214,6 @@ private struct IconRail: View {
         (.chart, "chart.xyaxis.line", "terminal"),
         (.scanner, "scope", "scanner"),
         (.news, "newspaper", "news"),
-        (.filings, "doc.text.magnifyingglass", "filings"),
         (.company, "building.2", "company"),
         (.options, "square.grid.3x3", "options"),
         (.foundry, "hammer", "foundry"),

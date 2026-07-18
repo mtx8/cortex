@@ -111,6 +111,10 @@ struct OrdersTable: View {
         switch i.order_type {
         case .market: "market"
         case .limit: i.limit_px.map { "limit \(DashFormat.price($0))" } ?? "limit"
+        case .stop: i.stop_px.map { "stop \(DashFormat.price($0))" } ?? "stop"
+        case .stop_limit:
+            (i.stop_px.map { "stop \(DashFormat.price($0))" } ?? "stop")
+                + (i.limit_px.map { " · lmt \(DashFormat.price($0))" } ?? "")
         }
     }
 

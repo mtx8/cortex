@@ -29,6 +29,12 @@ impl Side {
 pub enum OrderType {
     Market,
     Limit,
+    /// Rests until price reaches its `stop_px` trigger, then fills as a market
+    /// order (serde: "stop").
+    Stop,
+    /// Rests until price reaches its `stop_px` trigger, then becomes a resting
+    /// limit at `limit_px` (serde: "stop_limit").
+    StopLimit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,4 +143,27 @@ pub enum Severity {
     Insight,
     Warning,
     Critical,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_type_wire_strings_are_snake_case() {
+        // The Swift mirror decodes these raw values 1:1 — market/limit are
+        // unchanged and the additive stop variants join them as "stop" /
+        // "stop_limit".
+        for (variant, wire) in [
+            (OrderType::Market, "\"market\""),
+            (OrderType::Limit, "\"limit\""),
+            (OrderType::Stop, "\"stop\""),
+            (OrderType::StopLimit, "\"stop_limit\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, wire);
+            let back: OrderType = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
 }

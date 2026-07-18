@@ -28,6 +28,7 @@ struct NewsView: View {
                     switch tab {
                     case .feed: feedTab(now: context.date)
                     case .earnings: earningsTab(now: context.date)
+                    case .filings: filingsTab
                     case .brief: briefTab(now: context.date)
                     }
                 }
@@ -36,6 +37,19 @@ struct NewsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.ink)
+        // A caller (COMPANY board ▸ "all filings") can hint which tab to open:
+        // consume it on appear and whenever it lands, then clear it so
+        // re-entering the desk falls back to the tape.
+        .onAppear { consumeInitialTab() }
+        .onChange(of: model.newsInitialTab) { consumeInitialTab() }
+    }
+
+    /// Open the tab the model hinted at (via `openFilings`), then clear the
+    /// hint. Idempotent: a nil hint is a no-op.
+    private func consumeInitialTab() {
+        guard let hinted = model.newsInitialTab else { return }
+        tab = hinted
+        model.newsInitialTab = nil
     }
 
     // MARK: Header
@@ -393,6 +407,16 @@ struct NewsView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    // MARK: - FILINGS tab
+
+    /// The dedicated SEC EDGAR desk reused verbatim as a tab. FilingsView
+    /// auto-loads the selected equity's filings on appear and already fills the
+    /// pane (maxWidth/maxHeight), so it fits the tab content area like the
+    /// others; the AppModel environment threads through unchanged.
+    private var filingsTab: some View {
+        FilingsView()
     }
 
     // MARK: - AI BRIEF tab

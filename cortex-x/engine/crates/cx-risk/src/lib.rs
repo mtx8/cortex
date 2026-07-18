@@ -315,6 +315,7 @@ mod tests {
             qty,
             order_type: OrderType::Market,
             limit_px: None,
+            stop_px: None,
             tif: Tif::Ioc,
             reduce_only: false,
             source: OrderSource::Strategy("test".into()),

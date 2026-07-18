@@ -99,7 +99,8 @@ struct PositionsTable: View {
             side: p.qty > 0 ? .sell : .buy,
             qty: abs(p.qty),
             orderType: .market,
-            limitPx: nil
+            limitPx: nil,
+            stopPx: nil
         ))
     }
 }

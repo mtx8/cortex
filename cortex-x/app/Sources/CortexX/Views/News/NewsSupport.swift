@@ -12,10 +12,11 @@ import SwiftUI
 
 // MARK: - Section tabs
 
-/// The three faces of the news desk. Raw string so the default and ordering
-/// are testable; the tape opens first (FEED) — the point of the view.
+/// The four faces of the news desk. Raw string so the default and ordering
+/// are testable; the tape opens first (FEED) — the point of the view. FILINGS
+/// sits between EARNINGS and AI BRIEF (the dedicated SEC EDGAR desk, embedded).
 enum NewsTab: String, CaseIterable, Identifiable {
-    case feed, earnings, brief
+    case feed, earnings, filings, brief
 
     var id: String { rawValue }
 
@@ -23,6 +24,7 @@ enum NewsTab: String, CaseIterable, Identifiable {
         switch self {
         case .feed: "feed"
         case .earnings: "earnings"
+        case .filings: "filings"
         case .brief: "ai brief"
         }
     }

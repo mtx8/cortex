@@ -290,6 +290,7 @@ impl TradePipeline {
             qty: delta.abs(),
             order_type: OrderType::Market,
             limit_px: None,
+            stop_px: None,
             tif: Tif::Ioc,
             reduce_only: reduces,
             source: OrderSource::Strategy("fusion".into()),
@@ -409,6 +410,7 @@ impl TradePipeline {
             qty: qty.abs(),
             order_type: OrderType::Market,
             limit_px: None,
+            stop_px: None,
             tif: Tif::Ioc,
             reduce_only: true,
             source: OrderSource::Agent("protector".into()),
@@ -473,6 +475,7 @@ impl TradePipeline {
                 qty,
                 order_type,
                 limit_px,
+                stop_px,
             } => {
                 let Some(last_px) = self.store.last_price(&symbol) else {
                     self.thought(Severity::Warning, Some(&symbol), "manual order: no market data");
@@ -482,6 +485,10 @@ impl TradePipeline {
                 let reduces = qty <= current.abs() + 1e-12
                     && current.abs() > 1e-12
                     && side != if current > 0.0 { Side::Buy } else { Side::Sell };
+                // Stops route through the SAME risk gate as every other order:
+                // a protective reduce-only stop takes risk's permissive exit
+                // path, a new-risk stop faces the full sizing checks. Order-type
+                // validity (a stop needs a stop price) is enforced at the OMS.
                 let intent = OrderIntent {
                     id: cx_core::ids::next_order_id(),
                     symbol,
@@ -489,6 +496,7 @@ impl TradePipeline {
                     qty,
                     order_type,
                     limit_px,
+                    stop_px,
                     tif: Tif::Gtc,
                     reduce_only: reduces,
                     source: OrderSource::Manual,
@@ -610,6 +618,7 @@ mod tests {
             qty,
             order_type: OrderType::Market,
             limit_px: None,
+            stop_px: None,
             tif: Tif::Gtc,
             reduce_only: false,
             source: OrderSource::Manual,
@@ -797,6 +806,7 @@ mod tests {
             qty: 1.0,
             order_type: OrderType::Market,
             limit_px: None,
+            stop_px: None,
             tif: Tif::Gtc,
             reduce_only: true,
             source: OrderSource::Manual,
@@ -858,5 +868,47 @@ mod tests {
         pipeline.on_event(&m1("BTC-USD", 21, 105.0, 99.5, 100.0)).await;
         assert!(order_updates(&mut rx).is_empty());
         assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn place_order_protective_stop_routes_through_risk_and_rests() {
+        // A manual protective sell-stop command must reach the OMS through the
+        // SAME risk gate and rest as a Working stop (its trigger sits below the
+        // last price). Reduce-only takes risk's permissive exit path, so this
+        // never depends on the sizing caps. The dial is parked at Manual —
+        // manual operator commands are not autonomy-gated.
+        let (bus, store, oms, pipeline) = setup(test_cfg());
+        store.set_last_price("BTC-USD", 100.0);
+        // Open a 1.0 long directly (setup only).
+        open_position(&store, &oms, "BTC-USD", Side::Buy, 1.0, 100.0).await;
+
+        let mut rx = bus.subscribe();
+        pipeline
+            .handle_command(Command::PlaceOrder {
+                symbol: "BTC-USD".into(),
+                side: Side::Sell,
+                qty: 1.0,
+                order_type: OrderType::Stop,
+                limit_px: None,
+                stop_px: Some(95.0),
+            })
+            .await;
+
+        let ups = order_updates(&mut rx);
+        assert!(
+            !ups.iter()
+                .any(|u| matches!(u.status, OrderStatus::RejectedByRisk { .. })),
+            "protective stop must pass the risk gate"
+        );
+        assert!(ups.iter().any(|u| matches!(u.status, OrderStatus::Working)));
+
+        // It rests as a reduce-only Working stop carrying its trigger.
+        let open = oms.open_orders();
+        assert_eq!(open.len(), 1);
+        assert!(matches!(open[0].status, OrderStatus::Working));
+        assert_eq!(open[0].intent.order_type, OrderType::Stop);
+        assert_eq!(open[0].intent.stop_px, Some(95.0));
+        assert!(open[0].intent.reduce_only);
+        assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9); // still long
     }
 }

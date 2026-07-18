@@ -52,6 +52,25 @@ fn finite_or(x: f64, fallback: f64) -> f64 {
     }
 }
 
+/// A stop's trigger test: a BUY stop arms once price rises TO or THROUGH its
+/// `stop_px`; a SELL stop once price falls to or through it. A non-finite
+/// `price` (a NaN tick) never arms a stop — both comparisons read false.
+fn stop_triggered(side: Side, stop_px: f64, price: f64) -> bool {
+    match side {
+        Side::Buy => price >= stop_px,
+        Side::Sell => price <= stop_px,
+    }
+}
+
+/// Whether a limit is immediately fillable against `price`: a buy limit is
+/// marketable at or below its price, a sell limit at or above.
+fn limit_marketable(side: Side, limit_px: f64, price: f64) -> bool {
+    match side {
+        Side::Buy => price <= limit_px,
+        Side::Sell => price >= limit_px,
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 struct Pos {
     /// Signed: positive long, negative short. Exactly 0.0 when flat.
@@ -189,15 +208,40 @@ impl Oms {
             .limit_px
             .map(|p| p.is_finite() && p > 0.0)
             .unwrap_or(false);
-        let valid = intent.qty.is_finite()
-            && intent.qty > 0.0
-            && !intent.symbol.is_empty()
-            && (intent.order_type == OrderType::Market || limit_ok);
-        if !valid {
+        let stop_ok = intent
+            .stop_px
+            .map(|p| p.is_finite() && p > 0.0)
+            .unwrap_or(false);
+        let base_ok =
+            intent.qty.is_finite() && intent.qty > 0.0 && !intent.symbol.is_empty();
+        // Reject with the SPECIFIC missing input so the operator learns why:
+        // every order type carries exactly the prices it needs — a stop needs
+        // a trigger, a limit needs a price, a stop-limit needs both.
+        let reject: Option<&str> = if !base_ok {
+            Some("invalid order")
+        } else {
+            match intent.order_type {
+                OrderType::Market => None,
+                OrderType::Limit => {
+                    (!limit_ok).then_some("limit order requires a limit price")
+                }
+                OrderType::Stop => (!stop_ok).then_some("stop order requires a stop price"),
+                OrderType::StopLimit => {
+                    if !stop_ok {
+                        Some("stop order requires a stop price")
+                    } else if !limit_ok {
+                        Some("stop-limit order requires a limit price")
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        if let Some(reason) = reject {
             self.publish_update(
                 &intent,
                 OrderStatus::Canceled {
-                    reason: "invalid order".into(),
+                    reason: reason.into(),
                 },
             );
             return order_id;
@@ -272,6 +316,72 @@ impl Oms {
                     self.publish_update(&intent, OrderStatus::Working);
                 }
             }
+            // A stop rests as Working until price reaches its trigger, then
+            // fills as a market order. If the market is ALREADY through the
+            // trigger at placement (e.g. a buy stop set below the last price),
+            // it fires immediately; otherwise the marker watches it per tick.
+            OrderType::Stop => {
+                let stop = intent.stop_px.unwrap_or(0.0); // validated finite > 0
+                let last = self.store.last_price(&intent.symbol);
+                if last
+                    .map(|l| stop_triggered(intent.side, stop, l))
+                    .unwrap_or(false)
+                {
+                    let last = last.unwrap_or(0.0); // Some by the guard above
+                    let slip = finite_or(self.cfg.slippage_bps, 0.0).max(0.0);
+                    let px = last * (1.0 + intent.side.sign() * slip / 1e4);
+                    self.execute_fill(&mut inner, &intent, px, Liquidity::Taker);
+                } else {
+                    if let Some(o) = inner.orders.get_mut(&order_id) {
+                        o.status = OrderStatus::Working;
+                    }
+                    drop(inner);
+                    self.publish_update(&intent, OrderStatus::Working);
+                }
+            }
+            // A stop-limit becomes a resting LIMIT once triggered: it fills at
+            // the limit if the trigger tick is already marketable, otherwise it
+            // rests and the marker fills it per limit rules. Until triggered it
+            // rests as Working with the marker watching its stop.
+            OrderType::StopLimit => {
+                let stop = intent.stop_px.unwrap_or(0.0); // validated finite > 0
+                let limit = intent.limit_px.unwrap_or(0.0); // validated finite > 0
+                let last = self.store.last_price(&intent.symbol);
+                if last
+                    .map(|l| stop_triggered(intent.side, stop, l))
+                    .unwrap_or(false)
+                {
+                    let last = last.unwrap_or(0.0); // Some by the guard above
+                    if limit_marketable(intent.side, limit, last) {
+                        self.execute_fill(&mut inner, &intent, limit, Liquidity::Taker);
+                    } else if intent.tif == Tif::Ioc {
+                        inner.orders.remove(&order_id);
+                        drop(inner);
+                        self.publish_update(
+                            &intent,
+                            OrderStatus::Canceled {
+                                reason: "ioc not marketable".into(),
+                            },
+                        );
+                    } else {
+                        // Triggered but through the limit: rest as a plain
+                        // limit for the marker to fill per limit rules.
+                        intent.order_type = OrderType::Limit;
+                        if let Some(o) = inner.orders.get_mut(&order_id) {
+                            o.intent.order_type = OrderType::Limit;
+                            o.status = OrderStatus::Working;
+                        }
+                        drop(inner);
+                        self.publish_update(&intent, OrderStatus::Working);
+                    }
+                } else {
+                    if let Some(o) = inner.orders.get_mut(&order_id) {
+                        o.status = OrderStatus::Working;
+                    }
+                    drop(inner);
+                    self.publish_update(&intent, OrderStatus::Working);
+                }
+            }
         }
         order_id
     }
@@ -329,6 +439,7 @@ impl Oms {
                 qty: qty.abs(),
                 order_type: OrderType::Market,
                 limit_px: None,
+                stop_px: None,
                 tif: Tif::Ioc,
                 reduce_only: true,
                 source: OrderSource::RiskFlatten,
@@ -603,10 +714,60 @@ impl Oms {
         let now = now_ms();
         Self::roll_day(&mut inner, now);
 
+        // 1. Working stops whose trigger this tick reaches. A triggered Stop
+        //    fills as a market taker at the tick; a triggered StopLimit fills
+        //    at its limit when the tick is already marketable, else converts
+        //    to a resting limit that later ticks fill per limit rules.
+        let triggered: Vec<u64> = inner
+            .orders
+            .iter()
+            .filter(|(_, o)| {
+                matches!(o.status, OrderStatus::Working)
+                    && o.intent.symbol == symbol
+                    && matches!(o.intent.order_type, OrderType::Stop | OrderType::StopLimit)
+                    && o.intent
+                        .stop_px
+                        .map(|s| stop_triggered(o.intent.side, s, price))
+                        .unwrap_or(false)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in triggered {
+            let Some(intent) = inner.orders.get(&id).map(|o| o.intent.clone()) else {
+                continue;
+            };
+            match intent.order_type {
+                OrderType::StopLimit => {
+                    let limit = intent.limit_px.unwrap_or(0.0);
+                    if limit_marketable(intent.side, limit, price) {
+                        self.execute_fill(&mut inner, &intent, limit, Liquidity::Taker);
+                    } else if let Some(o) = inner.orders.get_mut(&id) {
+                        // Rest as a plain limit; future ticks fill it per the
+                        // crossed-limit pass below.
+                        o.intent.order_type = OrderType::Limit;
+                    }
+                }
+                // Stop fills as a market taker at the tick, worsened by slippage.
+                _ => {
+                    let slip = finite_or(self.cfg.slippage_bps, 0.0).max(0.0);
+                    let px = price * (1.0 + intent.side.sign() * slip / 1e4);
+                    self.execute_fill(&mut inner, &intent, px, Liquidity::Taker);
+                }
+            }
+        }
+
+        // 2. Resting limits (including stop-limits that have converted) whose
+        //    price this tick crosses fill at the limit as maker. Un-triggered
+        //    stop-limits are excluded here by the `Limit`-only guard so they
+        //    never fill before their stop arms.
         let crossed: Vec<OrderIntent> = inner
             .orders
             .values()
-            .filter(|o| matches!(o.status, OrderStatus::Working) && o.intent.symbol == symbol)
+            .filter(|o| {
+                matches!(o.status, OrderStatus::Working)
+                    && o.intent.symbol == symbol
+                    && matches!(o.intent.order_type, OrderType::Limit)
+            })
             .filter(|o| match (o.intent.side, o.intent.limit_px) {
                 (Side::Buy, Some(l)) => price <= l,
                 (Side::Sell, Some(l)) => price >= l,
@@ -701,6 +862,7 @@ mod tests {
             qty,
             order_type,
             limit_px,
+            stop_px: None,
             tif: Tif::Gtc,
             reduce_only: false,
             source: OrderSource::Manual,
@@ -713,6 +875,31 @@ mod tests {
         let mut i = intent(symbol, side, qty, OrderType::Market, None);
         i.reduce_only = true;
         i
+    }
+
+    /// A stop / stop-limit order intent. `limit_px` is None for a plain stop.
+    fn stop_intent(
+        symbol: &str,
+        side: Side,
+        qty: f64,
+        order_type: OrderType,
+        stop_px: Option<f64>,
+        limit_px: Option<f64>,
+    ) -> OrderIntent {
+        OrderIntent {
+            id: 0,
+            symbol: symbol.into(),
+            side,
+            qty,
+            order_type,
+            limit_px,
+            stop_px,
+            tif: Tif::Gtc,
+            reduce_only: false,
+            source: OrderSource::Manual,
+            rationale: "test stop".into(),
+            ts_ms: now_ms(),
+        }
     }
 
     fn setup(cfg: PaperConfig) -> (Arc<Bus>, Arc<BarStore>, Arc<Oms>) {
@@ -1166,5 +1353,349 @@ mod tests {
         assert!(oms.positions().is_empty());
         approx(oms.account().cash, 100_000.0);
         assert_eq!(oms.account().daily_trades, 0);
+    }
+
+    fn tick(symbol: &str, price: f64) -> EngineEvent {
+        EngineEvent::Tick(Tick {
+            symbol: symbol.into(),
+            ts_ms: now_ms(),
+            price,
+            size: 1.0,
+            aggressor: None,
+            venue: Venue::Paper,
+        })
+    }
+
+    #[tokio::test]
+    async fn buy_stop_triggers_only_at_or_above_stop_then_fills() {
+        let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
+        store.set_last_price("BTC-USD", 100.0);
+        let _marker = oms.spawn_marker();
+        let mut rx = bus.subscribe();
+
+        // Buy stop at 105 with last 100 -> not yet triggered -> rests Working.
+        let id = oms
+            .submit(stop_intent(
+                "BTC-USD",
+                Side::Buy,
+                1.0,
+                OrderType::Stop,
+                Some(105.0),
+                None,
+            ))
+            .await;
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Accepted));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Working));
+        assert_eq!(oms.open_orders().len(), 1);
+
+        // A tick BELOW the trigger must not fill.
+        bus.publish(tick("BTC-USD", 104.0));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(oms.open_orders()[0].status, OrderStatus::Working));
+        assert!(oms.positions().is_empty());
+
+        // A tick AT the trigger fills as a market taker at the tick price.
+        bus.publish(tick("BTC-USD", 105.0));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Filled));
+        approx(u.avg_fill_px, 105.0);
+        approx(u.filled_qty, 1.0);
+        approx(oms.positions()[0].qty, 1.0);
+        approx(oms.positions()[0].avg_px, 105.0);
+        assert_eq!(oms.account().daily_trades, 1);
+        assert!(oms.open_orders().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sell_stop_triggers_only_at_or_below_stop_then_fills() {
+        let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
+        store.set_last_price("ETH-USD", 100.0);
+        let _marker = oms.spawn_marker();
+        let mut rx = bus.subscribe();
+
+        // Sell stop at 95 with last 100 -> a stop BELOW the current price does
+        // NOT fire immediately (a sell stop arms only as price falls to it).
+        let id = oms
+            .submit(stop_intent(
+                "ETH-USD",
+                Side::Sell,
+                2.0,
+                OrderType::Stop,
+                Some(95.0),
+                None,
+            ))
+            .await;
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Accepted));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Working));
+
+        // A tick ABOVE the trigger must not fill.
+        bus.publish(tick("ETH-USD", 96.0));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(oms.open_orders()[0].status, OrderStatus::Working));
+        assert!(oms.positions().is_empty());
+
+        // A tick at the trigger fills; the short opens at the tick price.
+        bus.publish(tick("ETH-USD", 95.0));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Filled));
+        approx(u.avg_fill_px, 95.0);
+        approx(oms.positions()[0].qty, -2.0);
+        approx(oms.positions()[0].avg_px, 95.0);
+    }
+
+    #[tokio::test]
+    async fn stop_through_market_at_placement_fills_immediately() {
+        // Both sides: a BUY stop set BELOW last (last >= stop) and a SELL stop
+        // set ABOVE last (last <= stop) are already through their trigger, so
+        // they fire at placement without waiting for a tick.
+        let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
+        store.set_last_price("BTC-USD", 100.0);
+        let mut rx = bus.subscribe();
+
+        let id = oms
+            .submit(stop_intent(
+                "BTC-USD",
+                Side::Buy,
+                1.0,
+                OrderType::Stop,
+                Some(90.0),
+                None,
+            ))
+            .await;
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Accepted));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Filled)); // no Working — immediate
+        approx(u.avg_fill_px, 100.0);
+        approx(oms.positions()[0].qty, 1.0);
+
+        store.set_last_price("SOL-USD", 50.0);
+        let id = oms
+            .submit(stop_intent(
+                "SOL-USD",
+                Side::Sell,
+                1.0,
+                OrderType::Stop,
+                Some(60.0),
+                None,
+            ))
+            .await;
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Accepted));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Filled));
+        approx(u.avg_fill_px, 50.0);
+        approx(oms.position("SOL-USD").unwrap().qty, -1.0);
+    }
+
+    #[tokio::test]
+    async fn stop_limit_becomes_resting_limit_and_fills_per_limit_rules() {
+        let (bus, store, oms) = setup(cfg(0, 0.0, 5.0, 2.0));
+        store.set_last_price("BTC-USD", 95.0);
+        let _marker = oms.spawn_marker();
+        let mut rx = bus.subscribe();
+
+        // Buy stop-limit: stop 100, limit 99 (limit BELOW the stop). Last 95
+        // -> rests as a working stop-limit.
+        let id = oms
+            .submit(stop_intent(
+                "BTC-USD",
+                Side::Buy,
+                1.0,
+                OrderType::StopLimit,
+                Some(100.0),
+                Some(99.0),
+            ))
+            .await;
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Accepted));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Working));
+
+        // Tick to 100 arms the stop, but 100 is THROUGH the 99 limit (not
+        // marketable): it converts to a resting limit and does not fill.
+        bus.publish(tick("BTC-USD", 100.0));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(oms.open_orders().len(), 1);
+        assert!(matches!(oms.open_orders()[0].status, OrderStatus::Working));
+        assert!(oms.positions().is_empty());
+
+        // Price falls to the limit -> fills at 99 as a resting maker.
+        bus.publish(tick("BTC-USD", 98.0));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Filled));
+        approx(u.avg_fill_px, 99.0);
+        approx(oms.positions()[0].qty, 1.0);
+        approx(oms.positions()[0].avg_px, 99.0);
+        approx(oms.account().fees_paid, 99.0 * 2.0 / 1e4); // maker fee
+    }
+
+    #[tokio::test]
+    async fn stop_limit_triggered_and_marketable_fills_at_limit_as_taker() {
+        let (bus, store, oms) = setup(cfg(0, 0.0, 5.0, 2.0));
+        store.set_last_price("BTC-USD", 95.0);
+        let _marker = oms.spawn_marker();
+        let mut rx = bus.subscribe();
+
+        // Buy stop-limit: stop 100, limit 101 (limit ABOVE the stop). Rests,
+        // then a tick at 100 arms it and 100 <= 101 is marketable -> fills at
+        // the limit as a crossing taker.
+        let id = oms
+            .submit(stop_intent(
+                "BTC-USD",
+                Side::Buy,
+                1.0,
+                OrderType::StopLimit,
+                Some(100.0),
+                Some(101.0),
+            ))
+            .await;
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Accepted));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Working));
+
+        bus.publish(tick("BTC-USD", 100.0));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Filled));
+        approx(u.avg_fill_px, 101.0);
+        approx(oms.positions()[0].qty, 1.0);
+        approx(oms.account().fees_paid, 101.0 * 5.0 / 1e4); // taker fee
+    }
+
+    #[tokio::test]
+    async fn working_stop_limit_does_not_fill_as_a_limit_before_its_stop_arms() {
+        let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
+        store.set_last_price("BTC-USD", 95.0);
+        let _marker = oms.spawn_marker();
+        let mut rx = bus.subscribe();
+
+        // Buy stop-limit: stop 100, limit 99. It rests. A naive limit scan
+        // would see a buy limit at 99 and fill on any tick <= 99 — but the
+        // stop has NOT armed (price is below 100), so it must NOT fill.
+        let id = oms
+            .submit(stop_intent(
+                "BTC-USD",
+                Side::Buy,
+                1.0,
+                OrderType::StopLimit,
+                Some(100.0),
+                Some(99.0),
+            ))
+            .await;
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Accepted));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Working));
+
+        // A tick THROUGH the limit but below the stop must leave it resting.
+        bus.publish(tick("BTC-USD", 98.0));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(oms.open_orders().len(), 1);
+        assert!(matches!(oms.open_orders()[0].status, OrderStatus::Working));
+        assert!(oms.positions().is_empty());
+        assert_eq!(oms.account().daily_trades, 0);
+    }
+
+    #[tokio::test]
+    async fn stop_without_stop_px_is_rejected_with_a_clear_reason() {
+        let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
+        store.set_last_price("BTC-USD", 100.0);
+        let mut rx = bus.subscribe();
+
+        // Absent stop_px: rejected before ever being Accepted.
+        let id = oms
+            .submit(stop_intent(
+                "BTC-USD",
+                Side::Buy,
+                1.0,
+                OrderType::Stop,
+                None,
+                None,
+            ))
+            .await;
+        let u = next_update_for(&mut rx, id).await;
+        match &u.status {
+            OrderStatus::Canceled { reason } => {
+                assert_eq!(reason, "stop order requires a stop price")
+            }
+            other => panic!("expected cancel, got {other:?}"),
+        }
+
+        // NaN stop_px on a stop-limit is likewise rejected.
+        let id = oms
+            .submit(stop_intent(
+                "BTC-USD",
+                Side::Sell,
+                1.0,
+                OrderType::StopLimit,
+                Some(f64::NAN),
+                Some(100.0),
+            ))
+            .await;
+        let u = next_update_for(&mut rx, id).await;
+        match &u.status {
+            OrderStatus::Canceled { reason } => {
+                assert_eq!(reason, "stop order requires a stop price")
+            }
+            other => panic!("expected cancel, got {other:?}"),
+        }
+
+        // A stop-limit with a stop but no limit is rejected for the limit.
+        let id = oms
+            .submit(stop_intent(
+                "BTC-USD",
+                Side::Sell,
+                1.0,
+                OrderType::StopLimit,
+                Some(95.0),
+                None,
+            ))
+            .await;
+        let u = next_update_for(&mut rx, id).await;
+        match &u.status {
+            OrderStatus::Canceled { reason } => {
+                assert_eq!(reason, "stop-limit order requires a limit price")
+            }
+            other => panic!("expected cancel, got {other:?}"),
+        }
+
+        assert!(oms.open_orders().is_empty());
+        assert_eq!(oms.account().daily_trades, 0);
+        approx(oms.account().cash, 100_000.0);
+    }
+
+    #[tokio::test]
+    async fn protective_sell_stop_reduces_long_and_never_flips() {
+        let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
+        store.set_last_price("BTC-USD", 100.0);
+        let _marker = oms.spawn_marker();
+
+        // Open a 1.0 long.
+        oms.submit(intent("BTC-USD", Side::Buy, 1.0, OrderType::Market, None))
+            .await;
+
+        // A reduce-only protective sell stop for MORE than the position (5.0):
+        // when it triggers, the reduce-only clamp holds it to the live 1.0 so
+        // the position lands flat instead of flipping short.
+        let mut stop = stop_intent("BTC-USD", Side::Sell, 5.0, OrderType::Stop, Some(95.0), None);
+        stop.reduce_only = true;
+        let mut rx = bus.subscribe();
+        let id = oms.submit(stop).await;
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Accepted));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Working));
+
+        // Price falls through the stop.
+        bus.publish(tick("BTC-USD", 95.0));
+        let u = next_update_for(&mut rx, id).await;
+        assert!(matches!(u.status, OrderStatus::Filled));
+        approx(u.filled_qty, 1.0); // clamped to the live position, not 5.0
+        approx(oms.positions()[0].qty, 0.0); // flat, NEVER short
     }
 }

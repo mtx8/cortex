@@ -77,6 +77,14 @@ pub struct OrderIntent {
     pub qty: f64,
     pub order_type: OrderType,
     pub limit_px: Option<f64>,
+    /// Trigger price for `Stop` / `StopLimit` orders; `None` for market and
+    /// limit orders.
+    ///
+    /// WIRE COMPAT: additive `#[serde(default)]` field — payloads without it
+    /// still decode (None), so an old client's frame or a stored snapshot
+    /// never breaks. Clients (Swift) treat it as optional-with-default.
+    #[serde(default)]
+    pub stop_px: Option<f64>,
     pub tif: Tif,
     /// True when this order only reduces an existing position. Reduce-only
     /// orders pass risk on a dedicated (more permissive) path.
@@ -1062,6 +1070,39 @@ mod tests {
         assert!(json.contains("\"filing_index_url\""));
         let back: EngineEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn order_intent_stop_px_is_additive_and_defaults_none() {
+        // A pre-stop OrderIntent frame (no `stop_px`) must still decode —
+        // the field is additive with a default, so an old client's order or a
+        // stored snapshot never breaks a new engine.
+        let old = r#"{"id":7,"symbol":"BTC-USD","side":"buy","qty":1.0,
+            "order_type":"market","limit_px":null,"tif":"gtc","reduce_only":false,
+            "source":{"kind":"manual"},"rationale":"","ts_ms":1}"#;
+        let intent: OrderIntent = serde_json::from_str(old).unwrap();
+        assert_eq!(intent.stop_px, None);
+
+        // A populated stop order round-trips with a snake_case "stop_px".
+        let stop = OrderIntent {
+            id: 8,
+            symbol: "BTC-USD".into(),
+            side: Side::Sell,
+            qty: 2.0,
+            order_type: OrderType::StopLimit,
+            limit_px: Some(95.0),
+            stop_px: Some(96.0),
+            tif: Tif::Gtc,
+            reduce_only: true,
+            source: OrderSource::Manual,
+            rationale: "protective stop".into(),
+            ts_ms: 2,
+        };
+        let json = serde_json::to_string(&stop).unwrap();
+        assert!(json.contains("\"stop_px\":96.0"));
+        assert!(json.contains("\"order_type\":\"stop_limit\""));
+        let back: OrderIntent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, stop);
     }
 
     #[test]

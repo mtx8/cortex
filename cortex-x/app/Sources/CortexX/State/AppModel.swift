@@ -56,7 +56,7 @@ final class AppModel {
     private(set) var feeds: [String: FeedStatus] = [:]
 
     // MARK: Center sections
-    enum CenterMode: String, CaseIterable { case chart, scanner, news, filings, company, options, foundry, regimes, meridian }
+    enum CenterMode: String, CaseIterable { case chart, scanner, news, company, options, foundry, regimes, meridian }
     var centerMode: CenterMode = .chart
     private(set) var optionsChain: OptionsChain?
     private(set) var chainLoading = false
@@ -91,6 +91,11 @@ final class AppModel {
     /// active symbol when arriving via `openFilings`.
     private(set) var filingsQuery: String = ""
     private var filingsRequestSeq = 0
+    /// One-shot hint for NewsView: which tab to open on its next appear. Set by
+    /// `openFilings` so the COMPANY board's "all filings" affordance lands on
+    /// NEWS ▸ filings (filings now live as a tab inside the NEWS desk). NewsView
+    /// consumes it on appear, then clears it back to nil.
+    var newsInitialTab: NewsTab?
 
     // MARK: Copilot
     private(set) var copilot: [CopilotMessage] = []
@@ -143,6 +148,25 @@ final class AppModel {
     func start() { client.start() }
     func stop() { client.stop() }
     func send(_ command: Command) { client.send(command) }
+
+    // MARK: Order placement
+
+    /// Buying power for sizing (paper: cash). One accessor so the ticket's
+    /// %-of-buying-power chips read a single, named source.
+    var buyingPower: Double { account.cash }
+
+    /// The one order-placement path. Wraps `send(.placeOrder(...))` so every
+    /// ticket action (manual entry, flatten, reverse) funnels through the same
+    /// bus command with the stop price threaded through. Paper only.
+    func placeOrder(
+        symbol: String, side: Side, qty: Double, type: OrderType,
+        limitPx: Double?, stopPx: Double?
+    ) {
+        send(.placeOrder(
+            symbol: symbol, side: side, qty: qty, orderType: type,
+            limitPx: limitPx, stopPx: stopPx
+        ))
+    }
 
     // MARK: Derived
 
@@ -220,10 +244,13 @@ final class AppModel {
         requestCompany(companySymbol)
     }
 
-    /// Jump to the dedicated FILINGS section for a symbol and pull its EDGAR
-    /// filings. Called from the COMPANY board's "all filings" affordance.
+    /// Open NEWS ▸ filings for a symbol and pull its EDGAR filings. Called from
+    /// the COMPANY board's "all filings" affordance: filings now live as a tab
+    /// inside the NEWS desk, so switch to NEWS, hint the filings tab (NewsView
+    /// consumes the hint on appear), then request.
     func openFilings(_ symbol: String) {
-        centerMode = .filings
+        centerMode = .news
+        newsInitialTab = .filings
         requestFilings(query: symbol.uppercased())
     }
 

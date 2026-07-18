@@ -33,9 +33,20 @@ final class NewsSupportTests: XCTestCase {
 
     func testTabDefaultIsFeed() {
         XCTAssertEqual(NewsTab.default, .feed)
-        // The segmented order the tab bar renders.
-        XCTAssertEqual(NewsTab.allCases, [.feed, .earnings, .brief])
+        // The segmented order the tab bar renders — FILINGS sits between
+        // EARNINGS and AI BRIEF.
+        XCTAssertEqual(NewsTab.allCases, [.feed, .earnings, .filings, .brief])
+        XCTAssertEqual(NewsTab.filings.title, "filings")
         XCTAssertEqual(NewsTab.brief.title, "ai brief")
+    }
+
+    func testFilingsTabSitsBetweenEarningsAndBrief() throws {
+        let order = NewsTab.allCases
+        let earnings = try XCTUnwrap(order.firstIndex(of: .earnings))
+        let filings = try XCTUnwrap(order.firstIndex(of: .filings))
+        let brief = try XCTUnwrap(order.firstIndex(of: .brief))
+        XCTAssertLessThan(earnings, filings)
+        XCTAssertLessThan(filings, brief)
     }
 
     // MARK: - NewsFilter: empty = identity (except newest-first + cap)

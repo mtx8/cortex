@@ -9,7 +9,10 @@ import Foundation
 
 enum Side: String, Codable { case buy, sell }
 
-enum OrderType: String, Codable { case market, limit }
+// NEW OPTIONAL raw values `stop` / `stop_limit` are additive — old clients
+// keep decoding market/limit. Case names equal the serde snake_case wire
+// values verbatim (so `stop_limit`, never a swiftified `stopLimit`).
+enum OrderType: String, Codable { case market, limit, stop, stop_limit }
 
 enum Tif: String, Codable { case gtc, ioc, day }
 
@@ -160,6 +163,12 @@ struct OrderIntent: Codable, Equatable {
     var qty: Double
     var order_type: OrderType
     var limit_px: Double?
+    /// NEW OPTIONAL wire field — the stop/trigger price for stop &
+    /// stop-limit orders (absent → nil for market/limit and older engines).
+    /// The synthesized decoder treats an optional as decodeIfPresent, so a
+    /// payload without the key decodes nil rather than failing the frame; the
+    /// `= nil` default keeps the memberwise initializer callable without it.
+    var stop_px: Double? = nil
     var tif: Tif
     var reduce_only: Bool
     var source: OrderSource
@@ -945,7 +954,10 @@ enum ServerFrame {
 // MARK: - Outbound commands (client -> server), tag field "cmd"
 
 enum Command {
-    case placeOrder(symbol: String, side: Side, qty: Double, orderType: OrderType, limitPx: Double?)
+    case placeOrder(
+        symbol: String, side: Side, qty: Double, orderType: OrderType,
+        limitPx: Double?, stopPx: Double?
+    )
     case cancelOrder(orderId: UInt64)
     case setKillSwitch(engaged: Bool, reason: String)
     case setAutonomy(level: AutonomyLevel)
@@ -962,12 +974,15 @@ enum Command {
     func encoded() throws -> Data {
         var obj: [String: Any]
         switch self {
-        case let .placeOrder(symbol, side, qty, orderType, limitPx):
+        case let .placeOrder(symbol, side, qty, orderType, limitPx, stopPx):
             obj = [
                 "cmd": "place_order", "symbol": symbol, "side": side.rawValue,
                 "qty": qty, "order_type": orderType.rawValue,
             ]
+            // Both prices are additive + optional: the key ships only when set,
+            // so a market order's wire shape is unchanged from before.
             if let limitPx { obj["limit_px"] = limitPx }
+            if let stopPx { obj["stop_px"] = stopPx }
         case let .cancelOrder(orderId):
             obj = ["cmd": "cancel_order", "order_id": orderId]
         case let .setKillSwitch(engaged, reason):

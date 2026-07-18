@@ -314,6 +314,24 @@ final class FilingsTests: XCTestCase {
         XCTAssertEqual(out.map(\.filed), ["2026-06-01"])
     }
 
+    /// The OTHER chip, exercised through the real filtering path (`visible`),
+    /// keeps ONLY the forms no named chip claims. A Form 4 (insider) and a 10-K
+    /// are named and drop out; the unnamed forms (424B5, 6-K) survive. ALL keeps
+    /// everything. Guards the "OTHER does nothing / shows named rows" regression.
+    func testVisibleOtherKeepsOnlyUnnamedForms() {
+        let now = day("2026-07-12")
+        let rows = [
+            entry(form: "4", filed: "2026-05-01", accession: "a"),      // insider — named
+            entry(form: "10-K", filed: "2026-04-01", accession: "b"),   // named
+            entry(form: "424B5", filed: "2026-03-01", accession: "c"),  // unnamed
+            entry(form: "6-K", filed: "2026-02-01", accession: "d"),    // unnamed
+        ]
+        let other = FilingsSupport.visible(rows, form: .other, range: .all, sort: .default, now: now)
+        XCTAssertEqual(other.map(\.form), ["424B5", "6-K"]) // newest filed first
+        let all = FilingsSupport.visible(rows, form: .all, range: .all, sort: .default, now: now)
+        XCTAssertEqual(all.count, 4)
+    }
+
     // MARK: - AppModel flow
 
     @MainActor
@@ -382,10 +400,14 @@ final class FilingsTests: XCTestCase {
     }
 
     @MainActor
-    func testOpenFilingsSwitchesModeAndRequests() {
+    func testOpenFilingsSwitchesToNewsFilingsTabAndRequests() {
+        // FILINGS now lives as a tab inside the NEWS desk: openFilings switches
+        // to NEWS and hints the filings tab (NewsView consumes the hint on
+        // appear), then pulls the entity's filings.
         let model = AppModel()
         model.openFilings("nvda")
-        XCTAssertEqual(model.centerMode, .filings)
+        XCTAssertEqual(model.centerMode, .news)
+        XCTAssertEqual(model.newsInitialTab, .filings)
         XCTAssertTrue(model.filingsLoading)
         XCTAssertEqual(model.filingsQuery, "NVDA")
     }
