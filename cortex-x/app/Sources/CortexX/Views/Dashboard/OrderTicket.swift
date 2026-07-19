@@ -661,7 +661,13 @@ struct OrderTicket: View {
     // MARK: Actions
 
     private func select(_ s: String) {
-        symbolOverride = s == model.selectedSymbol ? nil : s
+        // Picking a symbol in the ticket drives the GLOBAL selection, so the
+        // chart (pane 0 in multi-chart view) and the rest of the workspace load
+        // it too — the ticket and the chart stay on the same instrument. This is
+        // the same path a watchlist tap takes (history fetch included). The local
+        // override is cleared so the ticket simply follows the selection it set.
+        symbolOverride = nil
+        model.selectSymbol(s)
         seedPricesIfNeeded()
     }
 
