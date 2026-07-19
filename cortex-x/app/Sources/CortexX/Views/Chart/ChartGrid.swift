@@ -99,14 +99,26 @@ struct ChartGrid: View {
                 paneView(1)
             }
         case .quad:
-            VStack(spacing: Self.gap) {
-                HStack(spacing: Self.gap) {
-                    paneView(0)
-                    paneView(1)
-                }
-                HStack(spacing: Self.gap) {
-                    paneView(2)
-                    paneView(3)
+            // Explicit 2x2 cell sizing. A plain VStack-of-HStacks of greedy,
+            // GeometryReader-backed panes (each CandleChart wraps one) does NOT
+            // converge in SwiftUI's layout engine: the two flexible rows and
+            // their flexible panes renegotiate ideal sizes every pass, pegging
+            // a layout worker thread at ~100% CPU forever (single/dual don't
+            // nest flexible stacks, so they settle). Handing each pane a fixed
+            // half-minus-gap frame removes every free variable, so the solver
+            // has nothing to iterate and the grid settles immediately.
+            GeometryReader { geo in
+                let cellW = max(0, (geo.size.width - Self.gap) / 2)
+                let cellH = max(0, (geo.size.height - Self.gap) / 2)
+                VStack(spacing: Self.gap) {
+                    HStack(spacing: Self.gap) {
+                        paneView(0).frame(width: cellW, height: cellH)
+                        paneView(1).frame(width: cellW, height: cellH)
+                    }
+                    HStack(spacing: Self.gap) {
+                        paneView(2).frame(width: cellW, height: cellH)
+                        paneView(3).frame(width: cellW, height: cellH)
+                    }
                 }
             }
         }
