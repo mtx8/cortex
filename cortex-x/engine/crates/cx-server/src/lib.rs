@@ -33,8 +33,19 @@ use cx_core::{Bus, Command};
 /// non-critical events start dropping.
 const OUT_QUEUE: usize = 1024;
 
-/// Bars per symbol included in the connect-time snapshot.
-const CONNECT_SNAPSHOT_BARS: u32 = 1_200;
+/// History depth requested for the automatic connect-time snapshot.
+///
+/// This is the ceiling for the DEEP interval (D1): ≈1300 daily bars covers ~5y
+/// of trading days for both configured and universe symbols. It is NOT the
+/// intraday depth — the snapshot source (`SnapshotSource::snapshot`) applies its
+/// own slim per-interval profile, capping intraday to a modest window so a
+/// normal connect ships on the order of 1–2 MB instead of ~8 MB.
+///
+/// A client-driven `Command::Sync` forwards its OWN `bars_per_symbol` unchanged
+/// (see the reader loop below): a range preset asking for the full store depth
+/// (up to 3000) still works, while the default connect stays on the slim
+/// profile. Keep this consistent with the source's D1 cap in `cortexd`.
+const CONNECT_SNAPSHOT_BARS: u32 = 1_300;
 
 /// Provider of the connect/sync state snapshot. Implementations must be cheap
 /// and non-blocking: this is called inline on client tasks.
@@ -327,6 +338,37 @@ mod tests {
             }
         });
         wire_rx
+    }
+
+    /// Snapshot source that echoes the requested depth so we can assert which
+    /// `bars_per_symbol` each call site forwards.
+    struct EchoSource;
+    impl SnapshotSource for EchoSource {
+        fn snapshot(&self, bars_per_symbol: u32) -> serde_json::Value {
+            serde_json::json!({ "requested_bars": bars_per_symbol })
+        }
+    }
+
+    /// The automatic connect snapshot must request the DEEP-but-slim default
+    /// (enough D1 for ~5y, ≈1300 bars, without maxing the 3000-bar store), and
+    /// a client-driven `Sync` must forward its OWN count unchanged — so a range
+    /// preset asking for the full 3000 still works while connect stays slim.
+    #[test]
+    fn connect_uses_deep_default_and_sync_forwards_requested_count() {
+        // Connect path: snapshot_frame(&snap, CONNECT_SNAPSHOT_BARS).
+        let connect: serde_json::Value =
+            serde_json::from_str(&snapshot_frame(&EchoSource, CONNECT_SNAPSHOT_BARS)).unwrap();
+        assert_eq!(connect["type"], "snapshot");
+        assert_eq!(connect["data"]["requested_bars"], CONNECT_SNAPSHOT_BARS);
+        // Deep enough for ~5y of daily bars, but never the store maximum.
+        assert!((1_300..3_000).contains(&CONNECT_SNAPSHOT_BARS));
+
+        // Sync path: snapshot_frame(&snap, bars_per_symbol) with the client's
+        // own value — a full-depth range preset is forwarded verbatim.
+        let sync: serde_json::Value =
+            serde_json::from_str(&snapshot_frame(&EchoSource, 3_000)).unwrap();
+        assert_eq!(sync["type"], "snapshot");
+        assert_eq!(sync["data"]["requested_bars"], 3_000);
     }
 
     fn tick(n: i64) -> EngineEvent {

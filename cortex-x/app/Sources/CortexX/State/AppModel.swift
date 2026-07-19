@@ -174,10 +174,26 @@ final class AppModel {
     /// one may replace what the operator is viewing.
     private var requestedChainUnderlying: String?
 
+    /// Display-rate coalescer for the high-frequency market frames (tick /
+    /// book_top / depth / flow / tape / forming bar). It buffers the LATEST of
+    /// each instead of flipping observable state at feed rate; a bounded flush
+    /// commits the batch. `@ObservationIgnored` so buffering never itself
+    /// triggers a SwiftUI pass. See `receive`.
+    @ObservationIgnored private var coalescer = MarketCoalescer()
+    /// One pending flush at a time — a buffered frame arms the timer, further
+    /// frames in the same window just add to the buffer.
+    @ObservationIgnored private var flushScheduled = false
+    /// Display-rate flush interval (ms). ~12 Hz: caps market-driven re-renders
+    /// at ~12/s instead of the ~40/s feed rate, with no perceptible lag.
+    static let flushMs = 80
+
     init(client: EngineClient = EngineClient()) {
         self.client = client
         self.brokerSettings = BrokerSettingsStore.load()
-        client.onFrame = { [weak self] frame in self?.apply(frame) }
+        // Frames land in `receive`, which coalesces the high-frequency ones to
+        // display rate before they reach `apply` (the single source of truth
+        // for HOW a frame mutates state).
+        client.onFrame = { [weak self] frame in self?.receive(frame) }
         client.onStateChange = { [weak self] s in self?.handleStateChange(s) }
     }
 
@@ -202,6 +218,10 @@ final class AppModel {
             tape = []
             depthSymbol = nil
             depthDelivered = false
+            // Drop any buffered market frames from the dead connection so a
+            // stale tick/book/print can never flush across the reconnect
+            // (the fresh snapshot + live stream repopulate from scratch).
+            coalescer.clear()
         }
     }
 
@@ -602,6 +622,49 @@ final class AppModel {
         }
     }
 
+    // MARK: Display-rate coalescing
+
+    /// Every engine frame enters here. The high-frequency market frames (tick /
+    /// book_top / depth / flow / tape and the FORMING bar) drown the UI in
+    /// re-renders at ~40 Hz, so they are buffered in the coalescer and committed
+    /// together on a ~12 Hz flush — the view repaints from market data at most
+    /// ~12/s. Everything else (completed bars, orders, fills, positions, risk,
+    /// account, thoughts, snapshots, answers, …) is low-frequency and/or
+    /// interaction-critical and applies immediately. `apply` stays the single
+    /// source of truth for HOW a frame mutates state; this only governs HOW
+    /// OFTEN, never WHAT — the subscription guards, ring caps and session math
+    /// all still run in `apply` exactly as before.
+    func receive(_ frame: ServerFrame) {
+        if coalescer.ingest(frame) {
+            scheduleFlush()
+        } else {
+            apply(frame)
+        }
+    }
+
+    /// Arm the display-rate flush if one is not already pending. The first
+    /// buffered frame in a window schedules the commit; later frames in the same
+    /// window fall into the same buffer and ride the same flush.
+    private func scheduleFlush() {
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(Self.flushMs))
+            guard let self else { return }
+            self.flushScheduled = false
+            self.flushMarket()
+        }
+    }
+
+    /// Commit the buffered market frames in ONE synchronous pass, so the many
+    /// mutations coalesce into a single SwiftUI update. Each drained frame runs
+    /// through `apply`, so a flushed tick/book/depth/flow/tape/forming-bar is
+    /// applied by the very same code path (and guards) as an immediate frame.
+    /// Called by the flush timer; exposed for tests to drive deterministically.
+    func flushMarket() {
+        for frame in coalescer.drain() { apply(frame) }
+    }
+
     // MARK: Frame application
 
     func apply(_ frame: ServerFrame) {
@@ -826,5 +889,113 @@ final class AppModel {
             if series.count > maxBars { series.removeFirst(series.count - maxBars) }
         }
         bars[bar.symbol, default: [:]][bar.interval] = series
+    }
+}
+
+// MARK: - Market frame coalescer (pure)
+
+/// Buffers the high-frequency market frames so the UI commits them at display
+/// rate instead of feed rate. It keeps the LATEST tick/book_top per symbol, the
+/// latest depth/flow, the latest FORMING bar per (symbol, interval), and the
+/// batch of tape prints in arrival order; `drain` hands the whole batch back as
+/// an ordered apply list. Completed bars and every low-frequency frame are NOT
+/// buffered — `ingest` reports them as pass-through so the caller applies them
+/// at once. Value type, Foundation-only, no observation — unit-tested in
+/// isolation. Correctness rule: draining and applying the batch produces the
+/// same state the un-buffered path would, only less often.
+struct MarketCoalescer {
+    /// Identity of a bar series — a forming bar coalesces within its own series.
+    struct FormingKey: Hashable {
+        var symbol: String
+        var interval: Interval
+    }
+
+    private var ticks: [String: Tick] = [:]
+    private var bookTops: [String: BookTop] = [:]
+    /// Latest depth / flow keyed BY SYMBOL (not a single slot): the engine
+    /// streams one book at a time, but a late in-flight frame from a just-
+    /// unsubscribed symbol can briefly overlap the subscribed one in a window.
+    /// Keying by symbol means such a straggler can never displace the valid
+    /// book — `apply`'s subscription guard then keeps only the subscribed one,
+    /// exactly as the un-buffered path did.
+    private var depths: [String: BookDepth] = [:]
+    private var flows: [String: FlowRead] = [:]
+    private var tapeBatch: [TapePrint] = []
+    private var formingBars: [FormingKey: Bar] = [:]
+
+    /// Whether anything is buffered — lets the flush skip an empty drain.
+    var hasPending: Bool {
+        !ticks.isEmpty || !bookTops.isEmpty || !depths.isEmpty || !flows.isEmpty
+            || !tapeBatch.isEmpty || !formingBars.isEmpty
+    }
+
+    /// Buffer `frame` for the display-rate flush, returning whether it was
+    /// buffered. High-frequency market frames buffer (true); a COMPLETED bar
+    /// and every other (low-frequency / interaction-critical) frame return
+    /// false so the caller applies them immediately. A completed bar also drops
+    /// any superseded forming bar for its series (open at or before it) so a
+    /// stale forming frame can never flush over the just-closed bar.
+    mutating func ingest(_ frame: ServerFrame) -> Bool {
+        switch frame {
+        case .tick(let t):
+            ticks[t.symbol] = t
+            return true
+        case .bookTop(let b):
+            bookTops[b.symbol] = b
+            return true
+        case .depth(let d):
+            depths[d.symbol] = d
+            return true
+        case .flow(let f):
+            flows[f.symbol] = f
+            return true
+        case .tape(let p):
+            tapeBatch.append(p)
+            return true
+        case .bar(let bar):
+            let key = FormingKey(symbol: bar.symbol, interval: bar.interval)
+            if bar.complete {
+                if let buffered = formingBars[key], buffered.ts_open_ms <= bar.ts_open_ms {
+                    formingBars[key] = nil
+                }
+                return false
+            }
+            formingBars[key] = bar
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The buffered frames as an ordered apply list, then reset. Order is
+    /// irrelevant to correctness (the categories are independent, and superseded
+    /// forming bars were already dropped at ingest): forming bars lead, and the
+    /// tape trails in ARRIVAL order so the newest-first insertion in `apply`
+    /// still yields a chronological tape.
+    mutating func drain() -> [ServerFrame] {
+        guard hasPending else { return [] }
+        var frames: [ServerFrame] = []
+        frames.reserveCapacity(
+            formingBars.count + ticks.count + bookTops.count
+                + depths.count + flows.count + tapeBatch.count
+        )
+        for bar in formingBars.values { frames.append(.bar(bar)) }
+        for t in ticks.values { frames.append(.tick(t)) }
+        for b in bookTops.values { frames.append(.bookTop(b)) }
+        for d in depths.values { frames.append(.depth(d)) }
+        for f in flows.values { frames.append(.flow(f)) }
+        for p in tapeBatch { frames.append(.tape(p)) }
+        clear()
+        return frames
+    }
+
+    /// Discard every buffered frame (e.g. on disconnect) without applying.
+    mutating func clear() {
+        ticks.removeAll(keepingCapacity: true)
+        bookTops.removeAll(keepingCapacity: true)
+        depths.removeAll(keepingCapacity: true)
+        flows.removeAll(keepingCapacity: true)
+        tapeBatch.removeAll(keepingCapacity: true)
+        formingBars.removeAll(keepingCapacity: true)
     }
 }

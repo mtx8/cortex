@@ -23,6 +23,32 @@ use cx_server::SnapshotSource;
 const THOUGHT_RING: usize = 100;
 const ORDER_RING: usize = 100;
 
+/// Per-interval history depth for the connect/reconnect snapshot — the SLIM
+/// profile that keeps the default payload small without losing the deep D1 the
+/// charts need.
+///
+/// Sizing rationale: the snapshot's cost is dominated by INTRADAY bars for the
+/// handful of configured symbols. Live feeds fill each intraday series toward
+/// the store's `MAX_BARS` (3000), so shipping every interval at full depth is
+/// what pushed the connect blob to ~8 MB (`6 symbols × 5 intraday × 3000`).
+///
+/// The wire caps by interval class:
+/// - **D1** is the DEEP interval: shipped up to `bars_per_symbol` (store max
+///   3000). A normal connect asks for [`CONNECT_SNAPSHOT_BARS`](cx_server)
+///   (≈1300 → ~5y of trading days) for BOTH configured and universe symbols; a
+///   range-preset `Command::Sync` may lift it to the store maximum.
+/// - **Intraday** (`s1`/`m1`/`m5`/`m15`/`h1`) is capped at
+///   [`INTRADAY_SNAPSHOT_BARS`] and only for CONFIGURED symbols. A longer
+///   intraday span is served by switching to a coarser interval, never by
+///   shipping thousands of 1s/1m bars on every connect. A deep `Sync` lifts
+///   D1 depth only; intraday stays capped at [`INTRADAY_SNAPSHOT_BARS`].
+/// - **Universe** symbols carry D1 ONLY (research history; no live intraday) —
+///   unchanged from before, restated here so the profile is one place.
+///
+/// A client requesting fewer than the cap still gets exactly what it asked for
+/// (the cap is a ceiling, never a floor).
+const INTRADAY_SNAPSHOT_BARS: usize = 400;
+
 pub struct SnapshotSrc {
     symbols: Vec<String>,
     /// Scan-universe symbols beyond the configured set: D1-only history in
@@ -174,34 +200,69 @@ fn depth_snapshot_map(depth_last: Option<BookDepth>) -> Option<HashMap<String, B
     depth_last.map(|d| HashMap::from([(d.symbol.clone(), d)]))
 }
 
-impl SnapshotSource for SnapshotSrc {
-    fn snapshot(&self, bars_per_symbol: u32) -> serde_json::Value {
-        let n = bars_per_symbol.clamp(10, 3_000) as usize;
-        let mut bars = serde_json::Map::new();
-        for symbol in &self.symbols {
-            let mut per_interval = serde_json::Map::new();
-            for interval in Interval::ALL {
-                let series = self.store.recent(symbol, interval, n);
-                if !series.is_empty() {
-                    // Interval serializes as its serde snake_case name ("m1").
-                    let key = serde_json::to_value(interval)
-                        .ok()
-                        .and_then(|v| v.as_str().map(String::from))
-                        .unwrap_or_else(|| interval.label().into());
-                    per_interval.insert(key, serde_json::to_value(&series).unwrap_or_default());
-                }
+/// Interval's serde snake_case wire key ("m1", "d1", …), falling back to its
+/// human label only if the (infallible in practice) serialization ever fails.
+fn interval_key(interval: Interval) -> String {
+    serde_json::to_value(interval)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| interval.label().into())
+}
+
+/// Assemble the per-symbol → per-interval bar map for the snapshot wire under
+/// the SLIM history profile documented on [`INTRADAY_SNAPSHOT_BARS`]:
+/// - **Configured** symbols get DEEP D1 (up to `bars_per_symbol`, store max
+///   3000) plus a MODEST intraday window (each of s1/m1/m5/m15/h1 capped at
+///   `INTRADAY_SNAPSHOT_BARS`).
+/// - **Universe** symbols get DEEP D1 ONLY — never intraday.
+///
+/// Empty series are omitted so the app only sees intervals that actually hold
+/// data. Configured symbols always get an entry (possibly an empty object);
+/// universe symbols appear only when they have D1 — behaviour preserved from
+/// the original inline builder. Nothing is fabricated: depth is whatever the
+/// store honestly holds, bounded by the caps.
+fn build_bars_map(
+    store: &BarStore,
+    symbols: &[String],
+    universe: &[String],
+    bars_per_symbol: u32,
+) -> serde_json::Map<String, serde_json::Value> {
+    // D1 is the deep interval: honour the requested depth up to the store max.
+    let d1_n = bars_per_symbol.clamp(10, 3_000) as usize;
+    // Intraday is held to the modest cap, but never more than was requested.
+    let intraday_n = d1_n.min(INTRADAY_SNAPSHOT_BARS);
+
+    let mut bars = serde_json::Map::new();
+    for symbol in symbols {
+        let mut per_interval = serde_json::Map::new();
+        for interval in Interval::ALL {
+            let cap = if interval == Interval::D1 { d1_n } else { intraday_n };
+            let series = store.recent(symbol, interval, cap);
+            if !series.is_empty() {
+                per_interval
+                    .insert(interval_key(interval), serde_json::to_value(&series).unwrap_or_default());
             }
+        }
+        bars.insert(symbol.clone(), serde_json::Value::Object(per_interval));
+    }
+    // Universe symbols: DEEP D1 only (delayed research history, not live feeds).
+    for symbol in universe {
+        let series = store.recent(symbol, Interval::D1, d1_n);
+        if !series.is_empty() {
+            let mut per_interval = serde_json::Map::new();
+            per_interval.insert("d1".into(), serde_json::to_value(&series).unwrap_or_default());
             bars.insert(symbol.clone(), serde_json::Value::Object(per_interval));
         }
-        // Universe symbols: D1 only (delayed research history, not live feeds).
-        for symbol in &self.universe {
-            let series = self.store.recent(symbol, Interval::D1, n);
-            if !series.is_empty() {
-                let mut per_interval = serde_json::Map::new();
-                per_interval.insert("d1".into(), serde_json::to_value(&series).unwrap_or_default());
-                bars.insert(symbol.clone(), serde_json::Value::Object(per_interval));
-            }
-        }
+    }
+    bars
+}
+
+impl SnapshotSource for SnapshotSrc {
+    fn snapshot(&self, bars_per_symbol: u32) -> serde_json::Value {
+        // Slim history profile: deep D1 (configured + universe), capped intraday
+        // for configured only, no intraday for universe. See build_bars_map /
+        // INTRADAY_SNAPSHOT_BARS for the per-interval caps and rationale.
+        let bars = build_bars_map(&self.store, &self.symbols, &self.universe, bars_per_symbol);
         let thoughts: Vec<AgentThought> = self
             .thoughts
             .lock()
@@ -276,7 +337,168 @@ impl SnapshotSource for SnapshotSrc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cx_core::events::BookLevel;
+    use cx_core::events::{Bar, BookLevel};
+
+    /// Seed `count` synthetic complete bars for one (symbol, interval) into the
+    /// store. Timestamps are distinct + increasing (bucket-aligned by the
+    /// interval's ms) so the store keeps them in order. Values are finite.
+    fn seed(store: &BarStore, symbol: &str, interval: Interval, count: usize) {
+        for i in 0..count {
+            store.push(Bar {
+                symbol: symbol.to_string(),
+                interval,
+                ts_open_ms: (i as i64 + 1) * interval.ms(),
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 1.0,
+                trade_count: 1,
+                vwap: 100.2,
+                complete: true,
+            });
+        }
+    }
+
+    /// Row count the wire carries for `symbol`/`key`; 0 when the interval is
+    /// absent (the slim profile omits empty series entirely).
+    fn rows(bars: &serde_json::Map<String, serde_json::Value>, symbol: &str, key: &str) -> usize {
+        bars.get(symbol)
+            .and_then(|s| s.get(key))
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    }
+
+    const INTRADAY_KEYS: [&str; 5] = ["s1", "m1", "m5", "m15", "h1"];
+
+    /// Connect profile: configured symbols ship DEEP D1 but every intraday
+    /// interval is capped at `INTRADAY_SNAPSHOT_BARS`, even though the store
+    /// holds far more. The universe symbol ships D1 ONLY — no intraday key.
+    #[test]
+    fn slim_profile_deep_d1_capped_intraday_universe_d1_only() {
+        let store = BarStore::new();
+        // Configured symbol, every interval filled to the store maximum.
+        for interval in Interval::ALL {
+            seed(&store, "BTC-USD", interval, 3_000);
+        }
+        // Universe symbol: D1 history plus (deliberately) intraday that MUST be
+        // dropped — universe carries daily research history only.
+        seed(&store, "AAPL", Interval::D1, 3_000);
+        seed(&store, "AAPL", Interval::M1, 3_000);
+
+        let symbols = vec!["BTC-USD".to_string()];
+        let universe = vec!["AAPL".to_string()];
+        // The connect default depth (deep D1, ~5y).
+        let bars = build_bars_map(&store, &symbols, &universe, 1_300);
+
+        // Configured: deep D1, modest intraday.
+        assert_eq!(rows(&bars, "BTC-USD", "d1"), 1_300, "D1 stays deep");
+        for key in INTRADAY_KEYS {
+            assert_eq!(
+                rows(&bars, "BTC-USD", key),
+                INTRADAY_SNAPSHOT_BARS,
+                "intraday {key} capped"
+            );
+        }
+
+        // Universe: D1 only, and NO intraday key present at all.
+        assert_eq!(rows(&bars, "AAPL", "d1"), 1_300, "universe D1 stays deep");
+        for key in INTRADAY_KEYS {
+            assert!(
+                bars["AAPL"].get(key).is_none(),
+                "universe must never ship intraday ({key})"
+            );
+        }
+    }
+
+    /// A range-preset `Sync` may lift D1 to the store maximum; intraday stays
+    /// capped regardless (a longer intraday span means a coarser interval).
+    #[test]
+    fn deep_sync_lifts_d1_but_intraday_stays_capped() {
+        let store = BarStore::new();
+        for interval in Interval::ALL {
+            seed(&store, "BTC-USD", interval, 3_000);
+        }
+        seed(&store, "AAPL", Interval::D1, 3_000);
+
+        let symbols = vec!["BTC-USD".to_string()];
+        let universe = vec!["AAPL".to_string()];
+        let bars = build_bars_map(&store, &symbols, &universe, 3_000);
+
+        assert_eq!(rows(&bars, "BTC-USD", "d1"), 3_000, "D1 honours the deep ask");
+        assert_eq!(rows(&bars, "AAPL", "d1"), 3_000, "universe D1 too");
+        for key in INTRADAY_KEYS {
+            assert_eq!(
+                rows(&bars, "BTC-USD", key),
+                INTRADAY_SNAPSHOT_BARS,
+                "intraday {key} still capped at 3000-bar sync"
+            );
+        }
+    }
+
+    /// The cap is a CEILING, not a floor: a client asking for fewer than the
+    /// intraday cap gets exactly what it asked for across all intervals, and
+    /// the request is clamped to the store's own bounds (min 10, max 3000).
+    #[test]
+    fn small_request_scales_every_interval_and_clamps() {
+        let store = BarStore::new();
+        for interval in Interval::ALL {
+            seed(&store, "BTC-USD", interval, 3_000);
+        }
+        let symbols = vec!["BTC-USD".to_string()];
+
+        // Below the intraday cap: every interval returns the requested count.
+        let bars = build_bars_map(&store, &symbols, &[], 50);
+        assert_eq!(rows(&bars, "BTC-USD", "d1"), 50);
+        for key in INTRADAY_KEYS {
+            assert_eq!(rows(&bars, "BTC-USD", key), 50, "intraday {key} scales down");
+        }
+
+        // Below the store floor (10): clamped up, never zero.
+        let clamped = build_bars_map(&store, &symbols, &[], 1);
+        assert_eq!(rows(&clamped, "BTC-USD", "d1"), 10);
+
+        // Above the store ceiling (3000): clamped down to what the store holds.
+        let maxed = build_bars_map(&store, &symbols, &[], 9_999);
+        assert_eq!(rows(&maxed, "BTC-USD", "d1"), 3_000);
+    }
+
+    /// Size sanity: with every interval maxed, the slim connect profile keeps
+    /// TOTAL rows far below the old "all intervals at full depth" blob. Per
+    /// configured symbol the profile is `D1(≤n) + 5×INTRADAY_SNAPSHOT_BARS`;
+    /// per universe symbol it is `D1(≤n)` only.
+    #[test]
+    fn total_row_count_stays_within_caps() {
+        let store = BarStore::new();
+        for interval in Interval::ALL {
+            seed(&store, "BTC-USD", interval, 3_000);
+            seed(&store, "ETH-USD", interval, 3_000);
+        }
+        for sym in ["AAPL", "MSFT", "NVDA"] {
+            seed(&store, sym, Interval::D1, 3_000);
+            seed(&store, sym, Interval::M1, 3_000); // must be ignored
+        }
+        let symbols = vec!["BTC-USD".to_string(), "ETH-USD".to_string()];
+        let universe = vec!["AAPL".to_string(), "MSFT".to_string(), "NVDA".to_string()];
+
+        let bars = build_bars_map(&store, &symbols, &universe, 1_300);
+        let total: usize = bars
+            .values()
+            .flat_map(|s| s.as_object().into_iter().flat_map(|o| o.values()))
+            .filter_map(|v| v.as_array().map(|a| a.len()))
+            .sum();
+
+        // Old worst case for this fixture (every interval at full 3000):
+        //   2 configured × 6 × 3000  +  3 universe × 1 × 3000 = 45,000 rows.
+        // Slim profile:
+        //   2 × (1300 + 5×400)  +  3 × 1300 = 6600 + 3900 = 10,500 rows.
+        let per_configured = 1_300 + 5 * INTRADAY_SNAPSHOT_BARS;
+        let expected = symbols.len() * per_configured + universe.len() * 1_300;
+        assert_eq!(total, expected);
+        assert_eq!(total, 10_500);
+        assert!(total < 45_000, "slim profile must cut most of the payload");
+    }
 
     fn sample_depth(symbol: &str) -> BookDepth {
         BookDepth {

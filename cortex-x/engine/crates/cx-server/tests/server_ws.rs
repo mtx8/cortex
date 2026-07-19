@@ -54,7 +54,9 @@ async fn websocket_gateway_full_protocol() {
         .await
         .expect("connect");
 
-    // 1. hello then snapshot(300), in that order.
+    // 1. hello then the connect snapshot, in that order. The automatic connect
+    //    requests the DEEP-but-slim default depth (CONNECT_SNAPSHOT_BARS ≈ 1300
+    //    → ~5y of D1); the source slims intraday itself.
     let hello = next_json(&mut ws).await;
     assert_eq!(hello["type"], "hello");
     assert_eq!(hello["app"], "cortex-x");
@@ -63,7 +65,7 @@ async fn websocket_gateway_full_protocol() {
 
     let snapshot = next_json(&mut ws).await;
     assert_eq!(snapshot["type"], "snapshot");
-    assert_eq!(snapshot["data"]["bars_per_symbol"], 1_200);
+    assert_eq!(snapshot["data"]["bars_per_symbol"], 1_300);
 
     assert_eq!(client_count(), 1);
 

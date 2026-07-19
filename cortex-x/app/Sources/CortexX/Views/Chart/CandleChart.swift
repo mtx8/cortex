@@ -35,6 +35,12 @@ struct CandleChart: View {
     let drawingStore: DrawingStore
 
     @FocusState private var focused: Bool
+    /// Per-pane memo for the indicator series (EMA/BB/RSI/MACD). Keyed on the
+    /// bar-series identity + overlay toggles, so pan / zoom / crosshair and
+    /// unrelated-symbol repaints reuse it instead of recomputing over the full
+    /// window every draw. A reference type held as @State, so it survives the
+    /// pane's redraws; plain (non-observed), so writing it never re-triggers one.
+    @State private var indicatorCache = IndicatorCache()
 
     /// Equity intraday chart: enables the ext toggle + its wash, and turns an
     /// empty series into a clear "no bars" notice rather than a load spinner.
@@ -53,14 +59,15 @@ struct CandleChart: View {
             } else {
                 chartBody(
                     ChartFrame(
-                        bars: bars, interval: interval, barSpanMs: barSpanMs,
-                        signals: signals, thoughts: thoughts,
+                        symbol: symbol, bars: bars, interval: interval,
+                        barSpanMs: barSpanMs, signals: signals, thoughts: thoughts,
                         drawings: drawingStore.drawings(for: symbol),
                         size: geo.size, interaction: interaction,
                         // Equity intraday only, and only while the ext toggle
                         // is on: D1/weekly bars are whole RTH sessions and
                         // crypto trades 24/7 — nothing to shade there.
-                        shadeExtendedHours: equityIntraday && interaction.showExtendedHours
+                        shadeExtendedHours: equityIntraday && interaction.showExtendedHours,
+                        indicatorCache: indicatorCache
                     )
                 )
             }
@@ -631,10 +638,10 @@ private struct ChartFrame {
     let shadeExtendedHours: Bool
 
     init?(
-        bars: [Bar], interval: Interval, barSpanMs: Int64,
+        symbol: String, bars: [Bar], interval: Interval, barSpanMs: Int64,
         signals: [StrategySignal], thoughts: [AgentThought],
         drawings: [Drawing], size: CGSize, interaction: ChartInteraction,
-        shadeExtendedHours: Bool
+        shadeExtendedHours: Bool, indicatorCache: IndicatorCache
     ) {
         guard !bars.isEmpty, size.width > 140, size.height > 140 else { return nil }
         self.bars = bars
@@ -675,19 +682,41 @@ private struct ChartFrame {
         rightIdx = Double(total - 1) - offset
         range = ChartMath.visibleRange(total: total, barsVisible: visible, rightOffset: offset)
 
-        // Indicators over the full series (windowed slices would distort warm-up)
-        let closes = bars.map(\.close)
-        ema9 = interaction.showEMA9 ? ChartMath.ema(closes, period: 9) : []
-        ema21 = interaction.showEMA21 ? ChartMath.ema(closes, period: 21) : []
-        ema50 = interaction.showEMA50 ? ChartMath.ema(closes, period: 50) : []
-        bb = interaction.showBollinger ? ChartMath.bollinger(closes, period: 20, k: 2) : []
-        rsi = interaction.showRSI ? ChartMath.rsi(closes, period: 14) : []
-        let m = interaction.showMACD
-            ? ChartMath.macdSeries(closes: closes)
-            : (macd: [Double?](), signal: [Double?](), hist: [Double?]())
-        macd = m.macd
-        macdSignal = m.signal
-        macdHist = m.hist
+        // Indicators over the full series (windowed slices would distort
+        // warm-up), MEMOIZED. The values depend only on the closes + which
+        // overlays are on — never on the visible window — so pan / zoom /
+        // crosshair and unrelated-symbol repaints reuse the cache instead of
+        // recomputing EMA/BB/RSI/MACD over up to 1500 bars on every draw. A
+        // moving forming bar changes the last close, so the key still turns over
+        // as the live bar ticks (recompute at display rate, not feed rate).
+        let key = IndicatorCacheKey.make(
+            symbol: symbol, interval: interval, bars: bars,
+            ema9: interaction.showEMA9, ema21: interaction.showEMA21,
+            ema50: interaction.showEMA50, bb: interaction.showBollinger,
+            rsi: interaction.showRSI, macd: interaction.showMACD
+        )
+        let series = indicatorCache.series(for: key) {
+            let closes = bars.map(\.close)
+            let m = interaction.showMACD
+                ? ChartMath.macdSeries(closes: closes)
+                : (macd: [Double?](), signal: [Double?](), hist: [Double?]())
+            return IndicatorCache.Series(
+                ema9: interaction.showEMA9 ? ChartMath.ema(closes, period: 9) : [],
+                ema21: interaction.showEMA21 ? ChartMath.ema(closes, period: 21) : [],
+                ema50: interaction.showEMA50 ? ChartMath.ema(closes, period: 50) : [],
+                bb: interaction.showBollinger ? ChartMath.bollinger(closes, period: 20, k: 2) : [],
+                rsi: interaction.showRSI ? ChartMath.rsi(closes, period: 14) : [],
+                macd: m.macd, macdSignal: m.signal, macdHist: m.hist
+            )
+        }
+        ema9 = series.ema9
+        ema21 = series.ema21
+        ema50 = series.ema50
+        bb = series.bb
+        rsi = series.rsi
+        macd = series.macd
+        macdSignal = series.macdSignal
+        macdHist = series.macdHist
 
         // Price scale over visible bars + enabled overlay values
         var lo = Double.greatestFiniteMagnitude
@@ -1570,5 +1599,74 @@ private struct ChartFrame {
         ctx.fill(path, with: .color(background))
         ctx.stroke(path, with: .color(Theme.line), lineWidth: 1)
         ctx.draw(resolved, at: CGPoint(x: rect.midX, y: rect.midY), anchor: .center)
+    }
+}
+
+// MARK: - Indicator memoization
+
+/// Cache key for the memoized indicator series. It captures everything the
+/// indicator VALUES depend on — the bar-series identity (symbol, interval, bar
+/// count, first/last bar open), the last bar's close, and which overlays are
+/// enabled — and nothing they don't. The visible window is deliberately absent:
+/// pan / zoom / crosshair move the window but not the values, so excluding it is
+/// what lets the cache survive interaction (the whole point of memoizing). The
+/// last close rides as raw bits so a NaN close still compares equal to itself —
+/// a NaN key would otherwise never hit and force a recompute on every draw.
+struct IndicatorCacheKey: Equatable {
+    var symbol: String
+    var interval: Interval
+    var count: Int
+    var firstTs: Int64
+    var lastTs: Int64
+    var lastCloseBits: UInt64
+    var toggles: UInt8
+
+    static func make(
+        symbol: String, interval: Interval, bars: [Bar],
+        ema9: Bool, ema21: Bool, ema50: Bool, bb: Bool, rsi: Bool, macd: Bool
+    ) -> IndicatorCacheKey {
+        var toggles: UInt8 = 0
+        if ema9 { toggles |= 1 << 0 }
+        if ema21 { toggles |= 1 << 1 }
+        if ema50 { toggles |= 1 << 2 }
+        if bb { toggles |= 1 << 3 }
+        if rsi { toggles |= 1 << 4 }
+        if macd { toggles |= 1 << 5 }
+        return IndicatorCacheKey(
+            symbol: symbol, interval: interval, count: bars.count,
+            firstTs: bars.first?.ts_open_ms ?? 0,
+            lastTs: bars.last?.ts_open_ms ?? 0,
+            lastCloseBits: (bars.last?.close ?? 0).bitPattern,
+            toggles: toggles
+        )
+    }
+}
+
+/// One-slot memo for the indicator series behind a `ChartFrame`. A plain
+/// (non-observed) reference type so mutating it inside a view update never
+/// schedules another update — the standard SwiftUI memoization pattern. Held as
+/// `@State` by `CandleChart`, so it persists across the pane's redraws.
+final class IndicatorCache {
+    struct Series {
+        var ema9: [Double?]
+        var ema21: [Double?]
+        var ema50: [Double?]
+        var bb: [ChartMath.BollingerPoint?]
+        var rsi: [Double?]
+        var macd: [Double?]
+        var macdSignal: [Double?]
+        var macdHist: [Double?]
+    }
+
+    private var key: IndicatorCacheKey?
+    private var cached: Series?
+
+    /// The memoized series for `key`, computing via `build` only on a miss.
+    func series(for key: IndicatorCacheKey, build: () -> Series) -> Series {
+        if key == self.key, let cached { return cached }
+        let fresh = build()
+        self.key = key
+        self.cached = fresh
+        return fresh
     }
 }
