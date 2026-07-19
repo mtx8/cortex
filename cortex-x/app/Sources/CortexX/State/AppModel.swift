@@ -42,6 +42,26 @@ final class AppModel {
     /// Rolling 24h-style reference for % change: first close seen per symbol/day.
     private(set) var sessionOpen: [String: Double] = [:]
 
+    // MARK: Level 2 (depth ladder + time & sales)
+    /// The order-book depth for the actively-subscribed symbol. nil until the
+    /// first depth frame lands (or while unsubscribed) — the montage shows an
+    /// honest "waiting for depth" state, never a stale book from another symbol.
+    private(set) var bookDepth: BookDepth?
+    /// Time & sales prints for the subscribed symbol, NEWEST-FIRST, ring-capped.
+    private(set) var tape: [TapePrint] = []
+    /// Tape ring cap — bounded so a fast tape never grows without limit.
+    static let tapeCap = 200
+    /// The symbol the engine is streaming depth + tape for (nil = none). Exactly
+    /// one at a time (bounded bandwidth): subscribing a new symbol unsubscribes
+    /// the previous. Late frames from a just-unsubscribed symbol are dropped by
+    /// matching against this.
+    private(set) var depthSymbol: String?
+    /// A price the operator clicked in the depth ladder, offered to the order
+    /// ticket's price-set path (the integration seam — the ticket seats it into
+    /// its limit field, then clears it). nil once consumed. NaN-safe: only a
+    /// finite, positive click ever lands here.
+    private(set) var pendingTicketPrice: Double?
+
     // MARK: Portfolio
     private(set) var positions: [String: Position] = [:]
     private(set) var account: AccountSnapshot = .empty
@@ -67,7 +87,7 @@ final class AppModel {
     private(set) var brokerSettings: BrokerSettings
 
     // MARK: Center sections
-    enum CenterMode: String, CaseIterable { case chart, scanner, news, company, options, foundry, regimes, meridian, settings }
+    enum CenterMode: String, CaseIterable { case chart, level2, scanner, news, company, options, foundry, regimes, meridian, settings }
     var centerMode: CenterMode = .chart
     private(set) var optionsChain: OptionsChain?
     private(set) var chainLoading = false
@@ -160,6 +180,13 @@ final class AppModel {
             // cannot claim a live+connected broker, so fall back to the safe
             // paper default until the next snapshot re-vouches for it.
             broker = nil
+            // A dropped connection orphans the depth subscription: the engine
+            // knows nothing of it after a fresh connect. Clear the book, tape,
+            // and subscribed symbol so a stale ladder never lingers and the
+            // montage re-subscribes cleanly once the link is back.
+            bookDepth = nil
+            tape = []
+            depthSymbol = nil
         }
     }
 
@@ -185,6 +212,46 @@ final class AppModel {
             limitPx: limitPx, stopPx: stopPx
         ))
     }
+
+    // MARK: Level 2 (depth + tape) subscription
+
+    /// Stream Level 2 depth + tape for `symbol` — and ONLY `symbol`. The engine
+    /// bounds bandwidth to one book at a time, so this unsubscribes the previous
+    /// symbol first, clears the stale book + tape (a new symbol must never show
+    /// another's ladder), then sends the subscribe command. Idempotent:
+    /// re-subscribing the symbol already streaming is a no-op, so view
+    /// re-appears never thrash the engine. Blank symbols are ignored.
+    func subscribeDepth(_ symbol: String) {
+        let symbol = symbol.uppercased()
+        guard !symbol.isEmpty, symbol != depthSymbol else { return }
+        if let prev = depthSymbol { send(.unsubscribeDepth(symbol: prev)) }
+        depthSymbol = symbol
+        bookDepth = nil
+        tape = []
+        send(.subscribeDepth(symbol: symbol))
+    }
+
+    /// Stop streaming depth for the current symbol (montage left the screen).
+    /// Clears the book + tape so nothing lingers, and tells the engine to free
+    /// the bandwidth. A no-op when nothing is subscribed.
+    func unsubscribeDepth() {
+        guard let prev = depthSymbol else { return }
+        send(.unsubscribeDepth(symbol: prev))
+        depthSymbol = nil
+        bookDepth = nil
+        tape = []
+    }
+
+    /// Offer a price the operator clicked in the depth ladder to the order
+    /// ticket (the integration seam). NaN-safe by design law: a non-finite or
+    /// non-positive click is ignored rather than seating garbage into a ticket.
+    func setTicketPrice(_ px: Double) {
+        guard px.isFinite, px > 0 else { return }
+        pendingTicketPrice = px
+    }
+
+    /// The ticket calls this once it has consumed `pendingTicketPrice`.
+    func clearTicketPrice() { pendingTicketPrice = nil }
 
     // MARK: Broker configuration
 
@@ -490,6 +557,16 @@ final class AppModel {
             applyBar(bar)
         case .bookTop(let top):
             bookTop[top.symbol] = top
+        case .depth(let d):
+            // Only accept the book for the symbol we are subscribed to — a late
+            // frame from a just-unsubscribed symbol could still be in flight and
+            // must never overwrite the current ladder.
+            if d.symbol == depthSymbol { bookDepth = d }
+        case .tape(let p):
+            // Same subscription guard, then ring-cap newest-first.
+            guard p.symbol == depthSymbol else { break }
+            tape.insert(p, at: 0)
+            if tape.count > Self.tapeCap { tape.removeLast(tape.count - Self.tapeCap) }
         case .orderIntent:
             break // intents surface via order updates
         case .orderUpdate(let u):
@@ -640,6 +717,9 @@ final class AppModel {
         // re-sync snapshot that omits it must not wipe a live posture a
         // standalone broker_status frame already established.
         if let b = snap.broker { broker = b }
+        // A snapshot may carry the latest book per subscribed symbol — adopt it
+        // only for the symbol we are actually streaming (never another's book).
+        if let sym = depthSymbol, let d = snap.depth?[sym] { bookDepth = d }
         if let r = snap.regimes { regimeBoard = r }
         if let g = snap.geo { geoPulse = g }
         if let s = snap.scan { applyScanBoard(s) }

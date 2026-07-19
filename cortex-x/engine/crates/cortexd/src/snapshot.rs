@@ -9,8 +9,8 @@ use cx_core::autonomy::AutonomyDial;
 use std::collections::HashMap;
 
 use cx_core::events::{
-    AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, NewsBoard, OrderUpdate,
-    RegimeBoard, ScanBoard,
+    AgentThought, BookDepth, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, NewsBoard,
+    OrderUpdate, RegimeBoard, ScanBoard,
 };
 use cx_broker::Broker;
 use cx_core::store::BarStore;
@@ -44,6 +44,11 @@ pub struct SnapshotSrc {
     geo_last: Mutex<Option<GeoPulse>>,
     scan_last: Mutex<Option<ScanBoard>>,
     news_last: Mutex<Option<NewsBoard>>,
+    /// The latest LEVEL 2 depth published for the actively-viewed symbol, so a
+    /// reconnecting client sees the current ladder without waiting for the next
+    /// venue update. Only one symbol streams depth at a time, so a single
+    /// slot is enough (and inherently bounded).
+    depth_last: Mutex<Option<BookDepth>>,
 }
 
 impl SnapshotSrc {
@@ -76,6 +81,7 @@ impl SnapshotSrc {
             geo_last: Mutex::new(None),
             scan_last: Mutex::new(None),
             news_last: Mutex::new(None),
+            depth_last: Mutex::new(None),
         })
     }
 
@@ -142,6 +148,12 @@ impl SnapshotSrc {
                             *this.news_last.lock().unwrap_or_else(|p| p.into_inner()) =
                                 Some(n.clone());
                         }
+                        EngineEvent::Depth(d) => {
+                            // Keep only the latest depth (one active symbol at a
+                            // time); a connecting client gets the current ladder.
+                            *this.depth_last.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(d.clone());
+                        }
                         _ => {}
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -150,6 +162,16 @@ impl SnapshotSrc {
             }
         })
     }
+}
+
+/// Shape the latest single-symbol depth for the snapshot wire as a
+/// symbol-keyed map, matching the app's `depth: [String: BookDepth]?` contract
+/// and its `snap.depth?[symbol]` lookup. Emitting a bare `BookDepth` here would
+/// decode as a `typeMismatch` in Swift and sink the ENTIRE `EngineSnapshot`
+/// (bars, positions, account, orders, feeds, broker posture — all silently
+/// dropped). Absent (serialized as JSON `null`) when no symbol streams depth.
+fn depth_snapshot_map(depth_last: Option<BookDepth>) -> Option<HashMap<String, BookDepth>> {
+    depth_last.map(|d| HashMap::from([(d.symbol.clone(), d)]))
 }
 
 impl SnapshotSource for SnapshotSrc {
@@ -216,6 +238,11 @@ impl SnapshotSource for SnapshotSrc {
         let geo_last = self.geo_last.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let scan_last = self.scan_last.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let news_last = self.news_last.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let depth_last = self
+            .depth_last
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
 
         serde_json::json!({
             "symbols": self.symbols,
@@ -231,11 +258,60 @@ impl SnapshotSource for SnapshotSrc {
             "geo": geo_last,
             "scan": scan_last,
             "news": news_last,
+            // The latest LEVEL 2 depth for the actively-viewed symbol (honestly
+            // labelled live/delayed), so a reconnecting client renders the
+            // ladder immediately. Keyed BY SYMBOL to match the app's
+            // `[String: BookDepth]?` contract; absent (null) when nothing
+            // streams. Never a bare object — that sinks the whole snapshot.
+            "depth": depth_snapshot_map(depth_last),
             "search_universe": self.universe,
             // The true broker posture at connect. The app reads LIVE only for
             // ibkr_live + connected, so a paper/fallback engine can never
             // mislabel — and an older app that ignores the field is unaffected.
             "broker": self.broker.status(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cx_core::events::BookLevel;
+
+    fn sample_depth(symbol: &str) -> BookDepth {
+        BookDepth {
+            symbol: symbol.to_string(),
+            bids: vec![BookLevel { px: 100.0, sz: 1.0, count: 1 }],
+            asks: vec![BookLevel { px: 101.0, sz: 1.0, count: 1 }],
+            depth: 1,
+            source: "test".into(),
+            is_live: true,
+            ts_ms: 1,
+        }
+    }
+
+    /// The connect/reconnect snapshot must key depth BY SYMBOL so the app's
+    /// `depth: [String: BookDepth]?` decode succeeds and `snap.depth?[symbol]`
+    /// resolves. A bare `BookDepth` (or a scalar under "depth") would
+    /// type-mismatch in Swift and drop the ENTIRE `EngineSnapshot`.
+    #[test]
+    fn depth_serializes_as_symbol_keyed_map() {
+        let v =
+            serde_json::to_value(depth_snapshot_map(Some(sample_depth("BTC-USD")))).unwrap();
+        let obj = v.as_object().expect("depth must be a JSON object keyed by symbol");
+        // Exactly one symbol streams depth at a time.
+        assert_eq!(obj.len(), 1);
+        let entry = obj.get("BTC-USD").expect("keyed by the depth's own symbol");
+        assert_eq!(entry["symbol"], "BTC-USD");
+        assert_eq!(entry["is_live"], true);
+        assert_eq!(entry["asks"][0]["px"], 101.0);
+    }
+
+    /// No active depth subscription → JSON `null` (Swift `decodeIfPresent` →
+    /// nil), never an empty object or a stale bare book.
+    #[test]
+    fn depth_absent_serializes_as_null() {
+        let v = serde_json::to_value(depth_snapshot_map(None)).unwrap();
+        assert!(v.is_null());
     }
 }

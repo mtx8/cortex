@@ -23,23 +23,40 @@ mod equity;
 pub mod options;
 mod synthetic;
 
+/// The IBKR market-data integration point: once the IBKR adapter (cx-broker,
+/// `ibkr` feature) is connected with the operator's market-data subscriptions,
+/// it publishes REAL equity LEVEL 1/2 depth (`reqMktDepth`) and trade prints
+/// (`reqMktData`) through these — the only sanctioned source of `is_live=true`
+/// equity depth/tape. The CBOE poller never emits live equity depth. See
+/// [`equity`] for the full note.
+pub use equity::{publish_ibkr_depth, publish_ibkr_tape};
+
 use std::sync::Arc;
 
 use cx_core::egress::Egress;
 use cx_core::store::BarStore;
 use cx_core::{Bus, Config};
+use tokio::sync::watch;
 
-pub struct MarketData;
+/// Handle to the running market-data squadron. Owns the supervisor task and
+/// the LEVEL 2 depth control channel: cortexd sets the single actively-viewed
+/// depth symbol here, and the connectors (Coinbase level2, CBOE delayed L1)
+/// pick it up over a broadcast [`watch`] so at most ONE symbol streams depth
+/// at a time — bandwidth bounded by construction.
+pub struct MarketData {
+    depth_tx: watch::Sender<Option<String>>,
+    task: tokio::task::JoinHandle<()>,
+}
 
 impl MarketData {
-    /// Spawn all internal tasks; the returned handle supervises them all.
-    /// Aborting it tears the squadron down.
-    pub fn start(
-        bus: Arc<Bus>,
-        store: Arc<BarStore>,
-        cfg: Config,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+    /// Spawn all internal tasks and return the squadron handle. [`MarketData::abort`]
+    /// tears the squadron down.
+    pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MarketData {
+        // The actively-viewed depth symbol (None = stream no depth). A watch so
+        // both connectors always see the latest value, rapid switches coalesce,
+        // and the value survives connector reconnects.
+        let (depth_tx, depth_rx) = watch::channel::<Option<String>>(None);
+        let task = tokio::spawn(async move {
             let (tick_tx, tick_rx) = tokio::sync::mpsc::channel(8_192);
             let aggregator = tokio::spawn(agg::run(tick_rx, bus.clone(), store.clone()));
 
@@ -77,10 +94,13 @@ impl MarketData {
                     equities,
                     tick_tx.clone(),
                     cfg.feed.backfill_bars,
+                    depth_rx.clone(),
                 ));
             }
 
             if synthetic_primary {
+                // Synthetic mode has no real book: it never publishes depth
+                // (honest — there is nothing real to show).
                 synthetic::run(bus, store, cfg.symbols.clone(), tick_tx).await;
             } else {
                 let mut cfg = cfg;
@@ -90,13 +110,29 @@ impl MarketData {
                     // poller; nothing else to run here.
                     std::future::pending::<()>().await;
                 } else {
-                    coinbase::run(bus, store, cfg, tick_tx).await;
+                    coinbase::run(bus, store, cfg, tick_tx, depth_rx).await;
                 }
             }
             // Connectors only return when the tick channel is gone; drain the
             // aggregator so a supervised shutdown is complete.
             let _ = aggregator.await;
-        })
+        });
+        MarketData { depth_tx, task }
+    }
+
+    /// Set the single actively-viewed depth symbol (None = stream no depth).
+    /// The engine streams LEVEL 2 depth for at most this one symbol to bound
+    /// bandwidth; setting a new symbol implicitly unsubscribes the previous.
+    /// Cheap and non-blocking; safe to call from the command loop.
+    pub fn set_active_depth(&self, symbol: Option<String>) {
+        // `send` fails only if every receiver is gone (squadron torn down);
+        // then there is nothing to stream and dropping the request is correct.
+        let _ = self.depth_tx.send(symbol);
+    }
+
+    /// Tear the squadron down (aborts the supervisor task).
+    pub fn abort(&self) {
+        self.task.abort();
     }
 }
 

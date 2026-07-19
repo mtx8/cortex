@@ -5,19 +5,37 @@
 //! is re-marked or filtered as RTH-only. Delayed data is honest data: the
 //! feed advertises itself as Degraded (never Live) so downstream consumers
 //! and the operator can see exactly what they are trading on.
+//!
+//! LEVEL 2 depth for equities: there is NO real order book here. Equities
+//! carry only CBOE ~15-min-DELAYED top-of-book (L1) today. For the actively-
+//! viewed equity symbol this feed therefore publishes a MINIMAL, honest
+//! [`BookDepth`] with `is_live = false` and `source = "cboe delayed L1 (no
+//! depth)"` — a single delayed level per side so the UI shows something true
+//! rather than pretending crypto-style live L2. Real equity L1/L2 (and a real
+//! tape) arrives via the IBKR adapter (`reqMktData` / `reqMktDepth`) once the
+//! operator connects IB Gateway with their market-data subscriptions; see the
+//! clearly-marked integration point [`publish_ibkr_depth`] / [`publish_ibkr_tape`]
+//! at the bottom of this file. This poller NEVER fabricates real-time equity
+//! depth or aggressor-tagged prints.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use cx_core::egress::Egress;
-use cx_core::events::{Bar, BookTop, EngineEvent, FeedHealth, FeedStatus, Tick};
+use cx_core::events::{
+    Bar, BookDepth, BookLevel, BookTop, EngineEvent, FeedHealth, FeedStatus, TapePrint, Tick,
+};
 use cx_core::store::BarStore;
 use cx_core::time::now_ms;
 use cx_core::types::{Interval, Venue};
 use cx_core::Bus;
+use tokio::sync::watch;
 
 const POLL_SECS: u64 = 20;
 const FEED_NAME: &str = "cboe-equities";
+/// Honest provenance label carried on every equity [`BookDepth`]: delayed L1
+/// with no real order-book depth.
+const EQUITY_DEPTH_SOURCE: &str = "cboe delayed L1 (no depth)";
 
 fn quote_url(symbol: &str) -> String {
     format!("https://cdn.cboe.com/api/global/delayed_quotes/quotes/{symbol}.json")
@@ -149,6 +167,7 @@ pub(crate) async fn run(
     symbols: Vec<String>,
     tick_tx: tokio::sync::mpsc::Sender<Tick>,
     backfill_bars: u32,
+    mut depth_rx: watch::Receiver<Option<String>>,
 ) {
     if symbols.is_empty() {
         return;
@@ -226,6 +245,12 @@ pub(crate) async fn run(
                             ask_sz: q.ask_size.max(0.0),
                         }));
                     }
+                    // Honest DELAYED L1 "depth" for the actively-viewed symbol
+                    // only (bandwidth bound): a single delayed level per side,
+                    // is_live=false. Never fabricated as live L2.
+                    if depth_rx.borrow().as_deref() == Some(symbol.as_str()) {
+                        bus.publish(EngineEvent::Depth(equity_depth(symbol, &q)));
+                    }
                 }
                 Err(e) => {
                     consecutive_failures += 1;
@@ -241,8 +266,94 @@ pub(crate) async fn run(
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+        // Sleep between poll cycles, but wake early when the actively-viewed
+        // depth symbol changes so the ladder shows the last-known delayed
+        // top-of-book immediately on open (rather than up to a poll away).
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(POLL_SECS)) => {}
+            changed = depth_rx.changed() => {
+                if changed.is_err() {
+                    return; // command side gone: squadron shutdown
+                }
+                let active = depth_rx.borrow_and_update().clone();
+                if let Some(sym) = active {
+                    if let Some(q) = last_seen.get(&sym) {
+                        bus.publish(EngineEvent::Depth(equity_depth(&sym, q)));
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Build the honest single-level DELAYED depth for an equity from its latest
+/// CBOE top-of-book. `is_live = false` and `source` disclose that this is
+/// delayed L1 with NO real order-book depth — the UI shows something truthful
+/// without pretending crypto-style live L2. A side is present only when its
+/// price is finite and positive (and the ask is not crossed); nothing is
+/// fabricated. `count` is 0 (no order count in an L1 quote). Real, live equity
+/// depth comes ONLY from the IBKR integration point below, never from here.
+pub(crate) fn equity_depth(symbol: &str, q: &EquityQuote) -> BookDepth {
+    let mut bids = Vec::new();
+    let mut asks = Vec::new();
+    if q.bid.is_finite() && q.bid > 0.0 {
+        bids.push(BookLevel {
+            px: q.bid,
+            sz: q.bid_size.max(0.0),
+            count: 0,
+        });
+    }
+    if q.ask.is_finite() && q.ask > 0.0 && q.ask >= q.bid {
+        asks.push(BookLevel {
+            px: q.ask,
+            sz: q.ask_size.max(0.0),
+            count: 0,
+        });
+    }
+    BookDepth {
+        symbol: symbol.to_string(),
+        bids,
+        asks,
+        depth: 1,
+        source: EQUITY_DEPTH_SOURCE.into(),
+        is_live: false,
+        ts_ms: now_ms(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IBKR INTEGRATION POINT (not yet wired).
+//
+// Real equity LEVEL 1 / LEVEL 2 depth and a real trade tape become available
+// once the operator connects IB Gateway / TWS and the IBKR adapter (cx-broker,
+// behind the `ibkr` feature) requests them:
+//   - `reqMktData`  -> live/frozen top-of-book (L1) and last-trade prints;
+//   - `reqMktDepth` -> the aggregated LEVEL 2 order book (per-venue depth),
+// both subject to the user's own IBKR market-data subscriptions.
+//
+// When that path is built, the adapter constructs honest `BookDepth` /
+// `TapePrint` values (labelling `is_live`/`source` per the ACTUAL subscription
+// — live vs delayed vs frozen) and publishes them through these two functions.
+// They are the ONLY sanctioned way to emit real equity depth/tape; the CBOE
+// poller above never emits `is_live = true`. Keeping them here (not in
+// cx-broker) preserves the bus-only rule: cx-broker publishes market data via
+// cx-md's vocabulary without depending on the connectors.
+// ---------------------------------------------------------------------------
+
+/// Publish a LEVEL 2 (or L1) equity depth book obtained from the IBKR adapter.
+/// The caller MUST label `is_live` / `source` truthfully for the subscription
+/// that produced it (live `reqMktDepth`, delayed L1, or frozen). No-op-safe:
+/// with no subscribers the event is simply dropped by the bus.
+pub fn publish_ibkr_depth(bus: &Bus, depth: BookDepth) {
+    bus.publish(EngineEvent::Depth(depth));
+}
+
+/// Publish a real equity trade print (Time & Sales) obtained from the IBKR
+/// adapter's `reqMktData` last-trade stream. The caller labels `is_live`
+/// truthfully and sets `aggressor` only when the venue actually discloses the
+/// taker side (else `None` — never guessed).
+pub fn publish_ibkr_tape(bus: &Bus, print: TapePrint) {
+    bus.publish(EngineEvent::Tape(print));
 }
 
 #[cfg(test)]
@@ -257,6 +368,41 @@ mod tests {
         assert_eq!(q.bid_size, 200.0);
         assert!(parse_quote("{}").is_none());
         assert!(parse_quote(r#"{"data":{"current_price":"NaN"}}"#).is_none());
+    }
+
+    #[test]
+    fn equity_depth_is_honest_delayed_single_level() {
+        // A live-looking CBOE quote still yields a DELAYED, is_live=false book
+        // of a single level per side — never crypto-style live L2.
+        let raw = r#"{"data":{"symbol":"AAPL","current_price":308.45,"bid":308.44,
+            "ask":308.47,"bid_size":200,"ask_size":40,"volume":1,"last_trade_time":""}}"#;
+        let q = parse_quote(raw).unwrap();
+        let depth = equity_depth("AAPL", &q);
+        assert!(!depth.is_live, "equity depth must never claim to be live");
+        assert_eq!(depth.source, "cboe delayed L1 (no depth)");
+        assert_eq!(depth.depth, 1);
+        assert_eq!(depth.bids.len(), 1);
+        assert_eq!(depth.asks.len(), 1);
+        assert_eq!(depth.bids[0].px, 308.44);
+        assert_eq!(depth.bids[0].sz, 200.0);
+        assert_eq!(depth.bids[0].count, 0);
+        assert_eq!(depth.asks[0].px, 308.47);
+        assert_eq!(depth.asks[0].sz, 40.0);
+
+        // A crossed / missing ask drops that side rather than fabricating one.
+        let crossed = EquityQuote {
+            price: 10.0,
+            bid: 10.0,
+            ask: 9.5, // crossed
+            bid_size: 5.0,
+            ask_size: 5.0,
+            volume: 0.0,
+            last_trade_time: String::new(),
+        };
+        let depth = equity_depth("XYZ", &crossed);
+        assert_eq!(depth.bids.len(), 1);
+        assert!(depth.asks.is_empty(), "a crossed ask is dropped, not shown");
+        assert!(!depth.is_live);
     }
 
     #[test]

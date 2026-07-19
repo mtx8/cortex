@@ -30,6 +30,7 @@ struct RootView: View {
                     Group {
                         switch model.centerMode {
                         case .chart: ChartGrid()
+                        case .level2: Level2View()
                         case .scanner: ScannerView()
                         case .news: NewsView()
                         case .company: CompanyView()
@@ -213,6 +214,7 @@ private struct IconRail: View {
 
     private static let sections: [(mode: AppModel.CenterMode, icon: String, name: String)] = [
         (.chart, "chart.xyaxis.line", "terminal"),
+        (.level2, "chart.bar.doc.horizontal", "level 2"),
         (.scanner, "scope", "scanner"),
         (.news, "newspaper", "news"),
         (.company, "building.2", "company"),

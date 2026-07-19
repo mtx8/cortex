@@ -8,13 +8,14 @@ import XCTest
 final class ShellTests: XCTestCase {
     func testCenterModeRailOrderThenSettings() {
         // FILINGS moved into the NEWS desk as a tab — it is no longer a center
-        // section. The icon rail derives its cmd-number shortcuts from the FIRST
-        // EIGHT cases (index + 1); SETTINGS is a separate foot-of-rail entry
-        // (gearshape, cmd-,) and must stay LAST so the numbered shortcuts remain
-        // contiguous and the rail stays in lockstep with this list.
+        // section. LEVEL 2 (the DAS depth ladder + tape) sits right after the
+        // chart terminal. The icon rail derives its cmd-number shortcuts from
+        // the FIRST NINE cases (index + 1); SETTINGS is a separate foot-of-rail
+        // entry (gearshape, cmd-,) and must stay LAST so the numbered shortcuts
+        // remain contiguous and the rail stays in lockstep with this list.
         XCTAssertEqual(
             AppModel.CenterMode.allCases,
-            [.chart, .scanner, .news, .company, .options, .foundry, .regimes, .meridian, .settings]
+            [.chart, .level2, .scanner, .news, .company, .options, .foundry, .regimes, .meridian, .settings]
         )
         // Settings sits off the numbered rail — always last.
         XCTAssertEqual(AppModel.CenterMode.allCases.last, .settings)

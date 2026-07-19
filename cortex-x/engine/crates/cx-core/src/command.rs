@@ -80,6 +80,21 @@ pub enum Command {
     GetHistory {
         symbol: String,
     },
+    /// Start streaming LEVEL 2 market depth (and the Time & Sales tape) for the
+    /// symbol the client is actively viewing. The engine streams depth for at
+    /// most ONE symbol at a time to bound bandwidth: subscribing a new symbol
+    /// implicitly unsubscribes the previous one. Answered by a stream of
+    /// `EngineEvent::Depth` (+ `EngineEvent::Tape`); the connect/sync snapshot
+    /// also carries the latest `BookDepth` for the subscribed symbol.
+    SubscribeDepth {
+        symbol: String,
+    },
+    /// Stop streaming depth for `symbol`. Ignored when it does not match the
+    /// currently-subscribed symbol (a stale unsubscribe never clears a newer
+    /// subscription).
+    UnsubscribeDepth {
+        symbol: String,
+    },
     /// Runtime broker (re)configuration from the app's Settings: switch the
     /// active order sink between the paper exchange and IBKR, and set the IBKR
     /// connection + LIVE hard limits, WITHOUT restarting the engine. The engine
@@ -229,6 +244,31 @@ mod tests {
         assert!(json.contains("\"form_filter\":\"10-K\""));
         let back: Command = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cmd);
+    }
+
+    #[test]
+    fn subscribe_depth_decodes_from_the_wire_contract() {
+        // The exact client -> server frames the Swift mirror sends.
+        let sub = r#"{"cmd":"subscribe_depth","symbol":"BTC-USD"}"#;
+        assert_eq!(
+            serde_json::from_str::<Command>(sub).unwrap(),
+            Command::SubscribeDepth { symbol: "BTC-USD".into() }
+        );
+        let unsub = r#"{"cmd":"unsubscribe_depth","symbol":"BTC-USD"}"#;
+        assert_eq!(
+            serde_json::from_str::<Command>(unsub).unwrap(),
+            Command::UnsubscribeDepth { symbol: "BTC-USD".into() }
+        );
+        // Round-trips with the `cmd` tag and snake_case fields; neither yields
+        // a BrokerConfig.
+        let cmd = Command::SubscribeDepth { symbol: "ETH-USD".into() };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"cmd\":\"subscribe_depth\""));
+        assert_eq!(serde_json::from_str::<Command>(&json).unwrap(), cmd);
+        assert!(cmd.to_broker_config().is_none());
+        assert!(Command::UnsubscribeDepth { symbol: "ETH-USD".into() }
+            .to_broker_config()
+            .is_none());
     }
 
     #[test]

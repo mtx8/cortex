@@ -37,7 +37,9 @@ async fn main() -> anyhow::Result<()> {
     let dial = Arc::new(AutonomyDial::new(AutonomyLevel::FullAuto));
 
     // Market data squadron: live feed (+ synthetic fallback), bars, backfill.
-    cx_md::MarketData::start(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
+    // The handle also carries the LEVEL 2 depth control channel: the command
+    // loop points it at the single actively-viewed symbol to bound bandwidth.
+    let md = cx_md::MarketData::start(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
 
     // OMS: paper execution, positions, account. The paper OMS runs in EVERY
     // mode — it is the paper broker's engine and the snapshot/risk view's
@@ -160,10 +162,22 @@ async fn main() -> anyhow::Result<()> {
 
     // Command dispatch: operator commands from connected clients.
     tracing::info!("cortex x live");
+    // The single actively-viewed LEVEL 2 depth symbol (None = no depth
+    // streaming). One at a time bounds bandwidth; see `next_active_depth`.
+    let mut active_depth: Option<String> = None;
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             Command::SetStrategyEnabled { strategy, enabled } => {
                 strategies.set_enabled(&strategy, enabled);
+            }
+            // LEVEL 2 depth subscribe/unsubscribe. The engine streams depth for
+            // at most ONE symbol at a time: subscribing a new symbol implicitly
+            // unsubscribes the previous, and a stale unsubscribe (for an already-
+            // replaced symbol) is ignored. The class-appropriate connector
+            // (Coinbase live L2 / CBOE delayed L1) responds to the watch update.
+            Command::SubscribeDepth { .. } | Command::UnsubscribeDepth { .. } => {
+                active_depth = next_active_depth(active_depth.take(), &cmd);
+                md.set_active_depth(active_depth.clone());
             }
             Command::AskAi {
                 request_id,
@@ -739,6 +753,38 @@ fn bars_since_adoption(store: &BarStore, symbols: &[String], adopted_ts: i64) ->
         .unwrap_or(0)
 }
 
+/// Compute the next actively-viewed LEVEL 2 depth symbol from a depth command
+/// and the current one, enforcing the ONE-active-symbol bandwidth bound:
+///
+/// - `SubscribeDepth { symbol }` makes `symbol` the sole active one, implicitly
+///   unsubscribing any previous symbol. An empty/whitespace symbol is a no-op.
+/// - `UnsubscribeDepth { symbol }` clears the active symbol ONLY when it matches
+///   the current one; a stale unsubscribe for an already-replaced symbol is
+///   ignored so it can never tear down a newer subscription.
+/// - Any other command leaves the active symbol unchanged.
+///
+/// Returns the new active symbol (None = stream no depth).
+fn next_active_depth(current: Option<String>, cmd: &Command) -> Option<String> {
+    match cmd {
+        Command::SubscribeDepth { symbol } => {
+            let s = symbol.trim();
+            if s.is_empty() {
+                current
+            } else {
+                Some(s.to_string())
+            }
+        }
+        Command::UnsubscribeDepth { symbol } => {
+            if current.as_deref() == Some(symbol.trim()) {
+                None
+            } else {
+                current
+            }
+        }
+        _ => current,
+    }
+}
+
 /// The configured EQUITY (bare-ticker) symbols — the only underlyings the
 /// options-chain refresh loop targets; dashed crypto products have no
 /// listed CBOE chain.
@@ -884,6 +930,54 @@ mod tests {
         let s2 =
             cx_sim::evaluate_strategy_params(&frozen, &symbols, "meanrev_z", &cx_sim::ParamMap::new());
         assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn subscribe_unsubscribe_swaps_the_single_active_depth_symbol() {
+        use cx_core::Command;
+
+        // Subscribe from nothing -> that symbol becomes active.
+        let a = next_active_depth(None, &Command::SubscribeDepth { symbol: "BTC-USD".into() });
+        assert_eq!(a, Some("BTC-USD".to_string()));
+
+        // Subscribing a NEW symbol swaps (implicitly unsubscribes the previous):
+        // only one active symbol at a time.
+        let b = next_active_depth(a, &Command::SubscribeDepth { symbol: "ETH-USD".into() });
+        assert_eq!(b, Some("ETH-USD".to_string()));
+
+        // A STALE unsubscribe (for the already-replaced symbol) is ignored — it
+        // never tears down the newer subscription.
+        let c = next_active_depth(
+            b,
+            &Command::UnsubscribeDepth { symbol: "BTC-USD".into() },
+        );
+        assert_eq!(c, Some("ETH-USD".to_string()));
+
+        // Unsubscribing the CURRENT symbol clears it.
+        let d = next_active_depth(
+            c,
+            &Command::UnsubscribeDepth { symbol: "ETH-USD".into() },
+        );
+        assert_eq!(d, None);
+
+        // Whitespace-tolerant match; empty subscribe is a no-op.
+        let e = next_active_depth(
+            Some("AAPL".into()),
+            &Command::SubscribeDepth { symbol: "  ".into() },
+        );
+        assert_eq!(e, Some("AAPL".to_string()));
+        let f = next_active_depth(
+            Some("AAPL".into()),
+            &Command::UnsubscribeDepth { symbol: " AAPL ".into() },
+        );
+        assert_eq!(f, None);
+
+        // An unrelated command never changes the active symbol.
+        let g = next_active_depth(
+            Some("AAPL".into()),
+            &Command::FlattenAll { reason: "x".into() },
+        );
+        assert_eq!(g, Some("AAPL".to_string()));
     }
 
     #[test]

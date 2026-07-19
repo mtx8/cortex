@@ -181,6 +181,13 @@ struct OrderTicket: View {
         .onChange(of: model.selectedSymbol) { _, _ in
             if symbolOverride == nil { seedPricesIfNeeded() }
         }
+        // The LEVEL 2 depth-ladder click seam: a price the operator clicked in
+        // the montage lands in `model.pendingTicketPrice`; seat it into the
+        // limit field here, then release it. `onChange` covers a click made
+        // while the deck is open; `onAppear` drains a price parked while the
+        // deck was collapsed (onChange never fires for a value set pre-mount).
+        .onChange(of: model.pendingTicketPrice) { _, px in seatLadderPrice(px) }
+        .onAppear { seatLadderPrice(model.pendingTicketPrice) }
         .confirmationDialog(
             "Place a LIVE order?",
             isPresented: Binding(
@@ -686,6 +693,20 @@ struct OrderTicket: View {
         if !usesLimit { orderType = .limit }
         limitText = DashFormat.editable(level)
         focus = .qty
+    }
+
+    /// Consume a price the operator clicked in the LEVEL 2 depth ladder (offered
+    /// via `model.pendingTicketPrice`): make the limit field visible by
+    /// switching to a price-bearing type if the ticket is on MKT, seat the
+    /// price, focus the size field, then release the pending value so one click
+    /// applies exactly once. The ladder gives no side, so — unlike `aggress` —
+    /// the armed side is left as-is. nil / non-finite / non-positive is a no-op.
+    private func seatLadderPrice(_ px: Double?) {
+        guard let px, px.isFinite, px > 0 else { return }
+        if !usesLimit { orderType = .limit }
+        limitText = DashFormat.editable(px)
+        focus = .qty
+        model.clearTicketPrice()
     }
 
     private func stepQty(_ dir: Int) {

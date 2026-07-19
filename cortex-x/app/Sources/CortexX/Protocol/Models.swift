@@ -145,6 +145,106 @@ struct BookTop: Codable, Equatable {
     var mid: Double { (bid_px + ask_px) / 2 }
 }
 
+// MARK: - Level 2: order-book depth (ladder) + time & sales (tape)
+
+/// One price level in the order book: the resting price, the aggregate size at
+/// that level, and the order count (`count == 0` when the venue does not report
+/// one). Mirror of the engine `BookLevel` contract type (serde snake_case).
+struct BookLevel: Codable, Equatable {
+    var px: Double
+    var sz: Double
+    /// Number of orders resting at this level; 0 when the venue omits it.
+    var count: UInt32
+}
+
+extension BookLevel {
+    enum CodingKeys: String, CodingKey { case px, sz, count }
+
+    // Defensive decode: a lean/garbled level must never fail the whole depth
+    // frame (Depth is a NON-critical, droppable event). Absent px/sz decode to
+    // 0 (the ladder drops non-finite / non-positive prices), an absent count
+    // to 0 (venue omitted it). Memberwise init preserved via the extension so
+    // construction/tests stay ergonomic; `encode(to:)` stays synthesized.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        px = try c.decodeIfPresent(Double.self, forKey: .px) ?? 0
+        sz = try c.decodeIfPresent(Double.self, forKey: .sz) ?? 0
+        count = try c.decodeIfPresent(UInt32.self, forKey: .count) ?? 0
+    }
+}
+
+/// A depth snapshot for one symbol: `bids` and `asks` each SORTED BEST-FIRST
+/// (bids high→low, asks low→high), the requested `depth`, the `source` feed
+/// label, an honest real/delayed flag, and the timestamp. Mirror of the engine
+/// `BookDepth` contract type (serde snake_case). NON-critical / droppable.
+struct BookDepth: Codable, Equatable {
+    var symbol: String
+    var bids: [BookLevel]
+    var asks: [BookLevel]
+    var depth: UInt32
+    var source: String
+    /// True ONLY for genuine real-time depth (e.g. IBKR L2). `false` = a
+    /// delayed / synthetic L1 stand-in — the montage must never style it as
+    /// live (it shows an honest "delayed" banner instead).
+    var is_live: Bool
+    var ts_ms: Int64
+}
+
+extension BookDepth {
+    enum CodingKeys: String, CodingKey {
+        case symbol, bids, asks, depth, source, is_live, ts_ms
+    }
+
+    // Defensive decode so a leaner engine payload still renders rather than
+    // failing the frame. Cardinal honesty rule: an absent `is_live` defaults to
+    // `false` — a missing flag can only ever be SAFER (delayed), never claim
+    // live. Memberwise init preserved via the extension.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        symbol = try c.decodeIfPresent(String.self, forKey: .symbol) ?? ""
+        bids = try c.decodeIfPresent([BookLevel].self, forKey: .bids) ?? []
+        asks = try c.decodeIfPresent([BookLevel].self, forKey: .asks) ?? []
+        depth = try c.decodeIfPresent(UInt32.self, forKey: .depth) ?? 0
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
+        is_live = try c.decodeIfPresent(Bool.self, forKey: .is_live) ?? false
+        ts_ms = try c.decodeIfPresent(Int64.self, forKey: .ts_ms) ?? 0
+    }
+}
+
+/// One time & sales print: trade `px` and `sz`, the `aggressor` side when the
+/// venue reports it (buy = lifted the ask, sell = hit the bid, nil = unknown),
+/// the timestamp, and an honest real/delayed flag. Mirror of the engine
+/// `TapePrint` contract type (serde snake_case). NON-critical / droppable.
+struct TapePrint: Codable, Equatable {
+    var symbol: String
+    var px: Double
+    var sz: Double
+    /// buy = lifted the ask (up), sell = hit the bid (down), nil = unknown.
+    var aggressor: Side?
+    var ts_ms: Int64
+    /// True only for real-time prints; `false` = delayed. Never styled as live.
+    var is_live: Bool
+}
+
+extension TapePrint {
+    enum CodingKeys: String, CodingKey {
+        case symbol, px, sz, aggressor, ts_ms, is_live
+    }
+
+    // Defensive decode: an absent aggressor decodes nil (unknown → dim), an
+    // absent is_live defaults to `false` (never claim live). Memberwise init
+    // preserved via the extension; `encode(to:)` stays synthesized.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        symbol = try c.decodeIfPresent(String.self, forKey: .symbol) ?? ""
+        px = try c.decodeIfPresent(Double.self, forKey: .px) ?? 0
+        sz = try c.decodeIfPresent(Double.self, forKey: .sz) ?? 0
+        aggressor = try c.decodeIfPresent(Side.self, forKey: .aggressor)
+        ts_ms = try c.decodeIfPresent(Int64.self, forKey: .ts_ms) ?? 0
+        is_live = try c.decodeIfPresent(Bool.self, forKey: .is_live) ?? false
+    }
+}
+
 /// serde: #[serde(tag = "kind", content = "name")]
 enum OrderSource: Codable, Equatable {
     case strategy(String)
@@ -934,6 +1034,11 @@ struct EngineSnapshot: Codable {
     /// engines omit it entirely, so it decodes nil (the app then shows the
     /// safe `paper` default) rather than failing the snapshot.
     var broker: BrokerStatus? = nil
+    /// NEW OPTIONAL wire field — the latest BookDepth per subscribed symbol
+    /// (bounded: the engine only streams depth for the actively-viewed
+    /// symbol). Older engines omit it entirely, so it decodes nil rather than
+    /// failing the snapshot; the montage then waits for the first live frame.
+    var depth: [String: BookDepth]? = nil
 }
 
 // MARK: - Inbound frame (server -> client), tag field "type"
@@ -944,6 +1049,8 @@ enum ServerFrame {
     case tick(Tick)
     case bar(Bar)
     case bookTop(BookTop)
+    case depth(BookDepth)
+    case tape(TapePrint)
     case orderIntent(OrderIntent)
     case orderUpdate(OrderUpdate)
     case fill(Fill)
@@ -985,6 +1092,8 @@ enum ServerFrame {
         case "tick": return .tick(try dec.decode(Tick.self, from: data))
         case "bar": return .bar(try dec.decode(Bar.self, from: data))
         case "book_top": return .bookTop(try dec.decode(BookTop.self, from: data))
+        case "depth": return .depth(try dec.decode(BookDepth.self, from: data))
+        case "tape": return .tape(try dec.decode(TapePrint.self, from: data))
         case "order_intent": return .orderIntent(try dec.decode(OrderIntent.self, from: data))
         case "order_update": return .orderUpdate(try dec.decode(OrderUpdate.self, from: data))
         case "fill": return .fill(try dec.decode(Fill.self, from: data))
@@ -1038,6 +1147,12 @@ enum Command {
     case getCompany(symbol: String)
     case getHistory(symbol: String)
     case getFilings(query: String, formFilter: String, text: String)
+    /// Subscribe / unsubscribe Level 2 depth + tape for a symbol. The engine
+    /// streams depth for ONE actively-viewed symbol at a time to bound
+    /// bandwidth: subscribing a new symbol supersedes the previous. Additive —
+    /// older engines simply ignore an unknown cmd.
+    case subscribeDepth(symbol: String)
+    case unsubscribeDepth(symbol: String)
     /// Reconfigure the live-trading broker link from SETTINGS. Additive: older
     /// engines simply ignore an unknown cmd. The engine re-runs the SAME
     /// `[broker]` validation + safety gates (live ports 7496/4001 require
@@ -1095,6 +1210,10 @@ enum Command {
                 "cmd": "get_filings", "query": query,
                 "form_filter": formFilter, "text": text,
             ]
+        case let .subscribeDepth(symbol):
+            obj = ["cmd": "subscribe_depth", "symbol": symbol]
+        case let .unsubscribeDepth(symbol):
+            obj = ["cmd": "unsubscribe_depth", "symbol": symbol]
         case let .setBrokerConfig(
             mode, ibkrHost, ibkrPort, ibkrClientId, ibkrAccount, ibkrRoute,
             allowLive, maxOrder, maxPosition, maxDailyLoss

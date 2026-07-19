@@ -58,6 +58,56 @@ impl BookTop {
     }
 }
 
+/// One price level of an order book (LEVEL 2 depth). `count` is the number of
+/// resting orders at that price; it is `0` when the venue aggregates size only
+/// and omits the order count (Coinbase level2), never a fabricated value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BookLevel {
+    pub px: f64,
+    pub sz: f64,
+    pub count: u32,
+}
+
+/// A LEVEL 2 market-depth snapshot for one symbol: the top N levels each side,
+/// sorted best-first (bids high→low, asks low→high). Honesty rides on the
+/// wire: `is_live` is true only for a genuinely live venue book (Coinbase
+/// level2) and false for anything delayed or derived (CBOE delayed L1), and
+/// `source` always discloses the true provenance so the UI can never render
+/// delayed data as live. Non-critical / droppable on the bus.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BookDepth {
+    pub symbol: String,
+    /// Best bids first (highest price first).
+    pub bids: Vec<BookLevel>,
+    /// Best asks first (lowest price first).
+    pub asks: Vec<BookLevel>,
+    /// Target levels per side (N): Coinbase L2 aggregates to 20, delayed
+    /// equity L1 carries a single level.
+    pub depth: u32,
+    /// Honest provenance label, e.g. "coinbase l2" or
+    /// "cboe delayed L1 (no depth)".
+    pub source: String,
+    /// True ONLY for a real, live venue book. Delayed/L1-derived depth is
+    /// false — the label is the contract that keeps delayed data from ever
+    /// being rendered as live.
+    pub is_live: bool,
+    pub ts_ms: i64,
+}
+
+/// One Time & Sales print — a single executed trade for the tape. `aggressor`
+/// is the taker side: `Buy` lifted the ask, `Sell` hit the bid, `None` when
+/// the venue does not disclose it. `is_live` is true for a real venue fill and
+/// false for anything delayed/derived.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TapePrint {
+    pub symbol: String,
+    pub px: f64,
+    pub sz: f64,
+    pub aggressor: Option<Side>,
+    pub ts_ms: i64,
+    pub is_live: bool,
+}
+
 /// Who asked for an order. Auditability starts here: every fill traces back
 /// to a source and a written rationale.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -829,6 +879,11 @@ pub enum EngineEvent {
     Tick(Tick),
     Bar(Bar),
     BookTop(BookTop),
+    /// LEVEL 2 market depth for the actively-viewed symbol (bandwidth-bounded
+    /// to one symbol). Non-critical / droppable.
+    Depth(BookDepth),
+    /// One Time & Sales print. Non-critical / droppable.
+    Tape(TapePrint),
     OrderIntent(OrderIntent),
     OrderUpdate(OrderUpdate),
     Fill(Fill),
@@ -872,6 +927,8 @@ impl EngineEvent {
             EngineEvent::Tick(_) => "tick",
             EngineEvent::Bar(_) => "bar",
             EngineEvent::BookTop(_) => "book_top",
+            EngineEvent::Depth(_) => "depth",
+            EngineEvent::Tape(_) => "tape",
             EngineEvent::OrderIntent(_) => "order_intent",
             EngineEvent::OrderUpdate(_) => "order_update",
             EngineEvent::Fill(_) => "fill",
@@ -1154,6 +1211,70 @@ mod tests {
         assert!(json.contains("\"order_type\":\"stop_limit\""));
         let back: OrderIntent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, stop);
+    }
+
+    #[test]
+    fn depth_event_is_type_tagged_and_not_critical() {
+        // The producer frame the macOS depth ladder consumes: a live Coinbase
+        // L2 book, sorted best-first, honestly labelled.
+        let ev = EngineEvent::Depth(BookDepth {
+            symbol: "BTC-USD".into(),
+            bids: vec![
+                BookLevel { px: 64_000.5, sz: 1.2, count: 0 },
+                BookLevel { px: 63_999.0, sz: 0.4, count: 0 },
+            ],
+            asks: vec![BookLevel { px: 64_001.0, sz: 0.8, count: 0 }],
+            depth: 20,
+            source: "coinbase l2".into(),
+            is_live: true,
+            ts_ms: 7,
+        });
+        assert_eq!(ev.kind(), "depth");
+        assert!(!ev.is_critical(), "depth must never starve ticks/critical events");
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"depth\""));
+        assert!(json.contains("\"source\":\"coinbase l2\""));
+        assert!(json.contains("\"is_live\":true"));
+        // snake_case field names the Swift mirror decodes 1:1.
+        assert!(json.contains("\"count\":0"));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn tape_event_is_type_tagged_and_carries_its_label() {
+        // A real Coinbase fill: the taker lifted the ask (Buy aggressor), live.
+        let ev = EngineEvent::Tape(TapePrint {
+            symbol: "ETH-USD".into(),
+            px: 3_500.25,
+            sz: 0.5,
+            aggressor: Some(Side::Buy),
+            ts_ms: 9,
+            is_live: true,
+        });
+        assert_eq!(ev.kind(), "tape");
+        assert!(!ev.is_critical(), "tape must never starve critical events");
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"tape\""));
+        assert!(json.contains("\"aggressor\":\"buy\""));
+        assert!(json.contains("\"is_live\":true"));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+
+        // A delayed/derived print (unknown aggressor) is honestly is_live=false
+        // with a null aggressor, and round-trips.
+        let delayed = EngineEvent::Tape(TapePrint {
+            symbol: "AAPL".into(),
+            px: 308.45,
+            sz: 100.0,
+            aggressor: None,
+            ts_ms: 10,
+            is_live: false,
+        });
+        let json = serde_json::to_string(&delayed).unwrap();
+        assert!(json.contains("\"aggressor\":null"));
+        assert!(json.contains("\"is_live\":false"));
+        assert_eq!(serde_json::from_str::<EngineEvent>(&json).unwrap(), delayed);
     }
 
     #[test]
