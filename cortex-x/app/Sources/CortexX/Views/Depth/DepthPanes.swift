@@ -104,9 +104,14 @@ struct DomLadder: View {
     /// with the inside market in the middle (never bottom-anchored, no void).
     @ViewBuilder
     private var ladderBody: some View {
+        // Sort both sides + resolve the shared histogram scale ONCE per render.
+        // `ladder` is a computed property, so every access re-sorts the whole
+        // book — reading it per row (for the shared maxSize) meant ~20+ full
+        // sorts every ~12 Hz flush. Bind it here and thread `maxSize` down.
+        let data = ladder
         if depth == nil {
             DeckEmpty(text: "waiting for depth…")
-        } else if ladder.bids.isEmpty && ladder.asks.isEmpty {
+        } else if data.bids.isEmpty && data.asks.isEmpty {
             DeckEmpty(text: "no book")
         } else {
             GeometryReader { geo in
@@ -114,23 +119,23 @@ struct DomLadder: View {
                     height: Double(geo.size.height),
                     rowHeight: Double(Self.rowHeight),
                     spreadHeight: Double(Self.spreadHeight),
-                    askCount: ladder.asks.count,
-                    bidCount: ladder.bids.count
+                    askCount: data.asks.count,
+                    bidCount: data.bids.count
                 )
-                let asks = DepthLadder.visibleAskRows(ladder.asks, count: layout.visibleAsks)
-                let bids = DepthLadder.visibleBidRows(ladder.bids, count: layout.visibleBids)
+                let asks = DepthLadder.visibleAskRows(data.asks, count: layout.visibleAsks)
+                let bids = DepthLadder.visibleBidRows(data.bids, count: layout.visibleBids)
                 VStack(spacing: 0) {
                     Color.clear.frame(height: CGFloat(layout.topPad))
                     // Asks top→bottom: highest shown ask down to the best ask,
                     // which lands directly above the spread row.
                     ForEach(asks.indices, id: \.self) { i in
-                        depthRow(asks[i], side: .sell, isBest: i == asks.count - 1)
+                        depthRow(asks[i], side: .sell, isBest: i == asks.count - 1, maxSize: data.maxSize)
                     }
-                    spreadRow
+                    spreadRow(data)
                     // Bids top→bottom: best bid directly below the spread, lower
                     // bids beneath it.
                     ForEach(bids.indices, id: \.self) { i in
-                        depthRow(bids[i], side: .buy, isBest: i == 0)
+                        depthRow(bids[i], side: .buy, isBest: i == 0, maxSize: data.maxSize)
                     }
                     Color.clear.frame(height: CGFloat(layout.bottomPad))
                 }
@@ -139,12 +144,12 @@ struct DomLadder: View {
         }
     }
 
-    private func depthRow(_ level: BookLevel, side: Side, isBest: Bool) -> some View {
+    private func depthRow(_ level: BookLevel, side: Side, isBest: Bool, maxSize: Double) -> some View {
         DepthRow(
             level: level,
             side: side,
             isBest: isBest,
-            fraction: DepthLadder.barFraction(size: level.sz, maxSize: ladder.maxSize),
+            fraction: DepthLadder.barFraction(size: level.sz, maxSize: maxSize),
             priceWidth: Self.priceWidth,
             rowHeight: Self.rowHeight,
             inset: Self.rowInset,
@@ -155,12 +160,12 @@ struct DomLadder: View {
     /// The thin inside-market band seated dead-center: mid + spread, dim and
     /// calm, framed top and bottom by a subtle ember hairline that marks the
     /// best bid/ask straddling it as the inside market.
-    private var spreadRow: some View {
+    private func spreadRow(_ data: LadderData) -> some View {
         HStack(spacing: 8) {
             Spacer(minLength: 0)
-            spreadStat("spread", ladder.spread.map { DashFormat.price($0) } ?? "—", Theme.dim)
+            spreadStat("spread", data.spread.map { DashFormat.price($0) } ?? "—", Theme.dim)
             Text("·").font(.system(size: 9, weight: .semibold)).foregroundStyle(Theme.dim)
-            spreadStat("mid", ladder.mid.map { DashFormat.price($0) } ?? "—", Theme.bone)
+            spreadStat("mid", data.mid.map { DashFormat.price($0) } ?? "—", Theme.bone)
             Spacer(minLength: 0)
         }
         .frame(height: Self.spreadHeight)

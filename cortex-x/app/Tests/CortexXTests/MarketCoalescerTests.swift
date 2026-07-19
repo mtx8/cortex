@@ -310,10 +310,34 @@ final class IndicatorCacheKeyTests: XCTestCase {
         XCTAssertEqual(key(bars), key(bars))
     }
 
-    func testMovingLastCloseChangesKey() {
+    func testFormingBarCloseDoesNotChangeKey() {
+        // The newest bar is still forming: its close twitches on every tick, but
+        // the memo anchors on the last COMPLETED bar — so the key holds steady
+        // and the indicator series is reused across the whole forming bar's life
+        // (no display-rate recompute of EMA/BB/RSI/MACD over the full window).
         var bars = series(count: 50)
+        bars[bars.count - 1].complete = false
         let a = key(bars)
-        // A forming bar whose close ticks must invalidate the memo.
+        bars[bars.count - 1].close += 5
+        XCTAssertEqual(a, key(bars))
+    }
+
+    func testFormingBarCompletionChangesKey() {
+        // When the forming bar finalizes, the key turns over exactly once so the
+        // completed bar folds into a single indicator recompute.
+        var bars = series(count: 50)
+        bars[bars.count - 1].complete = false
+        bars[bars.count - 1].close = 142
+        let forming = key(bars)
+        bars[bars.count - 1].complete = true
+        XCTAssertNotEqual(forming, key(bars))
+    }
+
+    func testCompletedBarCloseChangesKey() {
+        // A correction to the last COMPLETED bar's close still invalidates the
+        // memo (a settled value genuinely changed).
+        var bars = series(count: 50) // all complete
+        let a = key(bars)
         bars[bars.count - 1].close += 0.01
         XCTAssertNotEqual(a, key(bars))
     }
@@ -322,6 +346,20 @@ final class IndicatorCacheKeyTests: XCTestCase {
         let bars = series(count: 50)
         let a = key(bars)
         XCTAssertNotEqual(a, key(series(count: 51)))
+    }
+
+    func testFormingBarAppendChangesKey() {
+        // A new forming bar appending (the prior bar having just completed) turns
+        // the key over so the just-completed bar folds into the indicators —
+        // even though the appended bar is itself still forming.
+        var bars = series(count: 50) // b0…b49 complete
+        let before = key(bars)
+        bars.append(Bar(
+            symbol: "BTC-USD", interval: .m1, ts_open_ms: 50 * 60_000,
+            open: 150, high: 151, low: 149, close: 150,
+            volume: 1, trade_count: 1, vwap: 150, complete: false
+        ))
+        XCTAssertNotEqual(before, key(bars))
     }
 
     func testTogglingAnOverlayChangesKey() {

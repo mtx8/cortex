@@ -686,9 +686,10 @@ private struct ChartFrame {
         // warm-up), MEMOIZED. The values depend only on the closes + which
         // overlays are on — never on the visible window — so pan / zoom /
         // crosshair and unrelated-symbol repaints reuse the cache instead of
-        // recomputing EMA/BB/RSI/MACD over up to 1500 bars on every draw. A
-        // moving forming bar changes the last close, so the key still turns over
-        // as the live bar ticks (recompute at display rate, not feed rate).
+        // recomputing EMA/BB/RSI/MACD over up to 1500 bars on every draw. The
+        // key anchors on the last COMPLETED bar (see IndicatorCacheKey), so a
+        // forming bar ticking at ~12 Hz reuses the cache all through its life
+        // and the series recomputes only when a bar closes — not every flush.
         let key = IndicatorCacheKey.make(
             symbol: symbol, interval: interval, bars: bars,
             ema9: interaction.showEMA9, ema21: interaction.showEMA21,
@@ -1606,12 +1607,23 @@ private struct ChartFrame {
 
 /// Cache key for the memoized indicator series. It captures everything the
 /// indicator VALUES depend on — the bar-series identity (symbol, interval, bar
-/// count, first/last bar open), the last bar's close, and which overlays are
-/// enabled — and nothing they don't. The visible window is deliberately absent:
-/// pan / zoom / crosshair move the window but not the values, so excluding it is
-/// what lets the cache survive interaction (the whole point of memoizing). The
-/// last close rides as raw bits so a NaN close still compares equal to itself —
-/// a NaN key would otherwise never hit and force a recompute on every draw.
+/// count, first bar open), the last COMPLETED bar's close, and which overlays
+/// are enabled — and nothing they don't. The visible window is deliberately
+/// absent: pan / zoom / crosshair move the window but not the values, so
+/// excluding it is what lets the cache survive interaction (the whole point of
+/// memoizing).
+///
+/// Crucially, the key references the last COMPLETED bar's close, NEVER the
+/// forming bar's. The newest bar's close twitches on every tick while it forms;
+/// folding that into the key would miss the memo on every ~12 Hz flush and
+/// recompute EMA/BB/RSI/MACD over up to 1500 bars — re-allocating eight arrays
+/// — at display rate on the live/following chart. That was the hot loop pinning
+/// a core. Indicator VALUES only settle when a bar completes, so keying on the
+/// last completed bar keeps the cache stable across a forming bar's whole life
+/// and turns it over exactly ONCE when the bar finalizes (and on any append /
+/// front-trim via count / firstTs). The reference close rides as raw bits so a
+/// NaN close still compares equal to itself — a NaN key would otherwise never
+/// hit and force a recompute on every draw.
 struct IndicatorCacheKey: Equatable {
     var symbol: String
     var interval: Interval
@@ -1632,13 +1644,25 @@ struct IndicatorCacheKey: Equatable {
         if bb { toggles |= 1 << 3 }
         if rsi { toggles |= 1 << 4 }
         if macd { toggles |= 1 << 5 }
+        let ref = referenceBar(bars)
         return IndicatorCacheKey(
             symbol: symbol, interval: interval, count: bars.count,
             firstTs: bars.first?.ts_open_ms ?? 0,
-            lastTs: bars.last?.ts_open_ms ?? 0,
-            lastCloseBits: (bars.last?.close ?? 0).bitPattern,
+            lastTs: ref?.ts_open_ms ?? 0,
+            lastCloseBits: (ref?.close ?? 0).bitPattern,
             toggles: toggles
         )
+    }
+
+    /// The bar whose close/ts anchor the key: the newest COMPLETED bar. While
+    /// the last bar is still forming, its close ticks constantly, so the prior
+    /// (completed) bar is used instead — the key holds steady until the forming
+    /// bar closes. Falls back to the last bar when the series is a lone forming
+    /// bar (nothing completed yet), and to nil for an empty series.
+    static func referenceBar(_ bars: [Bar]) -> Bar? {
+        guard let last = bars.last else { return nil }
+        if !last.complete { return bars.count >= 2 ? bars[bars.count - 2] : last }
+        return last
     }
 }
 

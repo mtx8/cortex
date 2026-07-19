@@ -460,7 +460,10 @@ private struct ImbalanceBar: View {
                     .frame(width: Theme.hairline, height: 10)
             }
             .frame(maxHeight: .infinity)
-            .animation(DeckMotion.ease(0.25), value: fraction)
+            // No implicit animation: `fraction` is a live order-flow value that
+            // re-lands on every ~12 Hz flush. A 0.25s ease never settles between
+            // updates, so it would repaint this bar at display rate forever. The
+            // meter snaps to each reading instead (correct for a streaming value).
         }
     }
 }
