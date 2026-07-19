@@ -92,7 +92,7 @@ final class AppModel {
     private(set) var brokerSettings: BrokerSettings
 
     // MARK: Center sections
-    enum CenterMode: String, CaseIterable { case chart, level2, scanner, news, company, options, foundry, regimes, meridian, settings }
+    enum CenterMode: String, CaseIterable { case chart, scanner, news, company, options, foundry, regimes, meridian, settings }
     var centerMode: CenterMode = .chart
     private(set) var optionsChain: OptionsChain?
     private(set) var chainLoading = false

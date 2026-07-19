@@ -180,10 +180,14 @@ enum FlowNarrative {
 
 // MARK: - Panel
 
-/// The FLOW read panel, embedded as a column beside the L2 montage. Reads the
-/// active-symbol `flowRead` + the desk thought stream from the model.
+/// The FLOW read panel, stacked as one panel of the chart trading dock. Reads
+/// the active-symbol `flowRead` + the desk thought stream from the model. An
+/// optional `onHide` adds a collapse affordance to the header so the dock can
+/// turn this panel off (nil = no affordance; behavior otherwise unchanged).
 struct FlowPanel: View {
     @Environment(AppModel.self) private var model
+    /// When set, the header shows a collapse button that hides this dock panel.
+    var onHide: (() -> Void)? = nil
 
     private var flow: FlowRead? { model.flowRead }
     private var banner: FlowBanner { FlowBanner.make(for: flow) }
@@ -212,6 +216,7 @@ struct FlowPanel: View {
             }
             Spacer(minLength: 0)
             sourceBanner
+            if let onHide { DockCollapseButton(panel: .flow, action: onHide) }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)

@@ -8,17 +8,21 @@ import XCTest
 final class ShellTests: XCTestCase {
     func testCenterModeRailOrderThenSettings() {
         // FILINGS moved into the NEWS desk as a tab — it is no longer a center
-        // section. LEVEL 2 (the DAS depth ladder + tape) sits right after the
-        // chart terminal. The icon rail derives its cmd-number shortcuts from
-        // the FIRST NINE cases (index + 1); SETTINGS is a separate foot-of-rail
-        // entry (gearshape, cmd-,) and must stay LAST so the numbered shortcuts
-        // remain contiguous and the rail stays in lockstep with this list.
+        // section. LEVEL 2 (the DAS depth ladder + tape) is no longer a standalone
+        // section either — it folded INTO the chart section's trading dock (DOM /
+        // T&S / FLOW panels beside the chart), so CenterMode has no `.level2`. The
+        // icon rail derives its cmd-number shortcuts from all cases but SETTINGS
+        // (index + 1); SETTINGS is a separate foot-of-rail entry (gearshape,
+        // cmd-,) and must stay LAST so the numbered shortcuts remain contiguous
+        // and the rail stays in lockstep with this list.
         XCTAssertEqual(
             AppModel.CenterMode.allCases,
-            [.chart, .level2, .scanner, .news, .company, .options, .foundry, .regimes, .meridian, .settings]
+            [.chart, .scanner, .news, .company, .options, .foundry, .regimes, .meridian, .settings]
         )
         // Settings sits off the numbered rail — always last.
         XCTAssertEqual(AppModel.CenterMode.allCases.last, .settings)
+        // LEVEL 2 is gone as a center mode — its content lives in the chart dock.
+        XCTAssertFalse(AppModel.CenterMode.allCases.contains { $0.rawValue == "level2" })
     }
 
     func testOpenCompanySwitchesModeAndMarksLoading() {

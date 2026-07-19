@@ -68,8 +68,12 @@ struct ChartGrid: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 0) {
+            HStack(spacing: 8) {
                 Spacer(minLength: 0)
+                // The trading-dock feature picker (L1 · DOM · T&S · FLOW + dock
+                // collapse). Self-contained via @AppStorage, so the grid stays
+                // stateless about the dock.
+                ChartDockPicker()
                 layoutSwitcher
             }
             .padding(.horizontal, 8)
