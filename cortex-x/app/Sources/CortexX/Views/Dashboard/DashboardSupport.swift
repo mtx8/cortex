@@ -212,7 +212,10 @@ struct DeckGaugeBar: View {
                             .frame(width: max(0, geo.size.width * clamped))
                     }
             }
-            .animation(DeckMotion.ease(0.25), value: clamped)
+            // No implicit width animation: these gauges show LIVE values that
+            // change continuously, so an ease would be perpetually in-flight —
+            // driving 60fps layout inside this GeometryReader forever (a CPU
+            // peg). Live bars update instantly.
         }
         .frame(height: 4)
     }
