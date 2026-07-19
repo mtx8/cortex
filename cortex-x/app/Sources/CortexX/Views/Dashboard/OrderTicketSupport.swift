@@ -64,6 +64,48 @@ enum OrderSizing {
     }
 }
 
+// MARK: - Compact readout
+
+/// The dense ticket's one-line size + RISK readout, pre-formatted so the
+/// share-count / notional / %-equity / risk / reward:risk strings and the
+/// concentration flag are decided away from SwiftUI. NaN-safe by construction:
+/// an absent or non-finite input becomes "—" (or an omitted optional segment),
+/// never a bogus number the ticket would render as truth.
+struct TicketReadout: Equatable {
+    /// Resolved share count ("100 sh" / "— sh").
+    var shares: String
+    var notional: String
+    var equityPct: String
+    /// True once the order's notional passes the concentration threshold.
+    var concentrated: Bool
+    /// Total money at risk to the protective stop — nil unless a stop is set.
+    var risk: String?
+    /// Reward:risk ("1.80 : 1") — nil unless a positive, finite ratio exists.
+    var rewardRisk: String?
+
+    static func make(
+        qty: Double?,
+        notional: Double?,
+        equityFraction: Double?,
+        warnFraction: Double = OrderSizing.warnFractionOfEquity,
+        totalRisk: Double?,
+        rewardRisk: Double?
+    ) -> TicketReadout {
+        var riskStr: String?
+        if let r = totalRisk, r.isFinite { riskStr = DashFormat.money(r) }
+        var rrStr: String?
+        if let rr = rewardRisk, rr.isFinite, rr > 0 { rrStr = String(format: "%.2f : 1", rr) }
+        return TicketReadout(
+            shares: qty.map { "\(DashFormat.qty($0)) sh" } ?? "— sh",
+            notional: notional.map { DashFormat.money($0) } ?? "—",
+            equityPct: equityFraction.map { DashFormat.pct($0) } ?? "—",
+            concentrated: (equityFraction ?? 0) > warnFraction,
+            risk: riskStr,
+            rewardRisk: rrStr
+        )
+    }
+}
+
 // MARK: - Price ticks
 
 /// Price stepping for the limit/stop arrow buttons. The tick scales with the

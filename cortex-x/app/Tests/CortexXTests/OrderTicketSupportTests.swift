@@ -181,4 +181,63 @@ final class OrderTicketSupportTests: XCTestCase {
         XCTAssertNil(PositionAction.flatten(positionQty: .nan))
         XCTAssertNil(PositionAction.reverse(positionQty: 1e-13)) // below epsilon
     }
+
+    // MARK: - Compact one-line readout (dense ticket)
+
+    func testReadoutFormatsSizeNotionalAndEquity() {
+        let r = TicketReadout.make(
+            qty: 100, notional: 2_500, equityFraction: 0.10,
+            totalRisk: nil, rewardRisk: nil
+        )
+        XCTAssertEqual(r.shares, "100 sh")
+        XCTAssertEqual(r.notional, "2,500.00")
+        XCTAssertEqual(r.equityPct, "10.0%")
+        XCTAssertFalse(r.concentrated)
+        XCTAssertNil(r.risk)
+        XCTAssertNil(r.rewardRisk)
+    }
+
+    func testReadoutFlagsConcentrationStrictlyAboveThreshold() {
+        // 30% of equity is past the 25% warn line.
+        let hot = TicketReadout.make(
+            qty: 100, notional: 3_000, equityFraction: 0.30,
+            totalRisk: nil, rewardRisk: nil
+        )
+        XCTAssertTrue(hot.concentrated)
+        // Exactly at the threshold is NOT yet concentrated (strictly greater).
+        let edge = TicketReadout.make(
+            qty: 100, notional: 2_500, equityFraction: 0.25,
+            totalRisk: nil, rewardRisk: nil
+        )
+        XCTAssertFalse(edge.concentrated)
+    }
+
+    func testReadoutShowsRiskAndRewardOnlyWhenValid() {
+        let r = TicketReadout.make(
+            qty: 50, notional: 5_000, equityFraction: 0.20,
+            totalRisk: 250, rewardRisk: 1.8
+        )
+        XCTAssertEqual(r.risk, "250.00")
+        XCTAssertEqual(r.rewardRisk, "1.80 : 1")
+        // A non-positive reward:risk (stop/target on the wrong side) is omitted,
+        // never shown as truth.
+        let bad = TicketReadout.make(
+            qty: 50, notional: 5_000, equityFraction: 0.20,
+            totalRisk: 250, rewardRisk: -2
+        )
+        XCTAssertNil(bad.rewardRisk)
+    }
+
+    func testReadoutNaNAndEmptyInputsAreSafe() {
+        let r = TicketReadout.make(
+            qty: nil, notional: nil, equityFraction: nil,
+            totalRisk: .nan, rewardRisk: .nan
+        )
+        XCTAssertEqual(r.shares, "— sh")
+        XCTAssertEqual(r.notional, "—")
+        XCTAssertEqual(r.equityPct, "—")
+        XCTAssertFalse(r.concentrated)
+        XCTAssertNil(r.risk)        // NaN risk omitted, never a bogus number
+        XCTAssertNil(r.rewardRisk)  // NaN reward:risk omitted
+    }
 }

@@ -67,6 +67,48 @@ final class BrokerStatusTests: XCTestCase {
         XCTAssertEqual(s.text, "IBKR")
     }
 
+    // MARK: - Explicit BROKER label + connection-dot semantics
+
+    func testBadgeAlwaysCarriesBrokerLabel() {
+        // Every posture reads as the BROKER link, PAPER included, so the
+        // indicator is never an anonymous dot.
+        let postures: [BrokerStatus?] = [
+            nil,
+            BrokerStatus(mode: .paper, connected: false),
+            BrokerStatus(mode: .ibkr_paper, connected: true),
+            BrokerStatus(mode: .ibkr_paper, connected: false),
+            BrokerStatus(mode: .ibkr_live, connected: true),
+            BrokerStatus(mode: .ibkr_live, connected: false),
+        ]
+        for p in postures {
+            XCTAssertEqual(BrokerBadge.style(for: p).label, "BROKER")
+        }
+    }
+
+    func testBadgeConnectionDotVisibility() {
+        // Paper is the internal simulator with no broker session → no link dot.
+        XCTAssertFalse(BrokerBadge.style(for: nil).showDot)
+        XCTAssertFalse(BrokerBadge.style(for: BrokerStatus(mode: .paper, connected: false)).showDot)
+        // Every IBKR posture shows a link dot whose color tracks the session.
+        XCTAssertTrue(BrokerBadge.style(for: BrokerStatus(mode: .ibkr_paper, connected: true)).showDot)
+        XCTAssertTrue(BrokerBadge.style(for: BrokerStatus(mode: .ibkr_paper, connected: false)).showDot)
+        XCTAssertTrue(BrokerBadge.style(for: BrokerStatus(mode: .ibkr_live, connected: true)).showDot)
+        XCTAssertTrue(BrokerBadge.style(for: BrokerStatus(mode: .ibkr_live, connected: false)).showDot)
+    }
+
+    func testBadgeHelpAlwaysNamesTheBrokerLinkAndPaperIsSimulated() {
+        // The tooltip must always frame the control as the broker link, and
+        // every non-live posture must say the money is simulated.
+        for p: BrokerStatus? in [nil, BrokerStatus(mode: .paper, connected: false)] {
+            let s = BrokerBadge.style(for: p)
+            XCTAssertTrue(s.help.lowercased().contains("broker link"))
+            XCTAssertTrue(s.help.lowercased().contains("simulated"))
+        }
+        let paperLink = BrokerBadge.style(for: BrokerStatus(mode: .ibkr_paper, connected: true))
+        XCTAssertTrue(paperLink.help.lowercased().contains("broker link"))
+        XCTAssertTrue(paperLink.help.lowercased().contains("no real money"))
+    }
+
     // MARK: - BrokerMode defensive decode (safety)
 
     func testBrokerModeKnownValuesDecode() throws {

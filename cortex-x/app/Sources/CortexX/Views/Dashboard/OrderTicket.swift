@@ -98,10 +98,6 @@ struct OrderTicket: View {
         return OrderSizing.fractionOfEquity(notional: n, equity: model.account.equity)
     }
 
-    private var concentrated: Bool {
-        (equityFraction ?? 0) > OrderSizing.warnFractionOfEquity
-    }
-
     /// Signed loss/share from the current market to the protective stop.
     private var riskPerShare: Double? {
         guard usesStop, let s = stopPx, let p = price else { return nil }
@@ -142,18 +138,23 @@ struct OrderTicket: View {
     // MARK: Body
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        // Densified so the full ticket — quote, order type, sizing, buy/sell,
+        // flatten/reverse — is visible at a glance inside the 280pt deck with
+        // no scrolling. The symbol picker rides in the header; the quote and
+        // the size/risk readout are each a single compact line; price fields
+        // stay hidden for MKT.
+        VStack(alignment: .leading, spacing: 6) {
             header
-            symbolMenu
             quoteRow
             typeSegment
             priceFields
-            sizingSection
-            riskReadout
+            sizeModeRow
+            sizingInput
+            readoutLine
             submitControls
             flattenReverseRow
         }
-        .padding(12)
+        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .panel()
         .overlay(
@@ -177,10 +178,12 @@ struct OrderTicket: View {
 
     // MARK: Header
 
+    // Header carries the section stamp, the symbol picker (moved up from its
+    // own row to save vertical space), and the hotkey help.
     private var header: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             SectionLabel(text: "ticket")
-            Spacer(minLength: 0)
+            symbolMenu
             helpButton
         }
         .contentShape(Rectangle())
@@ -265,42 +268,34 @@ struct OrderTicket: View {
         .frame(maxWidth: .infinity)
     }
 
-    // MARK: Quote row
+    // MARK: Quote row — one compact line: bid · last · ask · spread. Bid/ask
+    // stay click-to-price; the size sub-line is dropped for deck density.
 
     private var quoteRow: some View {
-        VStack(spacing: 4) {
-            HStack(spacing: 6) {
-                quoteCell(label: "bid", px: book?.bid_px, sz: book?.bid_sz,
-                          tint: Theme.up, action: clickBid)
-                quoteCell(label: "last", px: price, sz: nil,
-                          tint: Theme.bone, action: nil)
-                quoteCell(label: "ask", px: book?.ask_px, sz: book?.ask_sz,
-                          tint: Theme.down, action: clickAsk)
-            }
-            spreadRow
+        HStack(spacing: 5) {
+            quoteCell(label: "bid", px: book?.bid_px, tint: Theme.up, action: clickBid)
+            quoteCell(label: "last", px: price, tint: Theme.bone, action: nil)
+            quoteCell(label: "ask", px: book?.ask_px, tint: Theme.down, action: clickAsk)
+            spreadCell
         }
     }
 
     private func quoteCell(
-        label: String, px: Double?, sz: Double?, tint: Color, action: (() -> Void)?
+        label: String, px: Double?, tint: Color, action: (() -> Void)?
     ) -> some View {
         let content = VStack(spacing: 1) {
             Text(label.uppercased())
-                .font(.system(size: 8, weight: .semibold))
-                .tracking(0.8)
+                .font(.system(size: 7, weight: .semibold))
+                .tracking(0.6)
                 .foregroundStyle(Theme.dim)
             Text(px.map { DashFormat.price($0) } ?? "—")
-                .numeric(size: 12, weight: .semibold)
+                .numeric(size: 11, weight: .semibold)
                 .foregroundStyle(px == nil ? Theme.dim : tint)
                 .lineLimit(1)
-                .minimumScaleFactor(0.7)
-            Text(sz.map { DashFormat.qty($0) } ?? " ")
-                .numeric(size: 8)
-                .foregroundStyle(Theme.dim)
-                .lineLimit(1)
+                .minimumScaleFactor(0.6)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 5)
+        .padding(.vertical, 4)
         .background(Theme.ink)
         .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
         .overlay(
@@ -325,16 +320,21 @@ struct OrderTicket: View {
         return b.ask_px - b.bid_px
     }
 
-    private var spreadRow: some View {
-        HStack(spacing: 4) {
-            Text("spread")
-                .font(.system(size: 9, weight: .medium))
+    private var spreadCell: some View {
+        VStack(spacing: 1) {
+            Text("SPR")
+                .font(.system(size: 7, weight: .semibold))
+                .tracking(0.6)
                 .foregroundStyle(Theme.dim)
-            Spacer(minLength: 0)
             Text(spread.map { DashFormat.price($0) } ?? "—")
-                .numeric(size: 9)
+                .numeric(size: 11)
                 .foregroundStyle(Theme.dim)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
         }
+        .frame(width: 54)
+        .padding(.vertical, 4)
+        .help("bid/ask spread")
     }
 
     // MARK: Order type
@@ -408,19 +408,16 @@ struct OrderTicket: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: Sizing
+    // MARK: Sizing — mode segments and the active input on their own compact
+    // lines; the resolved share count is folded into the readout line below.
 
-    private var sizingSection: some View {
-        VStack(spacing: 6) {
-            HStack(spacing: 4) {
-                ForEach(SizingMode.allCases) { mode in
-                    DeckSegment(title: mode.title, isOn: sizingMode == mode) {
-                        sizingMode = mode
-                    }
+    private var sizeModeRow: some View {
+        HStack(spacing: 4) {
+            ForEach(SizingMode.allCases) { mode in
+                DeckSegment(title: mode.title, isOn: sizingMode == mode) {
+                    sizingMode = mode
                 }
             }
-            sizingInput
-            resultRow
         }
     }
 
@@ -499,63 +496,46 @@ struct OrderTicket: View {
         .help("\(Int(fraction * 100))% of buying power")
     }
 
-    private var resultRow: some View {
-        HStack(spacing: 6) {
-            Text("=")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(Theme.dim)
-            Text(effectiveQty.map { "\(DashFormat.qty($0)) sh" } ?? "— sh")
-                .numeric(size: 11, weight: .semibold)
-                .foregroundStyle(effectiveQty == nil ? Theme.dim : Theme.bone)
+    // MARK: Risk / size readout — one compact line: resolved shares, notional,
+    // % of equity (ember dot when concentrated), and — once a stop is set —
+    // total risk and reward:risk. All formatting/gating lives in the pure
+    // TicketReadout helper.
+
+    private var readoutLine: some View {
+        let r = TicketReadout.make(
+            qty: effectiveQty,
+            notional: notional,
+            equityFraction: equityFraction,
+            totalRisk: totalRisk,
+            rewardRisk: rewardRisk
+        )
+        return HStack(spacing: 6) {
+            readoutSeg("=", r.shares, effectiveQty == nil ? Theme.dim : Theme.bone)
+            readoutSeg("notl", r.notional, Theme.dim)
+            readoutSeg("eq", r.equityPct, r.concentrated ? Theme.bone : Theme.dim, warn: r.concentrated)
+            if let risk = r.risk { readoutSeg("risk", risk, Theme.dim) }
+            if let rr = r.rewardRisk { readoutSeg("r:r", rr, Theme.dim) }
             Spacer(minLength: 0)
-            Text(notional.map { DashFormat.money($0) } ?? "—")
-                .numeric(size: 11)
-                .foregroundStyle(Theme.dim)
         }
+        .help(r.concentrated
+            ? "size is large — over \(DashFormat.pct(OrderSizing.warnFractionOfEquity, decimals: 0)) of equity"
+            : "size · notional · % of equity · risk to stop · reward:risk")
     }
 
-    // MARK: Risk readout
-
-    private var riskReadout: some View {
-        VStack(spacing: 3) {
-            infoRow("notional", notional.map { DashFormat.money($0) } ?? "—")
-            infoRow(
-                "% equity",
-                equityFraction.map { DashFormat.pct($0) } ?? "—",
-                valueColor: concentrated ? Theme.bone : Theme.dim,
-                warn: concentrated
-            )
-            if concentrated {
-                HStack(spacing: 6) {
-                    Circle().fill(Theme.ember).frame(width: 5, height: 5)
-                    Text("large — over \(DashFormat.pct(OrderSizing.warnFractionOfEquity, decimals: 0)) of equity")
-                        .font(.system(size: 9))
-                        .foregroundStyle(Theme.dim)
-                    Spacer(minLength: 0)
-                }
-            }
-            if usesStop, let rps = riskPerShare {
-                infoRow("risk/sh", DashFormat.price(rps))
-                infoRow("risk", totalRisk.map { DashFormat.money($0) } ?? "—")
-                if let rr = rewardRisk, rr > 0 {
-                    infoRow("R:R", String(format: "%.2f : 1", rr))
-                }
-            }
-        }
-    }
-
-    private func infoRow(
-        _ label: String, _ value: String, valueColor: Color = Theme.dim, warn: Bool = false
+    private func readoutSeg(
+        _ label: String, _ value: String, _ color: Color, warn: Bool = false
     ) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 3) {
             Text(label)
-                .font(.system(size: 10, weight: .medium))
+                .font(.system(size: 8, weight: .semibold))
+                .tracking(0.5)
                 .foregroundStyle(Theme.dim)
-            if warn { Circle().fill(Theme.ember).frame(width: 5, height: 5) }
-            Spacer(minLength: 4)
+            if warn { Circle().fill(Theme.ember).frame(width: 4, height: 4) }
             Text(value)
-                .numeric(size: 11)
-                .foregroundStyle(valueColor)
+                .numeric(size: 10, weight: .medium)
+                .foregroundStyle(color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
         }
     }
 

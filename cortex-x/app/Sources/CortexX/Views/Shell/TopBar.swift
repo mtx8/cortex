@@ -64,19 +64,32 @@ struct TopBar: View {
     }
 
     // Broker-link posture — the operator must always know whether real money
-    // is at play. Calm for PAPER / IBKR PAPER; unmissable (ember chip + LIVE)
-    // only when the engine says live AND the broker session is connected. All
-    // the text/color decisions live in the pure `BrokerBadge` helper.
+    // is at play. An explicit dim "BROKER" stamp precedes the mode so the
+    // control always reads as the broker/connection indicator (not an
+    // anonymous dot): "BROKER · PAPER" (calm), "BROKER · IBKR PAPER ●" (ember +
+    // link dot), "BROKER · IBKR LIVE ●" (unmissable ember chip + border, bold —
+    // real money). The trailing dot's color tracks the broker link state. All
+    // the label / text / dot / color decisions live in the pure `BrokerBadge`
+    // helper, so the loud-only-when-truly-live rule is unit-tested.
     private var brokerBadge: some View {
         let s = BrokerBadge.style(for: model.broker)
-        return HStack(spacing: 6) {
-            Circle()
-                .fill(s.dotColor)
-                .frame(width: 7, height: 7)
+        return HStack(spacing: 5) {
+            Text(s.label)
+                .font(.system(size: 8, weight: .semibold))
+                .tracking(1.2)
+                .foregroundStyle(Theme.dim)
+            Text("·")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(Theme.dim)
             Text(s.text)
                 .font(.system(size: 10, weight: s.isLive ? .bold : .semibold))
                 .tracking(1.2)
                 .foregroundStyle(s.textColor)
+            if s.showDot {
+                Circle()
+                    .fill(s.dotColor)
+                    .frame(width: 7, height: 7)
+            }
         }
         .padding(.horizontal, s.isLive ? 10 : 0)
         .padding(.vertical, s.isLive ? 4 : 0)
@@ -90,7 +103,7 @@ struct TopBar: View {
                 )
         )
         .help(s.help)
-        .accessibilityLabel("Broker \(s.text)")
+        .accessibilityLabel("\(s.label) \(s.text)")
     }
 
     private var connection: some View {
@@ -112,13 +125,25 @@ struct TopBar: View {
 /// unknown, absent, or disconnected reads as a calmer, non-live posture.
 enum BrokerBadge {
     struct Style: Equatable {
+        /// Always-present dim stamp so the control reads unmistakably as the
+        /// BROKER link, never an anonymous status dot.
+        var label: String
+        /// The execution-mode text: PAPER / IBKR PAPER / IBKR LIVE / IBKR.
         var text: String
         var textColor: Color
+        /// Whether to render a broker-link connection dot. The internal paper
+        /// simulator has no broker session, so it shows none.
+        var showDot: Bool
+        /// Link-state color of that dot: up = connected, dim = down; ember when
+        /// live-connected (tied to the loud chip).
         var dotColor: Color
         /// Real money is at play — drives the loud ember-chip emphasis.
         var isLive: Bool
         var help: String
     }
+
+    /// The stamp that precedes every mode, so PAPER is still clearly the BROKER.
+    static let label = "BROKER"
 
     static func style(for status: BrokerStatus?) -> Style {
         // No posture yet → the safe internal paper simulator.
@@ -129,43 +154,52 @@ enum BrokerBadge {
             return paper
         case .ibkr_paper:
             return Style(
+                label: label,
                 text: "IBKR PAPER",
                 textColor: Theme.ember,
+                showDot: true,
                 dotColor: status.connected ? Theme.up : Theme.dim,
                 isLive: false,
-                help: "IBKR paper account\(acct) — "
+                help: "Broker link: IBKR paper account\(acct) — "
                     + (status.connected ? "connected" : "link down")
                     + ". Simulated fills, no real money."
             )
         case .ibkr_live:
             if status.connected {
                 return Style(
+                    label: label,
                     text: "IBKR LIVE",
                     textColor: Theme.ember,
+                    showDot: true,
                     dotColor: Theme.ember,
                     isLive: true,
-                    help: "IBKR LIVE account\(acct) — connected. "
+                    help: "Broker link: IBKR LIVE account\(acct) — connected. "
                         + "REAL MONEY: orders execute at your broker."
                 )
             }
             // Live is configured but the broker link is down: no real order can
             // flow, so never scream LIVE. Show a calm, honest IBKR badge.
             return Style(
+                label: label,
                 text: "IBKR",
                 textColor: Theme.ember,
+                showDot: true,
                 dotColor: Theme.dim,
                 isLive: false,
-                help: "IBKR live account\(acct) configured — link DOWN. "
-                    + "No orders can execute until the broker reconnects."
+                help: "Broker link: IBKR live account\(acct) configured — link "
+                    + "DOWN. No orders can execute until the broker reconnects."
             )
         }
     }
 
     private static let paper = Style(
+        label: label,
         text: "PAPER",
         textColor: Theme.dim,
+        showDot: false,
         dotColor: Theme.dim,
         isLive: false,
-        help: "Paper simulator — no broker linked. No real money."
+        help: "Broker link: the internal paper simulator — no broker connected. "
+            + "Orders are simulated; no real money."
     )
 }
