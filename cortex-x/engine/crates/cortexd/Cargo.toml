@@ -34,6 +34,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
-
-[dev-dependencies]
+# The ActiveBroker hot-swap wrapper implements the async `Broker` trait, so
+# async-trait is a normal (not dev-only) dependency now.
 async-trait = { workspace = true }

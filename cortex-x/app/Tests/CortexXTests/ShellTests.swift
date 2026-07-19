@@ -6,15 +6,18 @@ import XCTest
 
 @MainActor
 final class ShellTests: XCTestCase {
-    func testCenterModeHasEightCasesInRailOrder() {
+    func testCenterModeRailOrderThenSettings() {
         // FILINGS moved into the NEWS desk as a tab — it is no longer a center
-        // section. The icon rail derives its cmd-number shortcuts from this
-        // order (index + 1), so removing it keeps the shortcuts contiguous and
-        // the rail must stay in lockstep with this list.
+        // section. The icon rail derives its cmd-number shortcuts from the FIRST
+        // EIGHT cases (index + 1); SETTINGS is a separate foot-of-rail entry
+        // (gearshape, cmd-,) and must stay LAST so the numbered shortcuts remain
+        // contiguous and the rail stays in lockstep with this list.
         XCTAssertEqual(
             AppModel.CenterMode.allCases,
-            [.chart, .scanner, .news, .company, .options, .foundry, .regimes, .meridian]
+            [.chart, .scanner, .news, .company, .options, .foundry, .regimes, .meridian, .settings]
         )
+        // Settings sits off the numbered rail — always last.
+        XCTAssertEqual(AppModel.CenterMode.allCases.last, .settings)
     }
 
     func testOpenCompanySwitchesModeAndMarksLoading() {

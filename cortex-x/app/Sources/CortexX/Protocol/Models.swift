@@ -92,6 +92,23 @@ enum BrokerMode: String, Codable, Equatable {
     }
 }
 
+/// The broker execution mode the operator SETS via SETTINGS — distinct from
+/// the richer status `BrokerMode` the engine reports back. Two values only,
+/// matching the engine `[broker].mode` contract: the internal paper simulator
+/// or the IBKR adapter. Whether an IBKR session is paper or live is decided by
+/// the port + `allow_live` gates, not by this field. Case names equal the
+/// serde snake_case wire values verbatim.
+enum BrokerConfigMode: String, Codable, CaseIterable, Identifiable, Equatable {
+    case paper, ibkr
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .paper: "Paper"
+        case .ibkr: "IBKR"
+        }
+    }
+}
+
 // MARK: - Payloads
 
 struct Tick: Codable, Equatable {
@@ -1021,6 +1038,20 @@ enum Command {
     case getCompany(symbol: String)
     case getHistory(symbol: String)
     case getFilings(query: String, formFilter: String, text: String)
+    /// Reconfigure the live-trading broker link from SETTINGS. Additive: older
+    /// engines simply ignore an unknown cmd. The engine re-runs the SAME
+    /// `[broker]` validation + safety gates (live ports 7496/4001 require
+    /// allow_live; every LIVE hard limit must be finite and > 0), reconfigures
+    /// / reconnects the active broker, and publishes an updated BrokerStatus —
+    /// on any failure it stays on the previous safe broker and emits a critical
+    /// thought. This client only records intent and sends; it never assumes the
+    /// change took.
+    case setBrokerConfig(
+        mode: BrokerConfigMode, ibkrHost: String, ibkrPort: Int, ibkrClientId: Int,
+        ibkrAccount: String, ibkrRoute: String, allowLive: Bool,
+        maxLiveOrderNotional: Double, maxLivePositionNotional: Double,
+        maxLiveDailyLoss: Double
+    )
 
     func encoded() throws -> Data {
         var obj: [String: Any]
@@ -1063,6 +1094,25 @@ enum Command {
             obj = [
                 "cmd": "get_filings", "query": query,
                 "form_filter": formFilter, "text": text,
+            ]
+        case let .setBrokerConfig(
+            mode, ibkrHost, ibkrPort, ibkrClientId, ibkrAccount, ibkrRoute,
+            allowLive, maxOrder, maxPosition, maxDailyLoss
+        ):
+            // Every field is always present so the wire shape matches the
+            // engine's `[broker]` contract exactly (serde snake_case, 1:1).
+            obj = [
+                "cmd": "set_broker_config",
+                "mode": mode.rawValue,
+                "ibkr_host": ibkrHost,
+                "ibkr_port": ibkrPort,
+                "ibkr_client_id": ibkrClientId,
+                "ibkr_account": ibkrAccount,
+                "ibkr_route": ibkrRoute,
+                "allow_live": allowLive,
+                "max_live_order_notional": maxOrder,
+                "max_live_position_notional": maxPosition,
+                "max_live_daily_loss": maxDailyLoss,
             ]
         }
         return try JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys])

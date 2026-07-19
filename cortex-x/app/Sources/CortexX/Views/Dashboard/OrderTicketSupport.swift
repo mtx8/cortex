@@ -172,6 +172,18 @@ enum OrderRisk {
     }
 }
 
+// MARK: - Live-order confirmation gate
+
+/// Whether a manual ticket submit needs an explicit real-money confirmation.
+/// Pure so the rule is unit-tested away from SwiftUI: a confirmation is owed
+/// only when the ticket routes to a real-money venue AND the operator has left
+/// the confirm-before-live preference on. Paper and IBKR-paper never prompt.
+enum LiveOrderConfirm {
+    static func required(isLiveVenue: Bool, confirmBeforeLive: Bool) -> Bool {
+        isLiveVenue && confirmBeforeLive
+    }
+}
+
 // MARK: - Position actions (flatten / reverse)
 
 /// A sized order side — the atom returned by the flatten/reverse builders so

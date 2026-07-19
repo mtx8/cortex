@@ -2,17 +2,20 @@
 //! Wires feeds, strategies, agents, risk, OMS and the websocket gateway
 //! around the single bus, then runs until killed.
 
+mod active_broker;
 mod options_enrich;
 mod pipeline;
 mod snapshot;
 
 use std::sync::Arc;
 
+use cx_broker::Broker;
 use cx_core::autonomy::AutonomyDial;
 use cx_core::store::BarStore;
 use cx_core::types::AutonomyLevel;
 use cx_core::{Bus, Command, Config, KillSwitch};
 
+use crate::active_broker::ActiveBroker;
 use crate::pipeline::TradePipeline;
 use crate::snapshot::SnapshotSrc;
 
@@ -45,7 +48,16 @@ async fn main() -> anyhow::Result<()> {
     // Active broker: PAPER by default. mode="ibkr" attempts a Gateway
     // connection and, on ANY failure, falls back to paper with a loud critical
     // thought — never crashes, never silently live (see cx-broker + docs/IBKR.md).
-    let broker = cx_broker::build_active_broker(&cfg.broker, Arc::clone(&bus), Arc::clone(&oms)).await;
+    //
+    // The built broker is wrapped in an ActiveBroker so Settings can hot-swap it
+    // at runtime (Command::SetBrokerConfig) WITHOUT rebuilding the pipeline. The
+    // pipeline and the snapshot both hold this SAME wrapper (as Arc<dyn Broker>),
+    // so one swap updates the routed sink and the connect-time badge together,
+    // and the kill/risk/flatten path always reaches the current delegate.
+    let active = ActiveBroker::new(
+        cx_broker::build_active_broker(&cfg.broker, Arc::clone(&bus), Arc::clone(&oms)).await,
+    );
+    let broker: Arc<dyn Broker> = Arc::clone(&active) as Arc<dyn Broker>;
     tracing::info!(broker = broker.name(), "active broker selected");
     // Announce the TRUE broker posture so the app badge reflects real money
     // from the first frame. build_active_broker already fell back to paper on
@@ -229,10 +241,109 @@ async fn main() -> anyhow::Result<()> {
                     }));
                 });
             }
+            // Runtime broker (re)configuration from Settings. Validated through
+            // the SAME gates as disk config, then the sink is rebuilt and
+            // hot-swapped behind the shared ActiveBroker (see reconfigure_broker).
+            // The `{ .. }` pattern binds nothing, so `cmd` is borrowed, not moved.
+            Command::SetBrokerConfig { .. } => {
+                reconfigure_broker(&cmd, &active, &bus, &oms).await;
+            }
             other => pipeline.handle_command(other).await,
         }
     }
     Ok(())
+}
+
+/// Apply a runtime `Command::SetBrokerConfig` from the app's Settings:
+/// reconfigure / reconnect the active order sink with the SAME live-safety
+/// gates a `[broker]` config load uses, then publish the true posture. Fail-safe
+/// by construction — it never bypasses a gate, never goes silently live, and
+/// never crashes:
+///
+/// - The command is converted to the engine's `BrokerConfig`
+///   (`Command::to_broker_config`) and `validate()`d: identical live-port
+///   refusal, ibkr-account requirement, live-account identity gate, and
+///   finite>0 live-limit checks as disk config. A REJECTED config keeps the
+///   PREVIOUS safe broker untouched (no swap) and emits a CRITICAL thought.
+/// - A VALID config is handed to `build_active_broker`, which is PAPER-FIRST:
+///   `mode="paper"` swaps instantly; `mode="ibkr"` attempts the Gateway and, on
+///   ANY failure, itself falls back to paper with a loud critical thought. The
+///   result is swapped into the shared `ActiveBroker` the pipeline and snapshot
+///   both route through — so the kill / risk / flatten path keeps working across
+///   the swap — and the OUTGOING broker is disconnected AFTER the new one is
+///   already live (routing is never interrupted).
+/// - The updated `BrokerStatus` (masked account) is published so the app badge
+///   reflects real money immediately.
+///
+/// No secret transits this path: IBKR API authentication happens in the
+/// operator's own IB Gateway / TWS login — CORTEX only opens a localhost socket.
+/// The account id is wrapped in `Secret` on conversion and appears only masked.
+async fn reconfigure_broker(
+    cmd: &Command,
+    active: &Arc<ActiveBroker>,
+    bus: &Arc<Bus>,
+    oms: &Arc<cx_oms::Oms>,
+) {
+    use cx_core::events::{AgentThought, BrokerMode, EngineEvent};
+    use cx_core::time::now_ms;
+    use cx_core::types::Severity;
+
+    let Some(new_cfg) = cmd.to_broker_config() else {
+        return; // defensive: only SetBrokerConfig routes here
+    };
+
+    // Gate: the EXACT config validation a disk `[broker]` load runs. A
+    // misconfigured request NEVER swaps the sink — the previous safe broker
+    // keeps routing. `CxError`'s Display never contains the account id.
+    if let Err(e) = new_cfg.validate() {
+        let text = format!(
+            "broker reconfigure REFUSED (invalid config): {e} — staying on the current broker"
+        );
+        tracing::error!("{text}");
+        bus.publish(EngineEvent::Thought(AgentThought {
+            agent: "broker".into(),
+            squadron: "execution".into(),
+            severity: Severity::Critical,
+            text,
+            tags: vec!["broker".into(), "config".into(), "refused".into()],
+            confidence: 1.0,
+            symbol: None,
+            ts_ms: now_ms(),
+        }));
+        return;
+    }
+
+    // Valid: build the replacement. PAPER-FIRST and fail-safe — an ibkr connect
+    // failure returns a paper broker WITH its own critical thought, so this can
+    // never silently go live and never panics.
+    let next = cx_broker::build_active_broker(&new_cfg, Arc::clone(bus), Arc::clone(oms)).await;
+    let status = next.status();
+    // Swap first so routing is never interrupted, then tear down the OUTGOING
+    // session (paper disconnect is a no-op; an old IBKR socket is closed).
+    let previous = active.swap(next);
+    previous.disconnect().await;
+
+    // Announce the TRUE posture (masked account) so the operator badge updates.
+    bus.publish(EngineEvent::BrokerStatus(status.clone()));
+    let mode_label = match status.mode {
+        BrokerMode::Paper => "paper exchange",
+        BrokerMode::IbkrPaper => "IBKR (paper account)",
+        BrokerMode::IbkrLive => "IBKR (LIVE — real money)",
+    };
+    tracing::info!(mode = ?status.mode, connected = status.connected, "broker reconfigured");
+    bus.publish(EngineEvent::Thought(AgentThought {
+        agent: "broker".into(),
+        squadron: "execution".into(),
+        severity: Severity::Insight,
+        text: format!(
+            "broker reconfigured to {mode_label} ({})",
+            if status.connected { "connected" } else { "not connected" }
+        ),
+        tags: vec!["broker".into(), "config".into()],
+        confidence: 1.0,
+        symbol: None,
+        ts_ms: now_ms(),
+    }));
 }
 
 /// The AUTORESEARCH runner. Each cycle (cadence validated >= 1h):

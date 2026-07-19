@@ -37,6 +37,7 @@ struct RootView: View {
                         case .foundry: FoundryView()
                         case .regimes: RegimesView()
                         case .meridian: MeridianView()
+                        case .settings: SettingsView()
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -227,7 +228,12 @@ private struct IconRail: View {
                 sectionButton(section, digit: index + 1)
             }
             Spacer(minLength: 8)
+            // Settings sits at the foot of the rail, above the connection dot —
+            // separate from the numbered section list (it opens the .settings
+            // center mode; ⌘, is the standard macOS Settings shortcut).
+            settingsButton
             connectionDot
+                .padding(.top, 6)
         }
         .padding(.vertical, 10)
         .frame(width: 48)
@@ -259,32 +265,65 @@ private struct IconRail: View {
         .keyboardShortcut(KeyEquivalent(Character("\(digit)")), modifiers: .command)
         .help(section.name)
         .onHover { hovered = $0 ? section.mode : (hovered == section.mode ? nil : hovered) }
-        // Instant on-brand title flyout to the right of the icon (the native
-        // .help tooltip is slow and easy to miss). Non-interactive; drawn
-        // above siblings so it never gets clipped by the next row.
         .overlay(alignment: .leading) {
-            if isHovered {
-                Text(section.name.uppercased())
-                    .font(.system(size: 10, weight: .semibold))
-                    .tracking(0.8)
-                    .foregroundStyle(Theme.bone)
-                    .lineLimit(1)
-                    .fixedSize()
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(Theme.panel)
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 6)
-                            .strokeBorder(Theme.line, lineWidth: Theme.hairline)
-                    )
-                    .offset(x: 46)
-                    .allowsHitTesting(false)
-                    .transition(.opacity)
-            }
+            if isHovered { railFlyout(section.name) }
         }
         .zIndex(isHovered ? 1 : 0)
         .animation(DeckMotion.ease(), value: isHovered)
+    }
+
+    /// Foot-of-rail gear opening the SETTINGS center mode. Same visual language
+    /// as the section buttons (ember tint when active/hovered, hover flyout) but
+    /// off the numbered list — it carries ⌘, instead of a digit.
+    private var settingsButton: some View {
+        let active = model.centerMode == .settings
+        let isHovered = hovered == .settings
+        return Button {
+            model.centerMode = .settings
+        } label: {
+            Image(systemName: "gearshape")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(active || isHovered ? Theme.ember : Theme.dim)
+                .frame(width: 28, height: 28)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(active ? Theme.emberTint : (isHovered ? Theme.panelHi : .clear))
+                )
+                .frame(width: 40, height: 36)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(",", modifiers: .command)
+        .help("settings")
+        .onHover { hovered = $0 ? .settings : (hovered == .settings ? nil : hovered) }
+        .overlay(alignment: .leading) {
+            if isHovered { railFlyout("settings") }
+        }
+        .zIndex(isHovered ? 1 : 0)
+        .animation(DeckMotion.ease(), value: isHovered)
+    }
+
+    /// Instant on-brand title flyout to the right of a rail icon (the native
+    /// .help tooltip is slow and easy to miss). Non-interactive; drawn above
+    /// siblings so it never gets clipped by the next row.
+    private func railFlyout(_ name: String) -> some View {
+        Text(name.uppercased())
+            .font(.system(size: 10, weight: .semibold))
+            .tracking(0.8)
+            .foregroundStyle(Theme.bone)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(Theme.panel)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+            )
+            .offset(x: 46)
+            .allowsHitTesting(false)
+            .transition(.opacity)
     }
 
     private var connectionDot: some View {

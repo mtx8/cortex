@@ -4,6 +4,7 @@
 // construction. Everything here is pure and NaN-safe — garbage in yields nil,
 // never a bogus number the ticket would render as truth.
 
+import SwiftUI
 import XCTest
 @testable import CortexX
 
@@ -239,5 +240,51 @@ final class OrderTicketSupportTests: XCTestCase {
         XCTAssertFalse(r.concentrated)
         XCTAssertNil(r.risk)        // NaN risk omitted, never a bogus number
         XCTAssertNil(r.rewardRisk)  // NaN reward:risk omitted
+    }
+
+    // MARK: - Ticket venue tag (reuses the shared BrokerBadge mapping)
+
+    func testVenueTagPaperPostures() {
+        // No posture and the internal simulator both read a calm PAPER, never
+        // loud — the common path shows no real-money emphasis.
+        for status: BrokerStatus? in [nil, BrokerStatus(mode: .paper, connected: false)] {
+            let tag = TicketVenueTag.make(for: status)
+            XCTAssertEqual(tag.text, "PAPER")
+            XCTAssertFalse(tag.isLive)
+            XCTAssertEqual(tag.color, Theme.dim)
+        }
+    }
+
+    func testVenueTagIbkrPaperIsNotLive() {
+        let tag = TicketVenueTag.make(for: BrokerStatus(mode: .ibkr_paper, connected: true))
+        XCTAssertEqual(tag.text, "IBKR PAPER")
+        XCTAssertFalse(tag.isLive)
+        XCTAssertEqual(tag.color, Theme.ember)
+    }
+
+    func testVenueTagIbkrLiveConnectedIsLoud() {
+        let tag = TicketVenueTag.make(for: BrokerStatus(mode: .ibkr_live, connected: true))
+        XCTAssertEqual(tag.text, "IBKR LIVE")
+        XCTAssertTrue(tag.isLive) // rendered loud beside BUY/SELL
+        XCTAssertEqual(tag.color, Theme.ember)
+    }
+
+    func testVenueTagIbkrLiveDisconnectedNeverReadsLive() {
+        // Live configured but link down — no order can flow, so never loud.
+        let tag = TicketVenueTag.make(for: BrokerStatus(mode: .ibkr_live, connected: false))
+        XCTAssertEqual(tag.text, "IBKR")
+        XCTAssertFalse(tag.isLive)
+    }
+
+    // MARK: - Live-order confirmation gate
+
+    func testLiveOrderConfirmOnlyOnLiveVenueWhenEnabled() {
+        // The only case that prompts: a real-money venue with the backstop on.
+        XCTAssertTrue(LiveOrderConfirm.required(isLiveVenue: true, confirmBeforeLive: true))
+        // Paper venue never prompts, regardless of the preference.
+        XCTAssertFalse(LiveOrderConfirm.required(isLiveVenue: false, confirmBeforeLive: true))
+        // Operator lowered the backstop → no prompt even on a live venue.
+        XCTAssertFalse(LiveOrderConfirm.required(isLiveVenue: true, confirmBeforeLive: false))
+        XCTAssertFalse(LiveOrderConfirm.required(isLiveVenue: false, confirmBeforeLive: false))
     }
 }

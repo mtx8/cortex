@@ -22,7 +22,14 @@ struct OrderTicket: View {
     @State private var limitText = ""
     @State private var stopText = ""
     @State private var showHelp = false
+    /// Non-nil while a real-money order is awaiting its explicit confirmation.
+    @State private var pendingLiveSide: Side?
     @FocusState private var focus: TicketFocus?
+
+    /// SETTINGS ▸ PREFERENCES: require an explicit confirmation before any order
+    /// that would route to a LIVE broker account. On by default — a real-money
+    /// backstop the operator can lower deliberately.
+    @AppStorage("ticket.confirmBeforeLiveOrder") private var confirmBeforeLiveOrder = true
 
     /// SHARES = raw count · DOLLARS = $ ÷ price · PERCENT = chip of buying power.
     enum SizingMode: String, CaseIterable, Identifiable {
@@ -173,6 +180,23 @@ struct OrderTicket: View {
         .onChange(of: orderType) { _, _ in seedPricesIfNeeded() }
         .onChange(of: model.selectedSymbol) { _, _ in
             if symbolOverride == nil { seedPricesIfNeeded() }
+        }
+        .confirmationDialog(
+            "Place a LIVE order?",
+            isPresented: Binding(
+                get: { pendingLiveSide != nil },
+                set: { if !$0 { pendingLiveSide = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingLiveSide
+        ) { s in
+            Button("Send \(s == .buy ? "BUY" : "SELL") — real money", role: .destructive) {
+                dispatch(s)
+                pendingLiveSide = nil
+            }
+            Button("Cancel", role: .cancel) { pendingLiveSide = nil }
+        } message: { _ in
+            Text("This routes to your live broker account. Real money — orders execute at your broker.")
         }
     }
 
@@ -555,21 +579,59 @@ struct OrderTicket: View {
                         .strokeBorder(Theme.down.opacity(0.5), lineWidth: Theme.hairline)
                 )
         } else {
-            HStack(spacing: 8) {
-                Button { submit(.buy) } label: {
-                    Text("BUY").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(BuySellButtonStyle(tint: Theme.up, armed: side == .buy))
-                .disabled(!canSubmit)
+            VStack(spacing: 6) {
+                venueTag
+                HStack(spacing: 8) {
+                    Button { submit(.buy) } label: {
+                        Text("BUY").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(BuySellButtonStyle(tint: Theme.up, armed: side == .buy))
+                    .disabled(!canSubmit)
 
-                Button { submit(.sell) } label: {
-                    Text("SELL").frame(maxWidth: .infinity)
+                    Button { submit(.sell) } label: {
+                        Text("SELL").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(BuySellButtonStyle(tint: Theme.down, armed: side == .sell))
+                    .disabled(!canSubmit)
                 }
-                .buttonStyle(BuySellButtonStyle(tint: Theme.down, armed: side == .sell))
-                .disabled(!canSubmit)
+                .opacity(canSubmit ? 1 : 0.5)
             }
-            .opacity(canSubmit ? 1 : 0.5)
         }
+    }
+
+    /// Compact execution-venue tag pinned above BUY/SELL so the trader always
+    /// knows where the order lands before clicking. Derives from the shared
+    /// BrokerBadge mapping (single source of truth), so it can never disagree
+    /// with the TopBar: calm inline text for PAPER / IBKR PAPER, a loud ember
+    /// chip for a connected LIVE account.
+    private var venueTag: some View {
+        let tag = TicketVenueTag.make(for: model.broker)
+        return HStack(spacing: 5) {
+            Text("venue")
+                .font(.system(size: 8, weight: .semibold))
+                .tracking(1.0)
+                .foregroundStyle(Theme.dim)
+            Text(tag.text)
+                .font(.system(size: 10, weight: tag.isLive ? .bold : .semibold))
+                .tracking(1.0)
+                .foregroundStyle(tag.color)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, tag.isLive ? 8 : 0)
+        .padding(.vertical, tag.isLive ? 3 : 0)
+        .background(tag.isLive ? Theme.ember.opacity(0.12) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.chipRadius)
+                .strokeBorder(
+                    tag.isLive ? Theme.ember.opacity(0.55) : Color.clear,
+                    lineWidth: Theme.hairline
+                )
+        )
+        .help(tag.isLive
+            ? "REAL MONEY — orders execute at your live broker account"
+            : "execution venue for this ticket")
+        .accessibilityLabel("venue \(tag.text)")
     }
 
     private var flattenReverseRow: some View {
@@ -658,8 +720,27 @@ struct OrderTicket: View {
         }
     }
 
+    /// True when the ticket routes to a connected LIVE broker account. Reuses
+    /// the shared BrokerBadge mapping so "live" here means exactly what the
+    /// TopBar badge and venue tag mean — nothing decides "live" twice.
+    private var isLiveVenue: Bool { TicketVenueTag.make(for: model.broker).isLive }
+
     private func submit(_ s: Side) {
         side = s
+        guard canSubmit, effectiveQty != nil else { return }
+        // A real-money venue gets one explicit confirmation before it fires
+        // (unless the operator lowered that backstop in SETTINGS). Paper and
+        // IBKR-paper dispatch immediately — the common path is untouched.
+        if LiveOrderConfirm.required(isLiveVenue: isLiveVenue, confirmBeforeLive: confirmBeforeLiveOrder) {
+            pendingLiveSide = s
+            return
+        }
+        dispatch(s)
+    }
+
+    /// The final send — after any live confirmation. Re-checks the gate so a
+    /// confirmation that lingered past a kill switch / disconnect can't fire.
+    private func dispatch(_ s: Side) {
         guard canSubmit, let qty = effectiveQty else { return }
         model.placeOrder(
             symbol: symbol, side: s, qty: qty, type: orderType,
@@ -714,6 +795,26 @@ struct OrderTicket: View {
             .trimmingCharacters(in: .whitespaces)
         guard !cleaned.isEmpty, let v = Double(cleaned), v.isFinite, v > 0 else { return nil }
         return v
+    }
+}
+
+// MARK: - Venue tag
+
+/// The compact execution-venue tag shown beside BUY/SELL. Derives entirely from
+/// the shared `BrokerBadge` mapping (the single source of truth for the
+/// paper / ibkr-paper / ibkr-live posture), so the ticket can never disagree
+/// with the TopBar about whether real money is at play. Kept as a small typed
+/// value so the mapping is unit-tested.
+struct TicketVenueTag: Equatable {
+    /// "PAPER" / "IBKR PAPER" / "IBKR LIVE" / "IBKR".
+    var text: String
+    /// Real money at a connected live account — the ticket renders this loud.
+    var isLive: Bool
+    var color: Color
+
+    static func make(for status: BrokerStatus?) -> TicketVenueTag {
+        let s = BrokerBadge.style(for: status)
+        return TicketVenueTag(text: s.text, isLive: s.isLive, color: s.textColor)
     }
 }
 

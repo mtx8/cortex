@@ -59,9 +59,15 @@ final class AppModel {
     /// stale "IBKR LIVE" can never linger while the engine is unreachable —
     /// LIVE must be current and connected or it must not read as live at all.
     private(set) var broker: BrokerStatus?
+    /// The operator's persisted broker preferences (SETTINGS ▸ BROKER). Loaded
+    /// at launch, mutated only through `applyBrokerConfig` so the persisted copy
+    /// and the last-sent command never drift. Convenience only: it is NEVER
+    /// auto-pushed to the engine — the engine owns its own `[broker]` config,
+    /// and applying this is an explicit operator action.
+    private(set) var brokerSettings: BrokerSettings
 
     // MARK: Center sections
-    enum CenterMode: String, CaseIterable { case chart, scanner, news, company, options, foundry, regimes, meridian }
+    enum CenterMode: String, CaseIterable { case chart, scanner, news, company, options, foundry, regimes, meridian, settings }
     var centerMode: CenterMode = .chart
     private(set) var optionsChain: OptionsChain?
     private(set) var chainLoading = false
@@ -138,6 +144,7 @@ final class AppModel {
 
     init(client: EngineClient = EngineClient()) {
         self.client = client
+        self.brokerSettings = BrokerSettingsStore.load()
         client.onFrame = { [weak self] frame in self?.apply(frame) }
         client.onStateChange = { [weak self] s in self?.handleStateChange(s) }
     }
@@ -176,6 +183,33 @@ final class AppModel {
         send(.placeOrder(
             symbol: symbol, side: side, qty: qty, orderType: type,
             limitPx: limitPx, stopPx: stopPx
+        ))
+    }
+
+    // MARK: Broker configuration
+
+    /// Persist the operator's broker preferences and push them to the engine as
+    /// a `set_broker_config` command. The engine re-validates (live-port +
+    /// allow_live, finite/>0 limits), reconfigures/reconnects the active broker,
+    /// and publishes an updated BrokerStatus we render live; on any failure it
+    /// stays on the previous safe broker and emits a critical thought. This only
+    /// records intent and sends — it never optimistically mutates `broker`, so
+    /// the badge/venue tag always reflect the engine's actual posture, never a
+    /// hoped-for one.
+    func applyBrokerConfig(_ settings: BrokerSettings) {
+        brokerSettings = settings
+        BrokerSettingsStore.save(settings)
+        send(.setBrokerConfig(
+            mode: settings.mode,
+            ibkrHost: settings.ibkrHost,
+            ibkrPort: settings.ibkrPort,
+            ibkrClientId: settings.ibkrClientId,
+            ibkrAccount: settings.ibkrAccount,
+            ibkrRoute: settings.ibkrRoute,
+            allowLive: settings.allowLive,
+            maxLiveOrderNotional: settings.maxLiveOrderNotional,
+            maxLivePositionNotional: settings.maxLivePositionNotional,
+            maxLiveDailyLoss: settings.maxLiveDailyLoss
         ))
     }
 

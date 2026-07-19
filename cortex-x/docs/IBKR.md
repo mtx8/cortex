@@ -177,7 +177,56 @@ Do these **in order**. Do not skip step 1.
 
 ---
 
-## 6. Known v1 scope / gaps (be honest)
+## 6. Runtime reconfiguration from the app (Settings)
+
+The broker can also be configured **without restarting the engine**, from the
+app's Settings, via the `set_broker_config` command:
+
+```json
+{ "cmd": "set_broker_config", "mode": "paper", "ibkr_host": "127.0.0.1",
+  "ibkr_port": 7497, "ibkr_client_id": 11, "ibkr_account": "",
+  "ibkr_route": "SMART", "allow_live": false, "max_live_order_notional": 2000.0,
+  "max_live_position_notional": 5000.0, "max_live_daily_loss": 500.0 }
+```
+
+The fields mirror the `[broker]` block one-for-one. The engine converts the
+command to the **same** `BrokerConfig` type and re-runs the **identical**
+safety gates as a disk load — so nothing about this path can weaken them:
+
+- A **LIVE port** (`7496`/`4001`) is refused without `allow_live=true`.
+- `mode="ibkr"` requires an account id; a **live-looking** account (not `DU…`)
+  requires `allow_live=true` regardless of port.
+- Every `max_live_*` limit must be **finite and > 0**.
+
+Behaviour is **fail-safe** and matches startup:
+
+- **Invalid config → no change.** The request is rejected, the **previous safe
+  broker keeps routing**, and a **critical** thought is published. Nothing swaps.
+- **`paper` → instant.** Switching to (or between) paper swaps immediately.
+- **`ibkr` → connect or fall back.** A valid `ibkr` config attempts the
+  Gateway; on **any** failure it **falls back to paper** with a loud critical
+  thought — never silently live, never a crash.
+- **The swap is seamless.** The pipeline routes through a stable holder whose
+  delegate is replaced, so the **kill switch / risk / flatten path keeps
+  working** across the swap; the outgoing session is disconnected only *after*
+  the new one is live. An updated `broker_status` event is published so the app
+  badge reflects real money immediately.
+
+> **No password ever transits this command.** IBKR API authentication happens
+> entirely in **your** IB Gateway / TWS login — CORTEX only opens a localhost
+> socket to software you are already logged into. `ibkr_account` is an **id, not
+> a credential**; it is wrapped in `Secret` on the engine side, is **never
+> logged**, and appears only **masked** (`U12****89`) in status.
+
+> **Note (ibkr → ibkr).** Reconnecting IBKR at runtime with the **same**
+> `ibkr_client_id` while the previous session is still up can be refused by the
+> Gateway (duplicate client id); it then falls back to paper with a critical
+> thought (safe). Use a different `ibkr_client_id`, or reconfigure via `paper`
+> first, to hop between two live IBKR sessions.
+
+---
+
+## 7. Known v1 scope / gaps (be honest)
 
 - **US equities only.** The live adapter routes `STK` orders (SMART or a direct
   venue). Crypto symbols (e.g. `BTC-USD`) are **not** routed live in v1 — they

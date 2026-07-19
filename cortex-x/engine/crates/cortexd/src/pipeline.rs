@@ -1133,4 +1133,100 @@ mod tests {
         assert!(open[0].intent.reduce_only);
         assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9); // still long
     }
+
+    /// Build a pipeline whose broker slot is a hot-swappable [`ActiveBroker`]
+    /// starting on a paper broker over the returned OMS, and hand back the
+    /// wrapper handle so a test can swap the delegate mid-flight — exactly what
+    /// the runtime `SetBrokerConfig` path does.
+    fn setup_with_active(
+        cfg: Config,
+    ) -> (
+        Arc<Bus>,
+        Arc<BarStore>,
+        Arc<Oms>,
+        Arc<KillSwitch>,
+        Arc<crate::active_broker::ActiveBroker>,
+        Arc<TradePipeline>,
+    ) {
+        let bus = Bus::new(1024);
+        let store = Arc::new(BarStore::new());
+        let oms = Oms::new(Arc::clone(&bus), Arc::clone(&store), cfg.paper.clone());
+        let kill = Arc::new(KillSwitch::new());
+        let risk = Arc::new(RiskEngine::new(cfg.risk.clone(), Arc::clone(&kill)));
+        let dial = Arc::new(AutonomyDial::new(AutonomyLevel::FullAuto));
+        let paper: Arc<dyn Broker> = cx_broker::PaperBroker::new(Arc::clone(&oms));
+        let active = crate::active_broker::ActiveBroker::new(paper);
+        let pipeline = TradePipeline::new(
+            Arc::clone(&bus),
+            Arc::clone(&store),
+            Arc::clone(&oms),
+            Arc::clone(&active) as Arc<dyn Broker>,
+            risk,
+            dial,
+            Arc::clone(&kill),
+            cfg,
+        );
+        (bus, store, oms, kill, active, pipeline)
+    }
+
+    fn buy(symbol: &str, qty: f64) -> Command {
+        Command::PlaceOrder {
+            symbol: symbol.into(),
+            side: Side::Buy,
+            qty,
+            order_type: OrderType::Market,
+            limit_px: None,
+            stop_px: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn paper_to_paper_broker_swap_keeps_pipeline_routing() {
+        // Swapping the sink (paper -> a fresh paper broker over the SAME book,
+        // as `set_broker_config` would) must not break order routing: the
+        // pipeline holds a stable ActiveBroker whose delegate simply changes.
+        let (_bus, store, oms, _kill, active, pipeline) = setup_with_active(test_cfg());
+        store.set_last_price("AAPL", 100.0);
+
+        // Pre-swap: a manual buy routes through the initial paper broker.
+        pipeline.handle_command(buy("AAPL", 2.0)).await;
+        assert!((oms.view().position_qty("AAPL") - 2.0).abs() < 1e-9);
+
+        // Hot-swap to a fresh paper broker over the SAME OMS book.
+        let paper2: Arc<dyn Broker> = cx_broker::PaperBroker::new(Arc::clone(&oms));
+        let previous = active.swap(Arc::clone(&paper2));
+        assert!(Arc::ptr_eq(&active.current(), &paper2), "swap must take effect");
+        assert_eq!(previous.name(), "paper");
+
+        // Post-swap: routing continues — another buy still reaches the OMS.
+        pipeline.handle_command(buy("AAPL", 3.0)).await;
+        assert!(
+            (oms.view().position_qty("AAPL") - 5.0).abs() < 1e-9,
+            "post-swap order must still route to the book"
+        );
+        assert_eq!(pipeline.broker.name(), "paper");
+    }
+
+    #[tokio::test]
+    async fn mock_broker_swap_preserves_kill_and_risk_path() {
+        // After hot-swapping to a mock broker, the operator kill switch must
+        // still engage the (synchronous, in-memory) kill AND route cancel +
+        // flatten to the CURRENT broker — the risk/kill path survives the swap.
+        let (_bus, _store, _oms, kill, active, pipeline) = setup_with_active(test_cfg());
+
+        let rec = RecordingBroker::new();
+        active.swap(Arc::clone(&rec) as Arc<dyn Broker>);
+
+        pipeline
+            .handle_command(Command::SetKillSwitch {
+                engaged: true,
+                reason: "kill switch".into(),
+            })
+            .await;
+
+        assert!(kill.is_engaged(), "the synchronous kill must engage across the swap");
+        let calls = rec.flatten_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "kill must flatten through the swapped-in broker");
+        assert_eq!(calls[0], "kill switch");
+    }
 }
