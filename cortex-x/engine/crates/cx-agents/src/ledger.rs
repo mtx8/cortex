@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, RwLock};
 
 use cx_core::events::{
-    AccountSnapshot, AgentThought, EngineEvent, FeedStatus, GeoPulse, MacroSnapshot, NewsBoard,
-    Position, RegimeBoard, RegimeState, RiskStatus, ScanBoard, StrategySignal,
+    AccountSnapshot, AgentThought, EngineEvent, FeedStatus, FlowRead, GeoPulse, MacroSnapshot,
+    NewsBoard, Position, RegimeBoard, RegimeState, RiskStatus, ScanBoard, StrategySignal,
 };
 use cx_core::store::BarStore;
 use cx_core::types::{Interval, Severity};
@@ -45,6 +45,11 @@ const RENDER_EARNINGS: usize = 8;
 const EARNINGS_WINDOW_DAYS: i64 = 14;
 /// DESKS bound: at most this many "desk-*" squadrons keep a latest note.
 const MAX_DESKS: usize = 6;
+/// FLOW bound: at most this many symbols keep a latest order-flow read (the
+/// FLOW desk streams one symbol at a time, so this only caps symbol churn).
+const MAX_FLOW: usize = 6;
+/// FLOW render: at most this many active microstructure flags per line.
+const RENDER_FLOW_FLAGS: usize = 5;
 /// PLAYBOOK bound: at most this many strategies in the regime matrix.
 const MAX_PLAYBOOK: usize = 12;
 /// Regime buckets in the PLAYBOOK matrix, mirroring the fusion layer's
@@ -97,6 +102,10 @@ pub(crate) struct LedgerState {
     /// (desks throttle to notable changes, so this is the freshest reading
     /// each desk has published). Admission-bounded to [`MAX_DESKS`].
     pub desks: BTreeMap<String, AgentThought>,
+    /// Latest FLOW read per symbol from the "desk-flow" agent (L2 depth + tape
+    /// microstructure). The desk streams one symbol at a time; admission-
+    /// bounded to [`MAX_FLOW`] to cap symbol churn.
+    pub flow: BTreeMap<String, FlowRead>,
 }
 
 pub(crate) struct ContextLedger {
@@ -209,6 +218,11 @@ impl ContextLedger {
                 st.signals.push_back(s.clone());
                 while st.signals.len() > MAX_SIGNALS {
                     st.signals.pop_front();
+                }
+            }
+            EngineEvent::Flow(f) => {
+                if st.flow.contains_key(&f.symbol) || st.flow.len() < MAX_FLOW {
+                    st.flow.insert(f.symbol.clone(), f.clone());
                 }
             }
             EngineEvent::Macro(m) => st.macro_snap = Some(m.clone()),
@@ -626,6 +640,42 @@ impl ContextLedger {
                         .unwrap_or_default(),
                     snip(&t.text, 160),
                 ));
+            }
+        }
+
+        // FLOW: the latest order-flow read per active symbol from the
+        // "desk-flow" agent (L2 depth + tape microstructure). Omitted until
+        // the desk has published, costing zero tokens while it is silent.
+        if !st.flow.is_empty() {
+            out.push_str("\n=== FLOW ===\n");
+            out.push_str(
+                "(live order flow: OBI = depth imbalance [-1,1]; cumΔ = session aggressor-volume delta; Δrate = signed volume/s; flags = absorption/sweeps/exhaustion/squeeze BEHAVIOR — squeeze is tape behavior, NOT short interest)\n",
+            );
+            for f in st.flow.values() {
+                let mut line = format!(
+                    "- {} {} | OBI {:+.2} cumΔ {:+.1} Δrate {:+.2}/s",
+                    snip(&f.symbol, 12),
+                    snip(&f.pressure, 10),
+                    fin(f.imbalance),
+                    fin(f.cum_delta),
+                    fin(f.delta_rate),
+                );
+                if !f.flags.is_empty() {
+                    let flags = f
+                        .flags
+                        .iter()
+                        .take(RENDER_FLOW_FLAGS)
+                        .map(|s| snip(s, 24))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    line.push_str(&format!(" | flags: {flags}"));
+                }
+                line.push_str(&format!(
+                    " | {} ({})\n",
+                    snip(&f.source, 40),
+                    if f.is_live { "live" } else { "delayed" },
+                ));
+                out.push_str(&line);
             }
         }
 
@@ -1332,6 +1382,101 @@ mod tests {
         ledger.apply(&desk_thought("desk-x00", None, "fresh reading"));
         let st = ledger.snapshot();
         assert_eq!(st.desks["desk-x00"].text, "fresh reading");
+    }
+
+    fn flow_event(
+        symbol: &str,
+        pressure: &str,
+        imbalance: f64,
+        cum_delta: f64,
+        flags: Vec<&str>,
+        is_live: bool,
+        source: &str,
+    ) -> EngineEvent {
+        EngineEvent::Flow(FlowRead {
+            symbol: symbol.into(),
+            imbalance,
+            cum_delta,
+            delta_rate: 0.0,
+            pressure: pressure.into(),
+            flags: flags.into_iter().map(String::from).collect(),
+            note: "note".into(),
+            is_live,
+            source: source.into(),
+            ts_ms: 1_000_000,
+        })
+    }
+
+    #[test]
+    fn flow_section_renders_latest_read_and_omits_when_absent() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        // No read yet: no section, zero tokens.
+        assert!(!ledger.render(&[]).contains("=== FLOW ==="));
+
+        ledger.apply(&flow_event(
+            "BTC-USD",
+            "buyers",
+            0.42,
+            125.0,
+            vec!["sweep:buy"],
+            true,
+            "coinbase l2",
+        ));
+        // The newest read per symbol wins (one line per symbol).
+        ledger.apply(&flow_event(
+            "BTC-USD",
+            "sellers",
+            -0.30,
+            -80.0,
+            vec!["absorption:bid", "delta_divergence"],
+            true,
+            "coinbase l2",
+        ));
+        let out = ledger.render(&["BTC-USD".to_string()]);
+        assert!(out.contains("=== FLOW ==="), "{out}");
+        assert!(out.contains("- BTC-USD sellers | OBI -0.30 cumΔ -80.0 Δrate +0.00/s"), "{out}");
+        assert!(out.contains("flags: absorption:bid, delta_divergence"), "{out}");
+        assert!(out.contains("coinbase l2 (live)"), "{out}");
+        // The superseded buyers read is gone.
+        assert!(!out.contains("sweep:buy"), "stale flow read kept: {out}");
+    }
+
+    #[test]
+    fn flow_section_labels_delayed_feeds_honestly() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        ledger.apply(&flow_event(
+            "AAPL",
+            "balanced",
+            0.0,
+            0.0,
+            vec![],
+            false,
+            "cboe delayed L1 (no depth)",
+        ));
+        let out = ledger.render(&[]);
+        assert!(out.contains("=== FLOW ==="), "{out}");
+        assert!(out.contains("cboe delayed L1 (no depth) (delayed)"), "{out}");
+    }
+
+    #[test]
+    fn flow_map_is_bounded() {
+        let store = Arc::new(BarStore::new());
+        let ledger = ContextLedger::new(store);
+        for i in 0..(MAX_FLOW + 5) {
+            ledger.apply(&flow_event(
+                &format!("S{i:02}-USD"),
+                "buyers",
+                0.1,
+                1.0,
+                vec![],
+                true,
+                "coinbase l2",
+            ));
+        }
+        let st = ledger.snapshot();
+        assert!(st.flow.len() <= MAX_FLOW, "{}", st.flow.len());
     }
 
     #[test]

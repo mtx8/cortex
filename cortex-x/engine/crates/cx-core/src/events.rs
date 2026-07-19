@@ -108,6 +108,52 @@ pub struct TapePrint {
     pub is_live: bool,
 }
 
+/// A FLOW desk read — a live order-flow / microstructure summary for one
+/// symbol, recomputed by the "desk-flow" agent from Level-2 depth
+/// ([`BookDepth`]) + a rolling window of the Time&Sales tape ([`TapePrint`])
+/// plus recent bars, and republished on the bus (throttled ~2/s). Advisory
+/// COLOR, never certainty: it says who is aggressing right now, whether
+/// resting size is absorbing them, and whether the tape shows squeeze-like
+/// BEHAVIOR — it is not a prediction and carries NO short-interest data.
+///
+/// Honesty rides on the wire: `is_live`/`source` are passed straight through
+/// from the depth feed, so a delayed/equity read is never presented as a live
+/// book. Every stored number is NaN-safe on ingest.
+///
+/// WIRE COMPAT: additive, serde snake_case, non-critical/droppable. The macOS
+/// app mirrors it field-for-field, every field optional/defaulted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FlowRead {
+    pub symbol: String,
+    /// Depth-weighted order-book imbalance in [-1, 1]: >0 bid-heavy (more
+    /// resting buy size in the top levels), <0 ask-heavy. 0.0 on an empty book.
+    pub imbalance: f64,
+    /// Session cumulative volume delta: the running sum of aggressor-signed
+    /// tape size (buy +, sell -), reset on the UTC-day roll and on a symbol
+    /// switch. Unknown-aggressor prints contribute 0 (honest, not guessed).
+    pub cum_delta: f64,
+    /// Recent signed-volume velocity (delta per second over a short window);
+    /// its sign is who is pressing right now.
+    pub delta_rate: f64,
+    /// Coarse current pressure: "buyers" | "sellers" | "balanced".
+    pub pressure: String,
+    /// Active microstructure flags, e.g. "absorption:ask", "sweep:buy",
+    /// "delta_divergence", "exhaustion", "squeeze_dynamics". Bounded; stable
+    /// order. "squeeze_dynamics" means squeeze BEHAVIOR in the tape (thinning
+    /// offers + accelerating up-delta + rising price), NOT a short-interest
+    /// call — that data is not present here.
+    pub flags: Vec<String>,
+    /// One-line human summary of the current read.
+    pub note: String,
+    /// True ONLY when the backing depth feed is a real, live venue book;
+    /// delayed/derived depth is false — the same contract as [`BookDepth`].
+    pub is_live: bool,
+    /// Honest provenance passed through from the depth feed, e.g.
+    /// "coinbase l2" or "cboe delayed L1 (no depth)".
+    pub source: String,
+    pub ts_ms: i64,
+}
+
 /// Who asked for an order. Auditability starts here: every fill traces back
 /// to a source and a written rationale.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -884,6 +930,9 @@ pub enum EngineEvent {
     Depth(BookDepth),
     /// One Time & Sales print. Non-critical / droppable.
     Tape(TapePrint),
+    /// A FLOW desk order-flow read for the active symbol (from L2 depth + the
+    /// tape). Non-critical / droppable; published throttled (~2/s).
+    Flow(FlowRead),
     OrderIntent(OrderIntent),
     OrderUpdate(OrderUpdate),
     Fill(Fill),
@@ -929,6 +978,7 @@ impl EngineEvent {
             EngineEvent::BookTop(_) => "book_top",
             EngineEvent::Depth(_) => "depth",
             EngineEvent::Tape(_) => "tape",
+            EngineEvent::Flow(_) => "flow",
             EngineEvent::OrderIntent(_) => "order_intent",
             EngineEvent::OrderUpdate(_) => "order_update",
             EngineEvent::Fill(_) => "fill",
@@ -1273,6 +1323,52 @@ mod tests {
         });
         let json = serde_json::to_string(&delayed).unwrap();
         assert!(json.contains("\"aggressor\":null"));
+        assert!(json.contains("\"is_live\":false"));
+        assert_eq!(serde_json::from_str::<EngineEvent>(&json).unwrap(), delayed);
+    }
+
+    #[test]
+    fn flow_event_is_type_tagged_and_not_critical() {
+        // The producer frame the macOS FLOW panel consumes: a live read off a
+        // Coinbase L2 book, honestly labelled, snake_case field-for-field.
+        let ev = EngineEvent::Flow(FlowRead {
+            symbol: "BTC-USD".into(),
+            imbalance: -0.42,
+            cum_delta: -12.5,
+            delta_rate: -3.2,
+            pressure: "sellers".into(),
+            flags: vec!["absorption:bid".into(), "delta_divergence".into()],
+            note: "sellers pressing; bid absorbing".into(),
+            is_live: true,
+            source: "coinbase l2".into(),
+            ts_ms: 11,
+        });
+        assert_eq!(ev.kind(), "flow");
+        assert!(!ev.is_critical(), "flow reads must never starve ticks");
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"flow\""));
+        assert!(json.contains("\"pressure\":\"sellers\""));
+        assert!(json.contains("\"is_live\":true"));
+        // snake_case field names the Swift mirror decodes 1:1.
+        assert!(json.contains("\"cum_delta\":-12.5"));
+        assert!(json.contains("\"delta_rate\":-3.2"));
+        let back: EngineEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+
+        // A delayed/derived read is honestly is_live=false and round-trips.
+        let delayed = EngineEvent::Flow(FlowRead {
+            symbol: "AAPL".into(),
+            imbalance: 0.0,
+            cum_delta: 0.0,
+            delta_rate: 0.0,
+            pressure: "balanced".into(),
+            flags: vec![],
+            note: "delayed L1: no live book".into(),
+            is_live: false,
+            source: "cboe delayed L1 (no depth)".into(),
+            ts_ms: 12,
+        });
+        let json = serde_json::to_string(&delayed).unwrap();
         assert!(json.contains("\"is_live\":false"));
         assert_eq!(serde_json::from_str::<EngineEvent>(&json).unwrap(), delayed);
     }

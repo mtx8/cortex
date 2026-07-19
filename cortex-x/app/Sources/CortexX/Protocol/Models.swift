@@ -245,6 +245,69 @@ extension TapePrint {
     }
 }
 
+/// The AI order-flow read for one symbol: a depth-weighted order-book
+/// `imbalance` (-1…1, buyers positive), session `cum_delta` (cumulative
+/// aggressor volume, signed), `delta_rate` (recent up/down-delta velocity),
+/// a plain `pressure` verdict ("buyers"/"sellers"/"balanced"), active
+/// order-flow `flags` (e.g. "absorption:ask", "sweep:buy", "delta_divergence",
+/// "squeeze_dynamics", "exhaustion"), a desk `note`, an honest real/delayed
+/// flag, and the feed `source`. Mirror of the engine `FlowRead` contract type
+/// (serde snake_case). NON-critical / droppable — decodes defensively so a
+/// lean payload still renders, and — the honesty rule — an absent `is_live`
+/// can only ever be SAFER (delayed), never claim live.
+struct FlowRead: Codable, Equatable {
+    var symbol: String
+    /// Depth-weighted order-book imbalance in -1…1 (buyers positive, sellers
+    /// negative). Non-finite is treated as 0 by the metrics helpers.
+    var imbalance: Double
+    /// Session cumulative aggressor volume, signed (buys − sells).
+    var cum_delta: Double
+    /// Recent up/down-delta velocity (the rate the delta is moving).
+    var delta_rate: Double
+    /// The plain-English verdict: "buyers", "sellers", or "balanced". Absent /
+    /// unknown decodes to "balanced" — the neutral, non-committal default.
+    var pressure: String
+    /// Active order-flow flags (venue/engine codes; the UI maps each to a
+    /// plain-English label + meaning).
+    var flags: [String]
+    /// The desk's latest narrative for this read; may be "".
+    var note: String
+    /// True ONLY for genuine real-time order flow. `false` = a delayed /
+    /// synthetic stand-in — the panel must never style it as live.
+    var is_live: Bool
+    /// The feed source label ("IBKR", "synthetic", …); may be "".
+    var source: String
+    var ts_ms: Int64
+}
+
+extension FlowRead {
+    enum CodingKeys: String, CodingKey {
+        case symbol, imbalance, cum_delta, delta_rate, pressure
+        case flags, note, is_live, source, ts_ms
+    }
+
+    // Defensive decode so a leaner engine payload still renders rather than
+    // failing the (droppable) frame. Cardinal honesty rule: an absent
+    // `is_live` defaults to `false` — a missing flag can only ever be SAFER
+    // (delayed), never claim live. An absent `pressure` defaults to the
+    // neutral "balanced". Numeric fields default to 0; the metrics helpers are
+    // NaN-safe so a garbage value never renders as truth. Memberwise init
+    // preserved via the extension; `encode(to:)` stays synthesized.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        symbol = try c.decodeIfPresent(String.self, forKey: .symbol) ?? ""
+        imbalance = try c.decodeIfPresent(Double.self, forKey: .imbalance) ?? 0
+        cum_delta = try c.decodeIfPresent(Double.self, forKey: .cum_delta) ?? 0
+        delta_rate = try c.decodeIfPresent(Double.self, forKey: .delta_rate) ?? 0
+        pressure = try c.decodeIfPresent(String.self, forKey: .pressure) ?? "balanced"
+        flags = try c.decodeIfPresent([String].self, forKey: .flags) ?? []
+        note = try c.decodeIfPresent(String.self, forKey: .note) ?? ""
+        is_live = try c.decodeIfPresent(Bool.self, forKey: .is_live) ?? false
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
+        ts_ms = try c.decodeIfPresent(Int64.self, forKey: .ts_ms) ?? 0
+    }
+}
+
 /// serde: #[serde(tag = "kind", content = "name")]
 enum OrderSource: Codable, Equatable {
     case strategy(String)
@@ -1039,6 +1102,11 @@ struct EngineSnapshot: Codable {
     /// symbol). Older engines omit it entirely, so it decodes nil rather than
     /// failing the snapshot; the montage then waits for the first live frame.
     var depth: [String: BookDepth]? = nil
+    /// NEW OPTIONAL wire field — the latest FlowRead per subscribed symbol
+    /// (bounded like `depth`: the engine only reads flow for the actively-
+    /// viewed symbol). Older engines omit it entirely, so it decodes nil rather
+    /// than failing the snapshot; the panel then waits for the first read.
+    var flow: [String: FlowRead]? = nil
 }
 
 // MARK: - Inbound frame (server -> client), tag field "type"
@@ -1051,6 +1119,7 @@ enum ServerFrame {
     case bookTop(BookTop)
     case depth(BookDepth)
     case tape(TapePrint)
+    case flow(FlowRead)
     case orderIntent(OrderIntent)
     case orderUpdate(OrderUpdate)
     case fill(Fill)
@@ -1094,6 +1163,7 @@ enum ServerFrame {
         case "book_top": return .bookTop(try dec.decode(BookTop.self, from: data))
         case "depth": return .depth(try dec.decode(BookDepth.self, from: data))
         case "tape": return .tape(try dec.decode(TapePrint.self, from: data))
+        case "flow": return .flow(try dec.decode(FlowRead.self, from: data))
         case "order_intent": return .orderIntent(try dec.decode(OrderIntent.self, from: data))
         case "order_update": return .orderUpdate(try dec.decode(OrderUpdate.self, from: data))
         case "fill": return .fill(try dec.decode(Fill.self, from: data))

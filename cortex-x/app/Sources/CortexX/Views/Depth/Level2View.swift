@@ -56,6 +56,13 @@ struct Level2View: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 Rectangle().fill(Theme.line).frame(width: Theme.hairline)
                 tapePane
+                Rectangle().fill(Theme.line).frame(width: Theme.hairline)
+                // The AI order-flow read, beside the montage. Rides the same
+                // depth subscription as the ladder + tape (the model gates its
+                // FlowRead on the streamed symbol), so it needs no extra wiring.
+                FlowPanel()
+                    .frame(width: 300)
+                    .frame(maxHeight: .infinity)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }

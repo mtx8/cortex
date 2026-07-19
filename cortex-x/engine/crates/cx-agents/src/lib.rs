@@ -14,6 +14,12 @@
 //!   one bus task in [`desks`]): 24/7 crypto dynamics, session gaps +
 //!   scanner ranks + breadth divergence, and option-chain IV/skew —
 //!   throttled thoughts, tighten-only cautions, advisory signals only.
+//! - FLOW desk ("desk-flow", one bus task in [`flow`]): order-flow
+//!   microstructure for the actively-subscribed depth symbol — L2 imbalance,
+//!   cumulative volume delta, absorption, sweeps, delta divergence and
+//!   squeeze dynamics — publishing a throttled [`EngineEvent::Flow`] read plus
+//!   notable-transition thoughts and advisory-only signals. The pure math
+//!   lives in [`flow_calc`].
 //!
 //! Invariants enforced at this layer:
 //! - Bus-only inter-squadron IO: the mesh publishes [`EngineEvent`]s and
@@ -46,6 +52,8 @@ mod analyst;
 mod auditor;
 mod copilot;
 mod desks;
+mod flow;
+mod flow_calc;
 mod ledger;
 mod llm;
 mod macro_agent;
@@ -143,6 +151,9 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
     );
     auditor::spawn(Arc::clone(&bus), Arc::clone(&ledger));
     desks::spawn(Arc::clone(&bus), Arc::clone(&store), cfg.symbols.clone());
+    // FLOW desk: L2 depth + tape microstructure for the actively-viewed
+    // symbol. Bus-driven, self-anchors to whatever depth symbol is streaming.
+    flow::spawn(Arc::clone(&bus), Arc::clone(&store));
 
     // Always spawn: the client auto-detects local servers (Ollama/LM Studio)
     // at runtime, so a user who starts one later is picked up on the next
@@ -164,7 +175,7 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) -> MeshHandle {
         None,
         1.0,
         format!(
-            "agent mesh online: market_analyst, macro_sentinel, risk_officer, execution_auditor, asset desks (crypto/equity/options){}{}{}",
+            "agent mesh online: market_analyst, macro_sentinel, risk_officer, execution_auditor, asset desks (crypto/equity/options), flow desk (l2 microstructure){}{}{}",
             if strategist_on {
                 ", strategist (llm)"
             } else {

@@ -47,6 +47,11 @@ final class AppModel {
     /// first depth frame lands (or while unsubscribed) — the montage shows an
     /// honest "waiting for depth" state, never a stale book from another symbol.
     private(set) var bookDepth: BookDepth?
+    /// The AI order-flow read for the actively-subscribed symbol. nil until the
+    /// first flow frame lands (or while unsubscribed) — the FLOW panel shows an
+    /// honest "waiting on order flow" state, never a stale read from another
+    /// symbol. Rides the same subscription + lifecycle as `bookDepth`.
+    private(set) var flowRead: FlowRead?
     /// Time & sales prints for the subscribed symbol, NEWEST-FIRST, ring-capped.
     private(set) var tape: [TapePrint] = []
     /// Tape ring cap — bounded so a fast tape never grows without limit.
@@ -185,6 +190,7 @@ final class AppModel {
             // and subscribed symbol so a stale ladder never lingers and the
             // montage re-subscribes cleanly once the link is back.
             bookDepth = nil
+            flowRead = nil
             tape = []
             depthSymbol = nil
         }
@@ -227,6 +233,7 @@ final class AppModel {
         if let prev = depthSymbol { send(.unsubscribeDepth(symbol: prev)) }
         depthSymbol = symbol
         bookDepth = nil
+        flowRead = nil
         tape = []
         send(.subscribeDepth(symbol: symbol))
     }
@@ -239,6 +246,7 @@ final class AppModel {
         send(.unsubscribeDepth(symbol: prev))
         depthSymbol = nil
         bookDepth = nil
+        flowRead = nil
         tape = []
     }
 
@@ -567,6 +575,10 @@ final class AppModel {
             guard p.symbol == depthSymbol else { break }
             tape.insert(p, at: 0)
             if tape.count > Self.tapeCap { tape.removeLast(tape.count - Self.tapeCap) }
+        case .flow(let f):
+            // Same subscription guard as depth — a late read from a just-
+            // unsubscribed symbol must never overwrite the current panel.
+            if f.symbol == depthSymbol { flowRead = f }
         case .orderIntent:
             break // intents surface via order updates
         case .orderUpdate(let u):
@@ -720,6 +732,8 @@ final class AppModel {
         // A snapshot may carry the latest book per subscribed symbol — adopt it
         // only for the symbol we are actually streaming (never another's book).
         if let sym = depthSymbol, let d = snap.depth?[sym] { bookDepth = d }
+        // Likewise the latest flow read — only for the streamed symbol.
+        if let sym = depthSymbol, let f = snap.flow?[sym] { flowRead = f }
         if let r = snap.regimes { regimeBoard = r }
         if let g = snap.geo { geoPulse = g }
         if let s = snap.scan { applyScanBoard(s) }
