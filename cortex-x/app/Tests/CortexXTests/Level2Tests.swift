@@ -143,6 +143,108 @@ final class Level2Tests: XCTestCase {
         XCTAssertNil(DepthLadder.spread(bestBid: 103, bestAsk: 100))
     }
 
+    // MARK: Centered-ladder visible slices (ask-above / bid-below ordering)
+
+    func testVisibleAskRowsHighestToBestNearestSpread() {
+        // Asks arrive best-first (lowest price first). The visible slice is the
+        // `count` nearest the inside market, ordered top→bottom: HIGHEST shown
+        // ask first, BEST ask last (directly above the spread row).
+        let asks = DepthLadder.sortedAsks([level(190.25, 1), level(190.15, 2), level(190.20, 3)])
+        let rows = DepthLadder.visibleAskRows(asks, count: 2)
+        XCTAssertEqual(rows.map(\.px), [190.20, 190.15])
+        XCTAssertEqual(rows.last?.px, 190.15, "best ask sits last, nearest the spread")
+        XCTAssertEqual(rows.first?.px, 190.20, "higher ask sits at the top")
+    }
+
+    func testVisibleBidRowsBestToLowest() {
+        // Bids best-first (highest first): top→bottom is BEST bid first (nearest
+        // the spread), lower bids beneath.
+        let bids = DepthLadder.sortedBids([level(190.00, 1), level(190.10, 2), level(190.05, 3)])
+        let rows = DepthLadder.visibleBidRows(bids, count: 2)
+        XCTAssertEqual(rows.map(\.px), [190.10, 190.05])
+        XCTAssertEqual(rows.first?.px, 190.10, "best bid sits first, nearest the spread")
+    }
+
+    func testVisibleRowsClampCountAndFloorAtZero() {
+        let asks = [level(1, 1), level(2, 1), level(3, 1)]
+        // An over-long count returns all available (no crash / over-read).
+        XCTAssertEqual(DepthLadder.visibleAskRows(asks, count: 99).count, 3)
+        XCTAssertEqual(DepthLadder.visibleBidRows(asks, count: 99).count, 3)
+        // Non-positive counts show nothing.
+        XCTAssertTrue(DepthLadder.visibleAskRows(asks, count: 0).isEmpty)
+        XCTAssertTrue(DepthLadder.visibleBidRows(asks, count: -4).isEmpty)
+    }
+
+    // MARK: Centered-ladder fill math (inside market centered; fewer / overflow)
+
+    func testLadderFillCentersInsideMarketWithDeepBook() {
+        // A deep book on both sides: rows pack to the per-side capacity and the
+        // spread row lands dead-center (equal height above and below it).
+        let l = LadderLayout.fit(
+            height: 440, rowHeight: 22, spreadHeight: 26, askCount: 20, bidCount: 20
+        )
+        let sideHeight = (440.0 - 26.0) / 2  // 207
+        XCTAssertEqual(l.perSideCapacity, 9)          // floor(207/22)
+        XCTAssertEqual(l.visibleAsks, 9)
+        XCTAssertEqual(l.visibleBids, 9)
+        XCTAssertEqual(l.topPad, 9, accuracy: 1e-9)   // 207 - 9*22
+        XCTAssertEqual(l.bottomPad, 9, accuracy: 1e-9)
+        // The inside market is centered: height above the spread == below it.
+        XCTAssertEqual(l.topPad + Double(l.visibleAsks) * 22, sideHeight, accuracy: 1e-9)
+        XCTAssertEqual(l.bottomPad + Double(l.visibleBids) * 22, sideHeight, accuracy: 1e-9)
+    }
+
+    func testLadderFillFewerLevelsStayCenteredNoVoid() {
+        // Far fewer levels than fit: the spread row stays centered, the levels
+        // hug it, and the leftover height pads the OUTER edges (never a void
+        // above with the rows bottom-anchored).
+        let l = LadderLayout.fit(
+            height: 440, rowHeight: 22, spreadHeight: 26, askCount: 2, bidCount: 1
+        )
+        let sideHeight = (440.0 - 26.0) / 2  // 207
+        XCTAssertEqual(l.visibleAsks, 2)
+        XCTAssertEqual(l.visibleBids, 1)
+        XCTAssertEqual(l.topPad, 207 - 44, accuracy: 1e-9)
+        XCTAssertEqual(l.bottomPad, 207 - 22, accuracy: 1e-9)
+        // Still centered despite the asymmetric, shallow book.
+        XCTAssertEqual(l.topPad + Double(l.visibleAsks) * 22, sideHeight, accuracy: 1e-9)
+        XCTAssertEqual(l.bottomPad + Double(l.visibleBids) * 22, sideHeight, accuracy: 1e-9)
+    }
+
+    func testLadderFillOverflowClampsToCapacityBestFirst() {
+        // A short pane with a deep book: each side clamps to the per-side
+        // capacity (the nearest-the-spread levels win), spread still centered.
+        let l = LadderLayout.fit(
+            height: 200, rowHeight: 22, spreadHeight: 26, askCount: 10, bidCount: 10
+        )
+        let sideHeight = (200.0 - 26.0) / 2  // 87
+        XCTAssertEqual(l.perSideCapacity, 3)          // floor(87/22)
+        XCTAssertEqual(l.visibleAsks, 3)
+        XCTAssertEqual(l.visibleBids, 3)
+        XCTAssertEqual(l.topPad + Double(l.visibleAsks) * 22, sideHeight, accuracy: 1e-9)
+    }
+
+    func testLadderFillDegenerateAndNaNSafe() {
+        // A pane too short for even one level: only the (centered) spread row.
+        let tiny = LadderLayout.fit(
+            height: 20, rowHeight: 22, spreadHeight: 26, askCount: 5, bidCount: 5
+        )
+        XCTAssertEqual(tiny, LadderLayout(
+            visibleAsks: 0, visibleBids: 0, topPad: 0, bottomPad: 0, perSideCapacity: 0
+        ))
+        // Non-finite / non-positive geometry and negative counts yield an empty
+        // layout (renders nothing rather than a bogus fill).
+        let empty = LadderLayout(
+            visibleAsks: 0, visibleBids: 0, topPad: 0, bottomPad: 0, perSideCapacity: 0
+        )
+        XCTAssertEqual(LadderLayout.fit(height: .nan, rowHeight: 22, spreadHeight: 26, askCount: 5, bidCount: 5), empty)
+        XCTAssertEqual(LadderLayout.fit(height: 440, rowHeight: 0, spreadHeight: 26, askCount: 5, bidCount: 5), empty)
+        XCTAssertEqual(LadderLayout.fit(height: -10, rowHeight: 22, spreadHeight: 26, askCount: 5, bidCount: 5), empty)
+        let negCounts = LadderLayout.fit(height: 440, rowHeight: 22, spreadHeight: 26, askCount: -3, bidCount: -1)
+        XCTAssertEqual(negCounts.visibleAsks, 0)
+        XCTAssertEqual(negCounts.visibleBids, 0)
+    }
+
     // MARK: Aggressor tone
 
     func testAggressorToneMapping() {

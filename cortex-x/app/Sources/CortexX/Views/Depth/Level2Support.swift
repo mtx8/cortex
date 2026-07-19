@@ -64,6 +64,82 @@ enum DepthLadder {
             b.isFinite, a.isFinite, b > 0, a > 0, a >= b else { return nil }
         return a - b
     }
+
+    // MARK: Centered-ladder visible slices (best-first, nearest the spread)
+
+    /// The visible ASK rows in TOP→BOTTOM display order for the centered ladder:
+    /// the `count` asks nearest the inside market (best-first) reversed, so the
+    /// HIGHEST shown ask sits at the top and the BEST ask sits last — directly
+    /// above the spread row. `count <= 0` yields none; an over-long count clamps.
+    static func visibleAskRows(_ asksBestFirst: [BookLevel], count: Int) -> [BookLevel] {
+        Array(asksBestFirst.prefix(max(0, count))).reversed()
+    }
+
+    /// The visible BID rows in TOP→BOTTOM display order: the BEST bid first
+    /// (directly below the spread row), lower bids beneath it — the `count` bids
+    /// nearest the inside market (best-first), unreversed.
+    static func visibleBidRows(_ bidsBestFirst: [BookLevel], count: Int) -> [BookLevel] {
+        Array(bidsBestFirst.prefix(max(0, count)))
+    }
+}
+
+// MARK: - Centered depth-ladder layout (fill + center the inside market)
+
+/// How a centered price-ladder (DOM) packs into a fixed-height pane: asks stack
+/// ABOVE a thin inside-market spread row, bids BELOW it, and the spread row sits
+/// dead-center so the ladder fills top-to-bottom with the inside market in the
+/// middle — never bottom-anchored, never a void above the rows. Pure + NaN-safe
+/// so the fill/centre math is unit-tested independent of SwiftUI.
+///
+/// The pane is split into two equal side-heights around the centered spread row.
+/// Each side shows the levels nearest the inside market that fit; leftover height
+/// becomes padding at the OUTER edges (the thin top/bottom of the book), which
+/// keeps the spread row centered whether the book is deep, shallow, or one-sided.
+struct LadderLayout: Equatable {
+    /// Ask rows shown above the spread (nearest the inside market first).
+    var visibleAsks: Int
+    /// Bid rows shown below the spread.
+    var visibleBids: Int
+    /// Empty height above the top-most (highest) shown ask — the top of book.
+    var topPad: Double
+    /// Empty height below the bottom-most (lowest) shown bid — the bottom of book.
+    var bottomPad: Double
+    /// Rows that fit on ONE side of the centered spread row (per-side capacity).
+    var perSideCapacity: Int
+
+    /// Fit the ladder into `height`, centring the spread row of `spreadHeight`.
+    /// Non-finite / non-positive geometry yields an empty layout (renders nothing
+    /// rather than a bogus fill); negative counts are treated as zero.
+    static func fit(
+        height: Double, rowHeight: Double, spreadHeight: Double,
+        askCount: Int, bidCount: Int
+    ) -> LadderLayout {
+        guard height.isFinite, height > 0,
+            rowHeight.isFinite, rowHeight > 0,
+            spreadHeight.isFinite, spreadHeight >= 0
+        else {
+            return LadderLayout(
+                visibleAsks: 0, visibleBids: 0,
+                topPad: 0, bottomPad: 0, perSideCapacity: 0
+            )
+        }
+        let asks = max(0, askCount)
+        let bids = max(0, bidCount)
+        // Height available on ONE side of the centered spread row.
+        let sideHeight = max(0, (height - spreadHeight) / 2)
+        let capacity = max(0, Int((sideHeight / rowHeight).rounded(.down)))
+        let vAsks = min(asks, capacity)
+        let vBids = min(bids, capacity)
+        // Pad so the spread row is centered: each level block hugs the spread,
+        // the remainder pushes to the outer edge. topPad + vAsks*row == sideHeight
+        // == bottomPad + vBids*row, so the inside market lands at height/2.
+        let topPad = max(0, sideHeight - Double(vAsks) * rowHeight)
+        let bottomPad = max(0, sideHeight - Double(vBids) * rowHeight)
+        return LadderLayout(
+            visibleAsks: vAsks, visibleBids: vBids,
+            topPad: topPad, bottomPad: bottomPad, perSideCapacity: capacity
+        )
+    }
 }
 
 // MARK: - Tape aggressor tone
