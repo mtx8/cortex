@@ -98,16 +98,19 @@ struct DomLadder: View {
         .background(Theme.ink)
     }
 
-    /// The centered ladder. A GeometryReader hands the pure fill math the pane
-    /// height; it returns how many levels fit each side and the outer padding
-    /// that keeps the spread row dead-center — so the book fills top-to-bottom
-    /// with the inside market in the middle (never bottom-anchored, no void).
+    /// The centered ladder, drawn as a SINGLE Canvas (near-zero layout cost —
+    /// the ~40 nested SwiftUI stack rows this replaced saturated the layout
+    /// engine at the ~12 Hz flush). A GeometryReader hands the pure fill math
+    /// the pane height; it returns how many levels fit each side and the outer
+    /// padding that keeps the spread band dead-center. `LadderGeometry.rows`
+    /// turns that into the exact top→bottom row rectangles the Canvas paints,
+    /// and the SAME rows drive the click hit-test, so the pixels and the
+    /// click-to-price target can never drift.
     @ViewBuilder
     private var ladderBody: some View {
         // Sort both sides + resolve the shared histogram scale ONCE per render.
         // `ladder` is a computed property, so every access re-sorts the whole
-        // book — reading it per row (for the shared maxSize) meant ~20+ full
-        // sorts every ~12 Hz flush. Bind it here and thread `maxSize` down.
+        // book — bind it here and thread the scale down.
         let data = ladder
         if depth == nil {
             DeckEmpty(text: "waiting for depth…")
@@ -124,187 +127,184 @@ struct DomLadder: View {
                 )
                 let asks = DepthLadder.visibleAskRows(data.asks, count: layout.visibleAsks)
                 let bids = DepthLadder.visibleBidRows(data.bids, count: layout.visibleBids)
-                VStack(spacing: 0) {
-                    Color.clear.frame(height: CGFloat(layout.topPad))
-                    // Asks top→bottom: highest shown ask down to the best ask,
-                    // which lands directly above the spread row.
-                    ForEach(asks.indices, id: \.self) { i in
-                        depthRow(asks[i], side: .sell, isBest: i == asks.count - 1, maxSize: data.maxSize)
-                    }
-                    spreadRow(data)
-                    // Bids top→bottom: best bid directly below the spread, lower
-                    // bids beneath it.
-                    ForEach(bids.indices, id: \.self) { i in
-                        depthRow(bids[i], side: .buy, isBest: i == 0, maxSize: data.maxSize)
-                    }
-                    Color.clear.frame(height: CGFloat(layout.bottomPad))
+                let rows = LadderGeometry.rows(
+                    layout: layout, asks: asks, bids: bids,
+                    rowHeight: Double(Self.rowHeight),
+                    spreadHeight: Double(Self.spreadHeight)
+                )
+                Canvas(opaque: true, rendersAsynchronously: false) { ctx, size in
+                    LadderCanvas(
+                        rows: rows, maxSize: data.maxSize,
+                        mid: data.mid, spread: data.spread,
+                        priceWidth: Self.priceWidth, inset: Self.rowInset
+                    ).draw(in: ctx, size: size)
                 }
-                .frame(width: geo.size.width, height: geo.size.height, alignment: .top)
+                .contentShape(Rectangle())
+                // Click-to-price by hit-testing the click y against the same
+                // drawn rows (map y -> level -> px -> model.setTicketPrice).
+                .gesture(
+                    SpatialTapGesture().onEnded { value in
+                        if let level = LadderGeometry.level(
+                            atY: Double(value.location.y), rows: rows
+                        ) {
+                            model.setTicketPrice(level.px)
+                        }
+                    }
+                )
+                .help("click a level to set the order-ticket price")
+            }
+        }
+    }
+}
+
+// MARK: - Depth ladder Canvas (centered DOM)
+
+/// Draws the whole centered order-book ladder into ONE GraphicsContext — price
+/// column, sizes, order counts, the inside-market spread band, and the
+/// outward-fanning depth histogram — exactly like the candle chart draws candles
+/// in a Canvas (near-zero layout cost, no per-row SwiftUI stacks). Bids fan left
+/// / green, asks fan right / red (the only direction color); the best bid/ask is
+/// bold + full-tone with a faint wash. Every row rectangle comes from the shared
+/// `LadderRowLayout` list, so the drawing and the click hit-test agree exactly.
+private struct LadderCanvas {
+    let rows: [LadderRowLayout]
+    let maxSize: Double
+    let mid: Double?
+    let spread: Double?
+    let priceWidth: CGFloat
+    let inset: CGFloat
+
+    func draw(in ctx: GraphicsContext, size: CGSize) {
+        // Opaque ink base (the Canvas is declared opaque for the perf win, so
+        // every pixel must be filled).
+        ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Theme.ink))
+
+        let centerX = size.width / 2
+        let priceLeft = centerX - priceWidth / 2
+        let priceRight = centerX + priceWidth / 2
+        let leftZoneW = max(0, priceLeft - inset)
+        let rightZoneW = max(0, (size.width - inset) - priceRight)
+
+        for row in rows {
+            switch row.kind {
+            case .ask:
+                drawLevel(
+                    ctx, row, isBid: false, width: size.width, centerX: centerX,
+                    priceLeft: priceLeft, priceRight: priceRight,
+                    leftZoneW: leftZoneW, rightZoneW: rightZoneW
+                )
+            case .bid:
+                drawLevel(
+                    ctx, row, isBid: true, width: size.width, centerX: centerX,
+                    priceLeft: priceLeft, priceRight: priceRight,
+                    leftZoneW: leftZoneW, rightZoneW: rightZoneW
+                )
+            case .spread:
+                drawSpread(ctx, row, width: size.width, centerX: centerX)
             }
         }
     }
 
-    private func depthRow(_ level: BookLevel, side: Side, isBest: Bool, maxSize: Double) -> some View {
-        DepthRow(
-            level: level,
-            side: side,
-            isBest: isBest,
-            fraction: DepthLadder.barFraction(size: level.sz, maxSize: maxSize),
-            priceWidth: Self.priceWidth,
-            rowHeight: Self.rowHeight,
-            inset: Self.rowInset,
-            onClick: { model.setTicketPrice(level.px) }
-        )
+    /// One order-book level: an outward-fanning depth bar (shared scale) behind
+    /// the centered price, with the size hugging the axis and the order count
+    /// (when reported) just outside it. Bids fan left; asks fan right.
+    private func drawLevel(
+        _ ctx: GraphicsContext, _ row: LadderRowLayout, isBid: Bool,
+        width: CGFloat, centerX: CGFloat, priceLeft: CGFloat, priceRight: CGFloat,
+        leftZoneW: CGFloat, rightZoneW: CGFloat
+    ) {
+        guard let level = row.level else { return }
+        let tone = isBid ? Theme.up : Theme.down
+        let y = CGFloat(row.minY)
+        let h = CGFloat(row.height)
+        let cy = y + h / 2
+
+        // Best inside-market row: a faint full-width wash.
+        if row.isBest {
+            ctx.fill(
+                Path(CGRect(x: 0, y: y, width: width, height: h)),
+                with: .color(tone.opacity(0.06))
+            )
+        }
+
+        // Outward-fanning depth histogram.
+        let fraction = DepthLadder.barFraction(size: level.sz, maxSize: maxSize)
+        if fraction > 0 {
+            let barColor = tone.opacity(0.16)
+            if isBid {
+                let barW = leftZoneW * CGFloat(fraction)
+                ctx.fill(
+                    Path(CGRect(x: priceLeft - barW, y: y, width: barW, height: h)),
+                    with: .color(barColor)
+                )
+            } else {
+                let barW = rightZoneW * CGFloat(fraction)
+                ctx.fill(
+                    Path(CGRect(x: priceRight, y: y, width: barW, height: h)),
+                    with: .color(barColor)
+                )
+            }
+        }
+
+        // Center price (bid green / ask red — the only direction color).
+        let priceText = Text(DashFormat.price(level.px))
+            .font(.system(size: 11, weight: row.isBest ? .bold : .regular).monospacedDigit())
+            .foregroundStyle(tone.opacity(row.isBest ? 1 : 0.82))
+        ctx.draw(priceText, at: CGPoint(x: centerX, y: cy), anchor: .center)
+
+        // Size hugging the axis; order count (when reported) just outside it.
+        let sizeText = Text(DashFormat.qty(level.sz))
+            .font(.system(size: 10, weight: row.isBest ? .medium : .regular).monospacedDigit())
+            .foregroundStyle(row.isBest ? Theme.bone : Theme.dim)
+        let resolvedSize = ctx.resolve(sizeText)
+        let hasCount = level.count > 0
+        if isBid {
+            let sizeX = priceLeft - 8
+            ctx.draw(resolvedSize, at: CGPoint(x: sizeX, y: cy), anchor: .trailing)
+            if hasCount {
+                let sw = resolvedSize.measure(in: CGSize(width: 1000, height: h)).width
+                ctx.draw(countText(level.count), at: CGPoint(x: sizeX - sw - 5, y: cy), anchor: .trailing)
+            }
+        } else {
+            let sizeX = priceRight + 8
+            ctx.draw(resolvedSize, at: CGPoint(x: sizeX, y: cy), anchor: .leading)
+            if hasCount {
+                let sw = resolvedSize.measure(in: CGSize(width: 1000, height: h)).width
+                ctx.draw(countText(level.count), at: CGPoint(x: sizeX + sw + 5, y: cy), anchor: .leading)
+            }
+        }
+    }
+
+    private func countText(_ count: UInt32) -> Text {
+        Text("\(count)")
+            .font(.system(size: 8, weight: .medium, design: .monospaced))
+            .foregroundStyle(Theme.dim)
     }
 
     /// The thin inside-market band seated dead-center: mid + spread, dim and
     /// calm, framed top and bottom by a subtle ember hairline that marks the
     /// best bid/ask straddling it as the inside market.
-    private func spreadRow(_ data: LadderData) -> some View {
-        HStack(spacing: 8) {
-            Spacer(minLength: 0)
-            spreadStat("spread", data.spread.map { DashFormat.price($0) } ?? "—", Theme.dim)
-            Text("·").font(.system(size: 9, weight: .semibold)).foregroundStyle(Theme.dim)
-            spreadStat("mid", data.mid.map { DashFormat.price($0) } ?? "—", Theme.bone)
-            Spacer(minLength: 0)
-        }
-        .frame(height: Self.spreadHeight)
-        .frame(maxWidth: .infinity)
-        .background(Theme.panel)
-        .overlay(alignment: .top) { emberEdge }
-        .overlay(alignment: .bottom) { emberEdge }
-    }
-
-    private func spreadStat(_ label: String, _ value: String, _ color: Color) -> some View {
-        HStack(spacing: 5) {
-            Text(label.uppercased())
-                .font(.system(size: 8, weight: .semibold))
-                .tracking(1.2)
-                .foregroundStyle(Theme.dim)
-            Text(value)
-                .numeric(size: 11, weight: .medium)
-                .foregroundStyle(color)
-                .lineLimit(1)
-        }
-    }
-
-    private var emberEdge: some View {
-        Rectangle().fill(Theme.ember.opacity(0.5)).frame(height: Theme.hairline)
-    }
-}
-
-// MARK: - Depth ladder row (centered DOM)
-
-/// One order-book level in the centered ladder: a three-zone row sharing a fixed
-/// center price axis. The price sits in the middle (bids green, asks red — the
-/// only direction color); the size + order-count cluster hugs the axis on the
-/// level's own side; and a muted depth-histogram bar (shared scale across both
-/// sides) fans OUTWARD from the axis as background density — bids to the left,
-/// asks to the right. The opposite side stays empty so the axis reads straight.
-/// The best bid/ask is bold + full-tone with a faint wash. The whole row is a
-/// click target that seats its price into the order ticket.
-private struct DepthRow: View {
-    let level: BookLevel
-    /// .buy = bid (green side, bar fans left), .sell = ask (red side, bar fans right).
-    let side: Side
-    let isBest: Bool
-    let fraction: Double
-    let priceWidth: CGFloat
-    let rowHeight: CGFloat
-    let inset: CGFloat
-    let onClick: () -> Void
-    @State private var hovering = false
-
-    private var isBid: Bool { side == .buy }
-    private var tone: Color { isBid ? Theme.up : Theme.down }
-
-    var body: some View {
-        Button(action: onClick) {
-            HStack(spacing: 0) {
-                zone(isBidSide: true)      // left — bid density
-                priceText
-                    .frame(width: priceWidth)
-                zone(isBidSide: false)     // right — ask density
-            }
-            .padding(.horizontal, inset)
-            .frame(height: rowHeight)
-            .frame(maxWidth: .infinity)
-            .background(rowWash)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .onHover { hovering = $0 }
-        .animation(DeckMotion.ease(), value: hovering)
-        .help("set ticket price \(DashFormat.price(level.px))")
-    }
-
-    private var priceText: some View {
-        Text(DashFormat.price(level.px))
-            .numeric(size: 11, weight: isBest ? .bold : .regular)
-            .foregroundStyle(tone.opacity(isBest ? 1 : 0.82))
-            .lineLimit(1)
-    }
-
-    /// One side's zone. The side matching this level shows the outward-fanning
-    /// depth bar with its size/count laid over the inner edge (nearest the price
-    /// axis); the opposite side is empty space so the axis stays straight.
-    @ViewBuilder
-    private func zone(isBidSide: Bool) -> some View {
-        if isBidSide == isBid {
-            ZStack(alignment: isBidSide ? .trailing : .leading) {
-                GeometryReader { geo in
-                    Rectangle()
-                        .fill(tone.opacity(0.16))
-                        .frame(width: max(0, geo.size.width * fraction))
-                        .frame(
-                            maxWidth: .infinity, maxHeight: .infinity,
-                            alignment: isBidSide ? .trailing : .leading
-                        )
-                }
-                sizeCluster
-                    .padding(isBidSide ? .trailing : .leading, 8)
-            }
-            .frame(maxWidth: .infinity)
-        } else {
-            Color.clear.frame(maxWidth: .infinity)
-        }
-    }
-
-    /// Size nearest the price axis, order-count (when reported) just outside it.
-    private var sizeCluster: some View {
-        HStack(spacing: 5) {
-            if isBid {
-                orderCount
-                sizeText
-            } else {
-                sizeText
-                orderCount
-            }
-        }
-    }
-
-    private var sizeText: some View {
-        Text(DashFormat.qty(level.sz))
-            .numeric(size: 10, weight: isBest ? .medium : .regular)
-            .foregroundStyle(isBest ? Theme.bone : Theme.dim)
-            .lineLimit(1)
-    }
-
-    private var orderCount: some View {
-        // Only when the venue reported a count (0 = omitted).
-        Group {
-            if level.count > 0 {
-                Text("\(level.count)")
-                    .font(.system(size: 8, weight: .medium, design: .monospaced))
-                    .foregroundStyle(Theme.dim)
-                    .lineLimit(1)
-            }
-        }
-    }
-
-    private var rowWash: some View {
-        Rectangle()
-            .fill(hovering ? Theme.panelHi : (isBest ? tone.opacity(0.06) : Color.clear))
+    private func drawSpread(_ ctx: GraphicsContext, _ row: LadderRowLayout, width: CGFloat, centerX: CGFloat) {
+        let y = CGFloat(row.minY)
+        let h = CGFloat(row.height)
+        ctx.fill(Path(CGRect(x: 0, y: y, width: width, height: h)), with: .color(Theme.panel))
+        let edge = Theme.ember.opacity(0.5)
+        ctx.fill(Path(CGRect(x: 0, y: y, width: width, height: Theme.hairline)), with: .color(edge))
+        ctx.fill(
+            Path(CGRect(x: 0, y: y + h - Theme.hairline, width: width, height: Theme.hairline)),
+            with: .color(edge)
+        )
+        let spreadStr = spread.map { DashFormat.price($0) } ?? "—"
+        let midStr = mid.map { DashFormat.price($0) } ?? "—"
+        let labelFont = Font.system(size: 8, weight: .semibold)
+        let valueFont = Font.system(size: 11, weight: .medium).monospacedDigit()
+        let composed =
+            Text("SPREAD ").font(labelFont).tracking(1.2).foregroundStyle(Theme.dim)
+            + Text(spreadStr).font(valueFont).foregroundStyle(Theme.dim)
+            + Text("   ·   ").font(labelFont).foregroundStyle(Theme.dim)
+            + Text("MID ").font(labelFont).tracking(1.2).foregroundStyle(Theme.dim)
+            + Text(midStr).font(valueFont).foregroundStyle(Theme.bone)
+        ctx.draw(composed, at: CGPoint(x: centerX, y: y + h / 2), anchor: .center)
     }
 }
 
@@ -359,7 +359,11 @@ struct TimeSalesPane: View {
 
 /// One time & sales print: time · price · size, the price colored by aggressor
 /// (buy = up, sell = down, unknown = dim) with a matching direction glyph.
-/// Monospaced throughout so the tape reads as a clean column.
+/// Monospaced throughout so the tape reads as a clean column. Deliberately a
+/// SINGLE flat HStack of fixed-width columns at a FIXED height — no nested
+/// stacks, no per-row overlay/padding pyramid — so the LazyVStack lays out only
+/// the visible rows and each costs the layout engine almost nothing at the
+/// ~12 Hz flush.
 private struct TapeRow: View {
     let print: TapePrint
 
@@ -382,18 +386,18 @@ private struct TapeRow: View {
     }
 
     var body: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 5) {
-                Image(systemName: glyph)
-                    .font(.system(size: 7, weight: .bold))
-                    .foregroundStyle(color)
-                    .frame(width: 8)
-                Text(DashFormat.time(print.ts_ms))
-                    .numeric(size: 10)
-                    .foregroundStyle(Theme.dim)
-                    .lineLimit(1)
-            }
-            .frame(width: 68, alignment: .leading)
+        HStack(spacing: 6) {
+            // Glyph + time fold into the header's 68-wide time column
+            // (8 + 6 + 54 = 68) without a nested stack.
+            Image(systemName: glyph)
+                .font(.system(size: 7, weight: .bold))
+                .foregroundStyle(color)
+                .frame(width: 8, alignment: .center)
+            Text(DashFormat.time(print.ts_ms))
+                .numeric(size: 10)
+                .foregroundStyle(Theme.dim)
+                .lineLimit(1)
+                .frame(width: 54, alignment: .leading)
             Text(DashFormat.price(print.px))
                 .numeric(size: 11, weight: .medium)
                 .foregroundStyle(color)
@@ -407,7 +411,5 @@ private struct TapeRow: View {
         }
         .padding(.horizontal, 10)
         .frame(height: 18)
-        .frame(maxWidth: .infinity)
-        .deckRowRule(0.4)
     }
 }

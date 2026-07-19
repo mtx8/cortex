@@ -245,6 +245,99 @@ final class Level2Tests: XCTestCase {
         XCTAssertEqual(negCounts.visibleBids, 0)
     }
 
+    // MARK: Canvas ladder row geometry (draw + hit-test share one source)
+
+    func testLadderRowsStackAsksAboveSpreadAboveBids() {
+        // A fitted layout with 2 asks above, the centered spread band, 2 bids
+        // below. Asks arrive in DISPLAY order (highest→best), bids best→lowest.
+        let layout = LadderLayout(
+            visibleAsks: 2, visibleBids: 2, topPad: 10, bottomPad: 10, perSideCapacity: 5
+        )
+        let asks = [level(190.20, 3), level(190.15, 7)]
+        let bids = [level(190.10, 5), level(190.05, 2)]
+        let rows = LadderGeometry.rows(
+            layout: layout, asks: asks, bids: bids, rowHeight: 22, spreadHeight: 26
+        )
+        XCTAssertEqual(rows.count, 5)
+        // Asks first, top→bottom from topPad; best ask is the LAST ask (nearest
+        // the spread band).
+        XCTAssertEqual(rows[0].kind, .ask)
+        XCTAssertEqual(rows[0].minY, 10, accuracy: 1e-9)
+        XCTAssertEqual(rows[0].level?.px, 190.20)
+        XCTAssertFalse(rows[0].isBest)
+        XCTAssertEqual(rows[1].kind, .ask)
+        XCTAssertEqual(rows[1].minY, 32, accuracy: 1e-9)
+        XCTAssertEqual(rows[1].level?.px, 190.15)
+        XCTAssertTrue(rows[1].isBest, "best ask is the last ask, nearest the spread")
+        // Spread band centered between the two sides, no level.
+        XCTAssertEqual(rows[2].kind, .spread)
+        XCTAssertEqual(rows[2].minY, 54, accuracy: 1e-9)
+        XCTAssertEqual(rows[2].height, 26, accuracy: 1e-9)
+        XCTAssertNil(rows[2].level)
+        // Bids below the spread, best (first) nearest it.
+        XCTAssertEqual(rows[3].kind, .bid)
+        XCTAssertEqual(rows[3].minY, 80, accuracy: 1e-9)
+        XCTAssertEqual(rows[3].level?.px, 190.10)
+        XCTAssertTrue(rows[3].isBest, "best bid is the first bid, nearest the spread")
+        XCTAssertEqual(rows[4].kind, .bid)
+        XCTAssertEqual(rows[4].minY, 102, accuracy: 1e-9)
+        XCTAssertFalse(rows[4].isBest)
+    }
+
+    func testLadderHitTestMapsClickYToLevel() {
+        let layout = LadderLayout(
+            visibleAsks: 2, visibleBids: 2, topPad: 10, bottomPad: 10, perSideCapacity: 5
+        )
+        let asks = [level(190.20, 3), level(190.15, 7)]
+        let bids = [level(190.10, 5), level(190.05, 2)]
+        let rows = LadderGeometry.rows(
+            layout: layout, asks: asks, bids: bids, rowHeight: 22, spreadHeight: 26
+        )
+        // A click inside the top ask row [10,32) → that ask.
+        XCTAssertEqual(LadderGeometry.level(atY: 20, rows: rows)?.px, 190.20)
+        // The best ask row [32,54).
+        XCTAssertEqual(LadderGeometry.level(atY: 53, rows: rows)?.px, 190.15)
+        // The spread band [54,80) → no tradeable level.
+        XCTAssertNil(LadderGeometry.level(atY: 60, rows: rows))
+        // The best bid row [80,102) and the lower bid row [102,124).
+        XCTAssertEqual(LadderGeometry.level(atY: 90, rows: rows)?.px, 190.10)
+        XCTAssertEqual(LadderGeometry.level(atY: 110, rows: rows)?.px, 190.05)
+        // The outer top pad (above every row) and the outer bottom pad → nil.
+        XCTAssertNil(LadderGeometry.level(atY: 5, rows: rows))
+        XCTAssertNil(LadderGeometry.level(atY: 200, rows: rows))
+    }
+
+    func testLadderRowBoundariesAreHalfOpen() {
+        // ask [0,20), spread [20,30), bid [30,50) — adjacent rows never both
+        // claim a boundary pixel.
+        let layout = LadderLayout(
+            visibleAsks: 1, visibleBids: 1, topPad: 0, bottomPad: 0, perSideCapacity: 1
+        )
+        let rows = LadderGeometry.rows(
+            layout: layout, asks: [level(2, 1)], bids: [level(1, 1)],
+            rowHeight: 20, spreadHeight: 10
+        )
+        XCTAssertEqual(LadderGeometry.level(atY: 0, rows: rows)?.px, 2)   // ask top edge inclusive
+        XCTAssertNil(LadderGeometry.level(atY: 20, rows: rows))          // spread top edge → spread (nil)
+        XCTAssertEqual(LadderGeometry.level(atY: 30, rows: rows)?.px, 1) // bid top edge inclusive
+        XCTAssertNil(LadderGeometry.level(atY: 50, rows: rows))          // past the last bid
+    }
+
+    func testLadderRowsEmptySidesYieldOnlySpread() {
+        // A one-sided/empty book still lands a centered spread band and nothing
+        // else — a click anywhere maps to no level.
+        let layout = LadderLayout(
+            visibleAsks: 0, visibleBids: 0, topPad: 100, bottomPad: 100, perSideCapacity: 0
+        )
+        let rows = LadderGeometry.rows(
+            layout: layout, asks: [], bids: [], rowHeight: 22, spreadHeight: 26
+        )
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].kind, .spread)
+        XCTAssertEqual(rows[0].minY, 100, accuracy: 1e-9)
+        XCTAssertNil(LadderGeometry.level(atY: 100, rows: rows))
+    }
+
     // MARK: Aggressor tone
 
     func testAggressorToneMapping() {

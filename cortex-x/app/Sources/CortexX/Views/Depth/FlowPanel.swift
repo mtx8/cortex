@@ -436,34 +436,41 @@ private struct PressureHeadline: View {
 /// toward buyers (right) or sellers (left) of a hairline track, past a 1px
 /// center tick. Ember is the accent (attention); direction is read from which
 /// side of center it fills — never from up/down color (that stays for money).
+///
+/// Drawn in a Canvas rather than a GeometryReader + ZStack: `fraction` re-lands
+/// on every ~12 Hz flush, and a GeometryReader forces a fresh layout pass each
+/// time (the meter was a per-flush layout-thrash source). The Canvas snaps to
+/// each reading with zero layout cost and no implicit animation (a 0.25s ease
+/// would never settle between updates, repainting at display rate forever).
 private struct ImbalanceBar: View {
     /// Signed −1…1 fraction (already clamped + NaN-safe by FlowMetrics).
     let fraction: Double
 
     var body: some View {
-        GeometryReader { geo in
-            let half = geo.size.width / 2
-            let width = half * abs(fraction)
-            ZStack {
-                // Track.
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(Theme.line)
-                    .frame(height: 4)
-                // Ember fill, anchored at the center, extending to one side.
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(Theme.ember)
-                    .frame(width: max(0, width), height: 4)
-                    .offset(x: fraction >= 0 ? width / 2 : -width / 2)
-                // Center zero tick, taller than the track.
-                Rectangle()
-                    .fill(Theme.dim)
-                    .frame(width: Theme.hairline, height: 10)
+        Canvas(rendersAsynchronously: false) { ctx, size in
+            let half = size.width / 2
+            let cy = size.height / 2
+            let trackH: CGFloat = 4
+            let radius: CGFloat = 2
+            // Track.
+            ctx.fill(
+                Path(roundedRect: CGRect(x: 0, y: cy - trackH / 2, width: size.width, height: trackH), cornerRadius: radius),
+                with: .color(Theme.line)
+            )
+            // Ember fill, anchored at the center, extending to one side.
+            let fillW = half * CGFloat(abs(fraction))
+            if fillW > 0 {
+                let x = fraction >= 0 ? half : half - fillW
+                ctx.fill(
+                    Path(roundedRect: CGRect(x: x, y: cy - trackH / 2, width: fillW, height: trackH), cornerRadius: radius),
+                    with: .color(Theme.ember)
+                )
             }
-            .frame(maxHeight: .infinity)
-            // No implicit animation: `fraction` is a live order-flow value that
-            // re-lands on every ~12 Hz flush. A 0.25s ease never settles between
-            // updates, so it would repaint this bar at display rate forever. The
-            // meter snaps to each reading instead (correct for a streaming value).
+            // Center zero tick, taller than the track.
+            ctx.fill(
+                Path(CGRect(x: half - Theme.hairline / 2, y: cy - 5, width: Theme.hairline, height: 10)),
+                with: .color(Theme.dim)
+            )
         }
     }
 }

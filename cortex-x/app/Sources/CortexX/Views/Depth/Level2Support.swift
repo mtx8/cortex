@@ -142,6 +142,78 @@ struct LadderLayout: Equatable {
     }
 }
 
+// MARK: - Centered-ladder row geometry (draw + hit-test share one source)
+
+/// One drawn ladder row's vertical span plus the model level it represents, in
+/// TOP→BOTTOM display order. The Canvas ladder paints these rows and the click
+/// hit-test maps a click y back to one, so the pixels the operator sees and the
+/// price a click seats into the ticket can never drift apart. The centered
+/// spread band carries no level.
+struct LadderRowLayout: Equatable {
+    enum Kind: Equatable { case ask, bid, spread }
+    var kind: Kind
+    /// Row top, in the ladder's local (Canvas) coordinate space.
+    var minY: Double
+    var height: Double
+    /// The book level for an ask/bid row; nil for the centered spread band.
+    var level: BookLevel?
+    /// The inside-market row on its side (best ask / best bid) — drawn bold.
+    var isBest: Bool
+
+    var maxY: Double { minY + height }
+}
+
+/// Pure geometry for the Canvas ladder: turn a fitted `LadderLayout` plus the
+/// visible (display-ordered) ask/bid slices into the exact top→bottom row
+/// rectangles the Canvas paints, and hit-test a click y back to the level whose
+/// row spans it. No SwiftUI here so the row math + click mapping stay
+/// unit-tested independent of the renderer.
+enum LadderGeometry {
+    /// Build the top→bottom row layout: asks stack from `topPad` down to the
+    /// centered spread band, then bids stack below it. `asks` and `bids` are the
+    /// already-sliced VISIBLE rows in DISPLAY order (asks highest→best, bids
+    /// best→lowest), so the best ask is the LAST ask and the best bid is the
+    /// FIRST bid — each landing against the spread band, matching the fill math.
+    static func rows(
+        layout: LadderLayout, asks: [BookLevel], bids: [BookLevel],
+        rowHeight: Double, spreadHeight: Double
+    ) -> [LadderRowLayout] {
+        var out: [LadderRowLayout] = []
+        out.reserveCapacity(asks.count + bids.count + 1)
+        var y = layout.topPad
+        for (i, level) in asks.enumerated() {
+            out.append(LadderRowLayout(
+                kind: .ask, minY: y, height: rowHeight,
+                level: level, isBest: i == asks.count - 1
+            ))
+            y += rowHeight
+        }
+        out.append(LadderRowLayout(
+            kind: .spread, minY: y, height: spreadHeight, level: nil, isBest: false
+        ))
+        y += spreadHeight
+        for (i, level) in bids.enumerated() {
+            out.append(LadderRowLayout(
+                kind: .bid, minY: y, height: rowHeight,
+                level: level, isBest: i == 0
+            ))
+            y += rowHeight
+        }
+        return out
+    }
+
+    /// The order-book level whose drawn row spans `y`, or nil when the click
+    /// lands on the spread band or the outer padding (no tradeable level there).
+    /// Rows are half-open `[minY, maxY)` so two adjacent rows never both claim a
+    /// boundary pixel.
+    static func level(atY y: Double, rows: [LadderRowLayout]) -> BookLevel? {
+        for row in rows where row.kind != .spread {
+            if y >= row.minY, y < row.maxY { return row.level }
+        }
+        return nil
+    }
+}
+
 // MARK: - Tape aggressor tone
 
 /// The direction a tape print pushed the market, decoupled from SwiftUI so the
