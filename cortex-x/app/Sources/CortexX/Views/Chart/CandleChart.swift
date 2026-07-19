@@ -213,8 +213,29 @@ struct CandleChart: View {
 
     @ViewBuilder
     private func overlays(_ frame: ChartFrame) -> some View {
-        legend(frame)
-            .padding(8)
+        // The legend VALUES are snapshotted from the frame into an Equatable
+        // struct. Between bar closes the indicator cache is frozen (keyed on
+        // the last COMPLETED bar), so these strings hold steady across the
+        // 12-40 Hz intra-bar tick storm — SwiftUI then skips re-rendering the
+        // whole legend + tool strip (its ~15 chips) on every tick, and only
+        // re-lays it out on a bar close, an overlay toggle, or a crosshair
+        // move. The Canvas below stays in the frequently-updating path.
+        let i = frame.legendIndex()
+        Legend(
+            values: LegendValues(
+                ema9: frame.indicatorText(frame.ema9, at: i),
+                ema21: frame.indicatorText(frame.ema21, at: i),
+                ema50: frame.indicatorText(frame.ema50, at: i),
+                bb: frame.bollingerText(at: i),
+                rsi: frame.rsiText(at: i),
+                macd: frame.macdText(at: i)
+            ),
+            equityIntraday: equityIntraday,
+            interaction: interaction,
+            symbol: symbol,
+            drawingStore: drawingStore
+        )
+        .padding(8)
         if !interaction.isFollowing {
             liveChip(frame)
         }
@@ -222,75 +243,6 @@ struct CandleChart: View {
             let hover = interaction.hover,
             let info = frame.crosshair(at: hover) {
             crosshairChips(frame, info)
-        }
-    }
-
-    private func legend(_ frame: ChartFrame) -> some View {
-        let i = frame.legendIndex()
-        return HStack(spacing: 4) {
-            LegendChip(
-                label: "ema 9", value: frame.indicatorText(frame.ema9, at: i),
-                color: ChartColors.ema9, isOn: interaction.showEMA9
-            ) { interaction.showEMA9.toggle() }
-            LegendChip(
-                label: "ema 21", value: frame.indicatorText(frame.ema21, at: i),
-                color: ChartColors.ema21, isOn: interaction.showEMA21
-            ) { interaction.showEMA21.toggle() }
-            LegendChip(
-                label: "ema 50", value: frame.indicatorText(frame.ema50, at: i),
-                color: ChartColors.ema50, isOn: interaction.showEMA50
-            ) { interaction.showEMA50.toggle() }
-            LegendChip(
-                label: "bb 20", value: frame.bollingerText(at: i),
-                color: Theme.bone.opacity(0.55), isOn: interaction.showBollinger
-            ) { interaction.showBollinger.toggle() }
-            LegendChip(
-                label: "rsi 14", value: frame.rsiText(at: i),
-                color: ChartColors.rsi, isOn: interaction.showRSI
-            ) { interaction.showRSI.toggle() }
-            LegendChip(
-                label: "macd", value: frame.macdText(at: i),
-                color: ChartColors.macd, isOn: interaction.showMACD
-            ) { interaction.showMACD.toggle() }
-            LegendChip(
-                label: "log", value: nil,
-                color: Theme.bone.opacity(0.55), isOn: interaction.logScale
-            ) { interaction.logScale.toggle() }
-            // Pre-market / after-hours shading toggle — only meaningful on an
-            // equity's intraday chart, so it stays out of the strip otherwise.
-            if equityIntraday {
-                LegendChip(
-                    label: "ext", value: nil,
-                    color: Theme.bone.opacity(0.55), isOn: interaction.showExtendedHours
-                ) { interaction.showExtendedHours.toggle() }
-            }
-            toolStrip
-        }
-    }
-
-    private var toolStrip: some View {
-        HStack(spacing: 4) {
-            Rectangle()
-                .fill(Theme.line)
-                .frame(width: Theme.hairline, height: 14)
-                .padding(.horizontal, 2)
-            ForEach(ChartTool.allCases, id: \.self) { tool in
-                ToolChip(
-                    symbol: tool.symbolName, isOn: interaction.activeTool == tool,
-                    help: tool.help
-                ) { interaction.selectTool(tool) }
-            }
-            // Magnet snap is a mode, not a tool: it bends anchor placement
-            // toward the bar's O/H/L/C. ("dot.scope" — SF Symbols ships no
-            // magnet glyph on macOS 14.)
-            ToolChip(
-                symbol: "dot.scope", isOn: interaction.magnetMode, help: "magnet snap"
-            ) { interaction.magnetMode.toggle() }
-            ToolChip(symbol: "trash", isOn: false, help: "clear drawings") {
-                drawingStore.removeAll(for: symbol)
-                interaction.selectedDrawingID = nil
-                interaction.pendingAnchor = nil
-            }
         }
     }
 
@@ -387,6 +339,111 @@ struct CandleChart: View {
         case .live: Theme.up
         case .degraded, .synthetic_fallback: Theme.warn
         case .down: Theme.down
+        }
+    }
+}
+
+// MARK: - Legend + tool strip (chrome, isolated from market data)
+
+/// The six overlay legend values snapshotted from the frame. Equatable so
+/// SwiftUI skips re-rendering the legend when a price tick leaves them
+/// unchanged — they move only when a bar closes, an overlay toggles, or the
+/// crosshair moves, never on an intra-bar tick.
+private struct LegendValues: Equatable {
+    var ema9: String?
+    var ema21: String?
+    var ema50: String?
+    var bb: String?
+    var rsi: String?
+    var macd: String?
+}
+
+/// Overlay legend + drawing tool strip. Reads ONLY the interaction toggles
+/// and the (rarely-changing) LegendValues snapshot — never bars / lastPrice
+/// / signals — so a market-data tick that rebuilds the ChartFrame leaves this
+/// subtree untouched and its chips are not re-laid-out.
+private struct Legend: View {
+    let values: LegendValues
+    let equityIntraday: Bool
+    let interaction: ChartInteraction
+    let symbol: String
+    let drawingStore: DrawingStore
+
+    var body: some View {
+        HStack(spacing: 4) {
+            LegendChip(
+                label: "ema 9", value: values.ema9,
+                color: ChartColors.ema9, isOn: interaction.showEMA9
+            ) { interaction.showEMA9.toggle() }
+            LegendChip(
+                label: "ema 21", value: values.ema21,
+                color: ChartColors.ema21, isOn: interaction.showEMA21
+            ) { interaction.showEMA21.toggle() }
+            LegendChip(
+                label: "ema 50", value: values.ema50,
+                color: ChartColors.ema50, isOn: interaction.showEMA50
+            ) { interaction.showEMA50.toggle() }
+            LegendChip(
+                label: "bb 20", value: values.bb,
+                color: Theme.bone.opacity(0.55), isOn: interaction.showBollinger
+            ) { interaction.showBollinger.toggle() }
+            LegendChip(
+                label: "rsi 14", value: values.rsi,
+                color: ChartColors.rsi, isOn: interaction.showRSI
+            ) { interaction.showRSI.toggle() }
+            LegendChip(
+                label: "macd", value: values.macd,
+                color: ChartColors.macd, isOn: interaction.showMACD
+            ) { interaction.showMACD.toggle() }
+            LegendChip(
+                label: "log", value: nil,
+                color: Theme.bone.opacity(0.55), isOn: interaction.logScale
+            ) { interaction.logScale.toggle() }
+            // Pre-market / after-hours shading toggle — only meaningful on an
+            // equity's intraday chart, so it stays out of the strip otherwise.
+            if equityIntraday {
+                LegendChip(
+                    label: "ext", value: nil,
+                    color: Theme.bone.opacity(0.55), isOn: interaction.showExtendedHours
+                ) { interaction.showExtendedHours.toggle() }
+            }
+            ToolStrip(interaction: interaction, symbol: symbol, drawingStore: drawingStore)
+        }
+    }
+}
+
+/// Drawing tool strip: cursor / trendline / … / magnet / clear. Depends only
+/// on `interaction.activeTool` + `interaction.magnetMode`, so it never
+/// re-lays-out on a market tick (and stays put even while the legend above
+/// re-renders on hover / bar close).
+private struct ToolStrip: View {
+    let interaction: ChartInteraction
+    let symbol: String
+    let drawingStore: DrawingStore
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Rectangle()
+                .fill(Theme.line)
+                .frame(width: Theme.hairline, height: 14)
+                .padding(.horizontal, 2)
+            ForEach(ChartTool.allCases, id: \.self) { tool in
+                ToolChip(
+                    symbol: tool.symbolName, isOn: interaction.activeTool == tool,
+                    help: tool.help
+                ) { interaction.selectTool(tool) }
+            }
+            // Magnet snap is a mode, not a tool: it bends anchor placement
+            // toward the bar's O/H/L/C. ("dot.scope" — SF Symbols ships no
+            // magnet glyph on macOS 14.)
+            ToolChip(
+                symbol: "dot.scope", isOn: interaction.magnetMode, help: "magnet snap"
+            ) { interaction.magnetMode.toggle() }
+            ToolChip(symbol: "trash", isOn: false, help: "clear drawings") {
+                drawingStore.removeAll(for: symbol)
+                interaction.selectedDrawingID = nil
+                interaction.pendingAnchor = nil
+            }
         }
     }
 }

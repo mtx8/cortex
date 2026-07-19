@@ -25,9 +25,6 @@ struct ChartPanel: View {
     @State private var weeklyMode = false
     /// Active range preset; cleared when an interval is picked manually.
     @State private var selectedRange: ChartRange?
-    @State private var flashDirection = 0
-    @State private var flashToken = 0
-    @State private var flashSymbol = ""
     @State private var symbolHovering = false
 
     var body: some View {
@@ -66,17 +63,12 @@ struct ChartPanel: View {
         .onChange(of: displaySymbol) { _, _ in
             interaction.resetForNewSeries()
             selectedRange = nil
-            flashToken += 1
-            flashDirection = 0
         }
         .onChange(of: displayInterval) { _, _ in
             interaction.resetForNewSeries()
         }
         .onChange(of: weeklyMode) { _, _ in
             interaction.resetForNewSeries()
-        }
-        .onChange(of: model.lastPrice(symbol)) { old, new in
-            handleTick(old, new)
         }
         .onChange(of: bars.count) { _, _ in
             // Deeper history landing while a preset is active re-frames the
@@ -135,7 +127,6 @@ struct ChartPanel: View {
 
     private var header: some View {
         let symbol = displaySymbol
-        let price = model.lastPrice(symbol)
         let changePct = model.sessionChangePct(symbol)
         let top = model.bookTop[symbol]
 
@@ -159,11 +150,11 @@ struct ChartPanel: View {
                     .foregroundStyle(Theme.bone)
             }
 
-            Text(price.map { ChartMath.formatPrice($0, grouped: true) } ?? "—")
-                .font(.system(size: 21, weight: .semibold))
-                .monospacedDigit()
-                .foregroundStyle(priceColor)
-                .animation(.easeOut(duration: 0.2), value: flashDirection)
+            // Live price + tick flash live in their OWN subview, so a price
+            // change re-renders only this small label — never the sibling
+            // range / interval pickers, which read no market data and so
+            // stay laid out across the 12-40 Hz tick storm.
+            LivePriceText(symbol: symbol)
 
             if let changePct {
                 Text(String(format: "%+.2f%%", changePct))
@@ -176,12 +167,14 @@ struct ChartPanel: View {
 
             Spacer(minLength: 8)
 
-            rangePicker
+            RangePicker(selectedRange: $selectedRange, apply: applyRange)
 
-            intervalPicker(Binding(
-                get: { displayInterval },
-                set: { setInterval($0) }
-            ))
+            IntervalPicker(
+                selectedInterval: displayInterval,
+                weeklyMode: weeklyMode,
+                pick: pickInterval,
+                pickWeekly: pickWeekly
+            )
 
             feedDot
         }
@@ -248,32 +241,6 @@ struct ChartPanel: View {
         pane.wrappedValue = state
     }
 
-    private var priceColor: Color {
-        if flashDirection > 0 { return Theme.up }
-        if flashDirection < 0 { return Theme.down }
-        return Theme.bone
-    }
-
-    /// Flash the price toward up/down on tick direction change, then settle
-    /// back to bone. Token guards against overlapping fades; the symbol guard
-    /// suppresses the spurious flash when the selection switches instruments.
-    private func handleTick(_ old: Double?, _ new: Double?) {
-        let symbol = displaySymbol
-        guard symbol == flashSymbol else {
-            flashSymbol = symbol
-            return
-        }
-        guard let o = old, let n = new, n != o else { return }
-        flashDirection = n > o ? 1 : -1
-        flashToken += 1
-        let token = flashToken
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(450))
-            guard token == flashToken else { return }
-            flashDirection = 0
-        }
-    }
-
     private func spreadChip(_ top: BookTop) -> some View {
         HStack(spacing: 5) {
             Text(ChartMath.formatPrice(top.bid_px))
@@ -300,23 +267,6 @@ struct ChartPanel: View {
 
     /// 1y / 2y / 5y / all — sets the visible span (and a sane bar size:
     /// daily for 1-2y, weekly for 5y/all), pinned to the live edge.
-    private var rangePicker: some View {
-        HStack(spacing: 2) {
-            ForEach(ChartRange.allCases) { range in
-                intervalChip(range.label, isOn: selectedRange == range) {
-                    applyRange(range)
-                }
-            }
-        }
-        .padding(2)
-        .background(Theme.ink)
-        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.chipRadius)
-                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
-        )
-    }
-
     private func applyRange(_ range: ChartRange) {
         selectedRange = range
         setInterval(.d1)
@@ -344,50 +294,23 @@ struct ChartPanel: View {
         interaction.applyRange(barCount: max(count, 20))
     }
 
-    private func intervalPicker(_ selection: Binding<Interval>) -> some View {
-        HStack(spacing: 2) {
-            ForEach(Interval.allCases) { iv in
-                intervalChip(iv.label, isOn: !weeklyMode && selection.wrappedValue == iv) {
-                    // A manual interval pick drops any range preset's wide
-                    // window back to the default zoom (the range flow sets its
-                    // own width through applyRange, so it stays untouched).
-                    selectedRange = nil
-                    weeklyMode = false
-                    interaction.resetZoomToDefault()
-                    selection.wrappedValue = iv
-                }
-            }
-            // Weekly rides on the 1d feed; the 1d chip deselects while on.
-            intervalChip("1w", isOn: weeklyMode) {
-                selectedRange = nil
-                interaction.resetZoomToDefault()
-                selection.wrappedValue = .d1
-                weeklyMode = true
-            }
-        }
-        .padding(2)
-        .background(Theme.ink)
-        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.chipRadius)
-                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
-        )
+    /// A manual interval pick drops any range preset's wide window back to the
+    /// default zoom (the range flow sets its own width through applyRange, so
+    /// it stays untouched). Order matches the old inline picker: state first,
+    /// interval last.
+    private func pickInterval(_ iv: Interval) {
+        selectedRange = nil
+        weeklyMode = false
+        interaction.resetZoomToDefault()
+        setInterval(iv)
     }
 
-    private func intervalChip(
-        _ label: String, isOn: Bool, action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Text(label)
-                .font(.system(size: 10, weight: .semibold))
-                .monospacedDigit()
-                .foregroundStyle(isOn ? Theme.bone : Theme.dim)
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3)
-                .background(isOn ? Theme.panelHi : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 4))
-        }
-        .buttonStyle(.plain)
+    /// Weekly rides on the 1d feed; the 1d chip deselects while on.
+    private func pickWeekly() {
+        selectedRange = nil
+        interaction.resetZoomToDefault()
+        setInterval(.d1)
+        weeklyMode = true
     }
 
     // MARK: - Feed health
@@ -418,5 +341,135 @@ struct ChartPanel: View {
                 return f.detail.isEmpty ? "\(f.feed): \(health)" : "\(f.feed): \(health) — \(f.detail)"
             }
             .joined(separator: "\n")
+    }
+}
+
+// MARK: - Live price label (isolated tick target)
+
+/// The flashing last-price readout. Owns its OWN flash state and is the only
+/// header element that reads live market data, so a price tick re-renders
+/// just this label — the range / interval pickers beside it read none of it
+/// and are skipped by SwiftUI when the panel body re-evaluates on a tick.
+private struct LivePriceText: View {
+    @Environment(AppModel.self) private var model
+    let symbol: String
+
+    @State private var flashDirection = 0
+    @State private var flashToken = 0
+    @State private var flashSymbol = ""
+
+    var body: some View {
+        Text(model.lastPrice(symbol).map { ChartMath.formatPrice($0, grouped: true) } ?? "—")
+            .font(.system(size: 21, weight: .semibold))
+            .monospacedDigit()
+            .foregroundStyle(priceColor)
+            .animation(.easeOut(duration: 0.2), value: flashDirection)
+            .onChange(of: model.lastPrice(symbol)) { old, new in handleTick(old, new) }
+            .onChange(of: symbol) { _, _ in
+                // New instrument: cancel any in-flight settle and clear the tint.
+                flashToken += 1
+                flashDirection = 0
+            }
+    }
+
+    private var priceColor: Color {
+        if flashDirection > 0 { return Theme.up }
+        if flashDirection < 0 { return Theme.down }
+        return Theme.bone
+    }
+
+    /// Flash the price toward up/down on tick direction change, then settle
+    /// back to bone. Token guards against overlapping fades; the symbol guard
+    /// suppresses the spurious flash when the selection switches instruments.
+    private func handleTick(_ old: Double?, _ new: Double?) {
+        guard symbol == flashSymbol else {
+            flashSymbol = symbol
+            return
+        }
+        guard let o = old, let n = new, n != o else { return }
+        flashDirection = n > o ? 1 : -1
+        flashToken += 1
+        let token = flashToken
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard token == flashToken else { return }
+            flashDirection = 0
+        }
+    }
+}
+
+// MARK: - Header toolbars (isolated from market data)
+
+/// 1y / 2y / 5y / all range presets. Reads only `selectedRange`; the model
+/// work happens in `apply`, so a price tick never re-lays-out these chips.
+private struct RangePicker: View {
+    @Binding var selectedRange: ChartRange?
+    let apply: (ChartRange) -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(ChartRange.allCases) { range in
+                IntervalChip(label: range.label, isOn: selectedRange == range) {
+                    apply(range)
+                }
+            }
+        }
+        .padding(2)
+        .background(Theme.ink)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.chipRadius)
+                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+        )
+    }
+}
+
+/// Bar-size picker (plus the weekly aggregate chip). Reads only the selected
+/// interval + weekly flag — never bars / price — so it holds its layout
+/// across the tick storm.
+private struct IntervalPicker: View {
+    let selectedInterval: Interval
+    let weeklyMode: Bool
+    let pick: (Interval) -> Void
+    let pickWeekly: () -> Void
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(Interval.allCases) { iv in
+                IntervalChip(label: iv.label, isOn: !weeklyMode && selectedInterval == iv) {
+                    pick(iv)
+                }
+            }
+            IntervalChip(label: "1w", isOn: weeklyMode) { pickWeekly() }
+        }
+        .padding(2)
+        .background(Theme.ink)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.chipRadius)
+                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+        )
+    }
+}
+
+/// One text chip shared by the range + interval pickers. Unchanged styling
+/// from the former `intervalChip` helper.
+private struct IntervalChip: View {
+    let label: String
+    let isOn: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(isOn ? Theme.bone : Theme.dim)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 3)
+                .background(isOn ? Theme.panelHi : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+        }
+        .buttonStyle(.plain)
     }
 }
