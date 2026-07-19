@@ -120,8 +120,11 @@ struct ChartWorkspace: View {
     @AppStorage(DockPanel.tape.storageKey) private var tapeOn = DockPanel.tape.defaultOn
     @AppStorage(DockPanel.flow.storageKey) private var flowOn = DockPanel.flow.defaultOn
     @AppStorage("chartDockHidden") private var dockHidden = false
+    /// User-resizable dock width, persisted. Defaults WIDER (~340) than the old
+    /// fixed 320 so the DOM ladder isn't crushed; the divider clamps it live.
+    @AppStorage(ResizablePanel.chartDock.storageKey)
+    private var dockWidth = ResizablePanel.chartDock.defaultSize
 
-    private static let dockWidth: CGFloat = 320
     private static let ease = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.2)
 
     private var state: DockState {
@@ -137,9 +140,12 @@ struct ChartWorkspace: View {
             ChartGrid()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             if dockVisible {
-                Rectangle().fill(Theme.line).frame(width: Theme.hairline)
+                ResizeDivider(
+                    axis: .horizontal, panel: .chartDock,
+                    size: $dockWidth, direction: -1
+                )
                 TradingDock()
-                    .frame(width: Self.dockWidth)
+                    .frame(width: CGFloat(ResizablePanel.chartDock.clamp(dockWidth)))
             } else if state.anyEnabled {
                 // Enabled but collapsed: a slim re-open handle pinned to the edge
                 // (mirrors the shell ReopenHandle pattern).
@@ -158,8 +164,13 @@ struct ChartWorkspace: View {
         .onDisappear { model.unsubscribeDepth() }
         .onChange(of: depthNeeded) { _, _ in syncDepth() }
         .onChange(of: model.selectedSymbol) { _, _ in syncDepth() }
-        .onChange(of: model.connection) { _, c in
-            if c == .connected, depthNeeded { model.subscribeDepth(model.selectedSymbol) }
+        // On (re)connect, force the subscribe to actually reach the engine: the
+        // initial subscribe from .onAppear is dropped while the socket is down
+        // (send() no-ops off .connected) yet leaves depthSymbol set, so a guarded
+        // re-subscribe would no-op and the book would never populate. resyncDepth
+        // bypasses that guard when a book is needed but not yet delivering.
+        .onChange(of: model.connection == .connected) { _, connected in
+            if connected { model.resyncDepth(depthNeeded: depthNeeded) }
         }
     }
 

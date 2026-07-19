@@ -61,6 +61,13 @@ final class AppModel {
     /// the previous. Late frames from a just-unsubscribed symbol are dropped by
     /// matching against this.
     private(set) var depthSymbol: String?
+    /// Whether at least one depth frame has actually landed for the current
+    /// `depthSymbol`. False the instant a (re)subscribe goes out and until the
+    /// engine answers. The resync path reads it: a subscribe whose command was
+    /// dropped while the socket was down (send() no-ops off `.connected`) leaves
+    /// depthSymbol set but nothing delivered — the honest signal to force-resend
+    /// on connect. A book already delivering needs no resend (no engine thrash).
+    private(set) var depthDelivered = false
     /// A price the operator clicked in the depth ladder, offered to the order
     /// ticket's price-set path (the integration seam — the ticket seats it into
     /// its limit field, then clears it). nil once consumed. NaN-safe: only a
@@ -188,11 +195,13 @@ final class AppModel {
             // A dropped connection orphans the depth subscription: the engine
             // knows nothing of it after a fresh connect. Clear the book, tape,
             // and subscribed symbol so a stale ladder never lingers and the
-            // montage re-subscribes cleanly once the link is back.
+            // montage re-subscribes cleanly once the link is back. Reset the
+            // delivered flag too, so the reconnect resync re-sends the subscribe.
             bookDepth = nil
             flowRead = nil
             tape = []
             depthSymbol = nil
+            depthDelivered = false
         }
     }
 
@@ -235,6 +244,7 @@ final class AppModel {
         bookDepth = nil
         flowRead = nil
         tape = []
+        depthDelivered = false
         send(.subscribeDepth(symbol: symbol))
     }
 
@@ -248,6 +258,49 @@ final class AppModel {
         bookDepth = nil
         flowRead = nil
         tape = []
+        depthDelivered = false
+    }
+
+    /// Force the depth stream (re)established now that the link is `.connected`.
+    /// The initial `subscribeDepth` often fires from the chart workspace's
+    /// `.onAppear` BEFORE the socket connects — and `send()` drops commands off
+    /// `.connected`, so that first `subscribe_depth` is lost while `depthSymbol`
+    /// is already set. The guarded `subscribeDepth` then no-ops (symbol unchanged)
+    /// and the book never populates. This bypasses that guard: when a symbol is
+    /// already targeted but no frame has landed, it re-sends the subscribe; when
+    /// nothing is targeted (a reconnect cleared it), it starts a fresh one for the
+    /// selected symbol. A stream already delivering is left alone (no thrash).
+    /// The late-frame guard in `apply(.depth)` still protects against stale books.
+    func resyncDepth(depthNeeded: Bool) {
+        guard Self.shouldResyncDepth(
+            connected: connection == .connected,
+            depthNeeded: depthNeeded,
+            depthSymbol: depthSymbol,
+            everDelivered: depthDelivered
+        ) else { return }
+        if let sym = depthSymbol {
+            // Same symbol, subscribe was dropped: re-deliver without churning
+            // the (already-clear) book or unsubscribing a stream we still want.
+            depthDelivered = false
+            send(.subscribeDepth(symbol: sym))
+        } else {
+            // Nothing targeted (reconnect cleared it): fresh subscribe.
+            subscribeDepth(selectedSymbol)
+        }
+    }
+
+    /// Pure decision for `resyncDepth`: whether a depth subscribe must be
+    /// (re)sent right now. True only when connected AND the dock still needs a
+    /// book AND that book is not already delivering — either no symbol is
+    /// targeted yet (subscribe fresh) or one is but no frame has ever landed
+    /// (the subscribe was dropped while the socket was down; re-send). A stream
+    /// already delivering frames for its symbol needs no resend.
+    static func shouldResyncDepth(
+        connected: Bool, depthNeeded: Bool, depthSymbol: String?, everDelivered: Bool
+    ) -> Bool {
+        guard connected, depthNeeded else { return false }
+        if depthSymbol != nil, everDelivered { return false }
+        return true
     }
 
     /// Offer a price the operator clicked in the depth ladder to the order
@@ -568,8 +621,12 @@ final class AppModel {
         case .depth(let d):
             // Only accept the book for the symbol we are subscribed to — a late
             // frame from a just-unsubscribed symbol could still be in flight and
-            // must never overwrite the current ladder.
-            if d.symbol == depthSymbol { bookDepth = d }
+            // must never overwrite the current ladder. A landed frame proves the
+            // subscribe took, so the resync path stops re-sending it.
+            if d.symbol == depthSymbol {
+                bookDepth = d
+                depthDelivered = true
+            }
         case .tape(let p):
             // Same subscription guard, then ring-cap newest-first.
             guard p.symbol == depthSymbol else { break }
@@ -731,7 +788,10 @@ final class AppModel {
         if let b = snap.broker { broker = b }
         // A snapshot may carry the latest book per subscribed symbol — adopt it
         // only for the symbol we are actually streaming (never another's book).
-        if let sym = depthSymbol, let d = snap.depth?[sym] { bookDepth = d }
+        if let sym = depthSymbol, let d = snap.depth?[sym] {
+            bookDepth = d
+            depthDelivered = true
+        }
         // Likewise the latest flow read — only for the streamed symbol.
         if let sym = depthSymbol, let f = snap.flow?[sym] { flowRead = f }
         if let r = snap.regimes { regimeBoard = r }

@@ -2,6 +2,7 @@
 // Panels are implemented in Views/*; this file owns only arrangement, the
 // section rail, panel visibility, and keyboard navigation.
 
+import AppKit
 import SwiftUI
 
 struct RootView: View {
@@ -9,6 +10,14 @@ struct RootView: View {
     @AppStorage("showWatchlist") private var showWatchlist = true
     @AppStorage("showIntelligence") private var showIntelligence = true
     @AppStorage("showDeck") private var showDeck = true
+    // User-resizable panel sizes, persisted. Read through ResizablePanel so the
+    // dividers, storage keys, defaults, and clamps stay a single source of truth.
+    @AppStorage(ResizablePanel.watchlist.storageKey)
+    private var watchlistWidth = ResizablePanel.watchlist.defaultSize
+    @AppStorage(ResizablePanel.intelligence.storageKey)
+    private var intelligenceWidth = ResizablePanel.intelligence.defaultSize
+    @AppStorage(ResizablePanel.deck.storageKey)
+    private var deckHeight = ResizablePanel.deck.defaultSize
 
     private static let ease = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.2)
 
@@ -21,8 +30,11 @@ struct RootView: View {
                 Divider().overlay(Theme.line)
                 if showWatchlist {
                     Watchlist()
-                        .frame(width: 220)
-                    Divider().overlay(Theme.line)
+                        .frame(width: CGFloat(ResizablePanel.watchlist.clamp(watchlistWidth)))
+                    ResizeDivider(
+                        axis: .horizontal, panel: .watchlist,
+                        size: $watchlistWidth, direction: 1
+                    )
                 } else {
                     ReopenHandle(panel: .watchlist, visible: $showWatchlist)
                 }
@@ -42,18 +54,24 @@ struct RootView: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     if showDeck {
-                        Divider().overlay(Theme.line)
+                        ResizeDivider(
+                            axis: .vertical, panel: .deck,
+                            size: $deckHeight, direction: -1
+                        )
                         DashboardPanel()
-                            .frame(height: 280)
+                            .frame(height: CGFloat(ResizablePanel.deck.clamp(deckHeight)))
                     } else {
                         ReopenHandle(panel: .deck, visible: $showDeck)
                     }
                 }
                 .frame(maxWidth: .infinity)
                 if showIntelligence {
-                    Divider().overlay(Theme.line)
+                    ResizeDivider(
+                        axis: .horizontal, panel: .intelligence,
+                        size: $intelligenceWidth, direction: -1
+                    )
                     IntelligencePanel()
-                        .frame(width: 340)
+                        .frame(width: CGFloat(ResizablePanel.intelligence.clamp(intelligenceWidth)))
                 } else {
                     ReopenHandle(panel: .intelligence, visible: $showIntelligence)
                 }
@@ -339,5 +357,178 @@ private struct IconRail: View {
         case .connecting: Theme.warn
         case .disconnected: Theme.down
         }
+    }
+}
+
+// MARK: - Resizable panels
+
+/// The four user-resizable panels. Each carries its @AppStorage key, min/max
+/// clamps, and default size, so the drag dividers, the persisted store, and the
+/// tests read ONE source of truth. Sizes persist as Double (the @AppStorage wire
+/// type); `frame` takes CGFloat, identical to Double on 64-bit macOS.
+enum ResizablePanel: CaseIterable {
+    case watchlist, intelligence, deck, chartDock
+
+    /// @AppStorage key backing this panel's persisted size — never rename.
+    /// Distinct from the visibility keys (showWatchlist / showDeck / …), so
+    /// resize and collapse never fight over storage.
+    var storageKey: String {
+        switch self {
+        case .watchlist: "watchlistWidth"
+        case .intelligence: "intelligenceWidth"
+        case .deck: "deckHeight"
+        case .chartDock: "chartDockWidth"
+        }
+    }
+
+    var minSize: Double {
+        switch self {
+        case .watchlist: 160
+        case .intelligence: 260
+        case .deck: 120
+        case .chartDock: 240
+        }
+    }
+
+    var maxSize: Double {
+        switch self {
+        case .watchlist: 360
+        case .intelligence: 520
+        case .deck: 460
+        case .chartDock: 560
+        }
+    }
+
+    /// The persisted default before the operator drags anything. The chart dock
+    /// defaults WIDER (340) than the shell sidebars so the DOM ladder is usable
+    /// out of the box; the deck defaults SHORTER (200) so an empty positions
+    /// table never dominates the workspace.
+    var defaultSize: Double {
+        switch self {
+        case .watchlist: 220
+        case .intelligence: 340
+        case .deck: 200
+        case .chartDock: 340
+        }
+    }
+
+    /// NaN-safe clamp of a candidate size to this panel's [min, max].
+    func clamp(_ value: Double) -> Double {
+        PanelResize.clamp(value, min: minSize, max: maxSize)
+    }
+}
+
+enum PanelResize {
+    /// Clamp `value` to [lo, hi]. NaN-safe: NaN (never expected from a drag, but
+    /// cheap to guard) collapses to the minimum rather than persisting a garbage
+    /// size; ±infinity fall to the finite bound they run into.
+    static func clamp(_ value: Double, min lo: Double, max hi: Double) -> Double {
+        guard !value.isNaN else { return lo }
+        return Swift.min(Swift.max(value, lo), hi)
+    }
+}
+
+/// A draggable divider that resizes an adjacent panel. Renders as a 1px hairline
+/// inside a ~5pt grab strip; hovering brightens the line to ember and shows the
+/// correct resize cursor. Dragging updates the bound @AppStorage `size`, clamped
+/// live to the panel's [min, max]. `direction` is +1 when dragging along the
+/// natural axis enlarges the panel (watchlist, whose divider is on its right
+/// edge) and -1 when it shrinks it (intelligence + chart-dock left edges, deck
+/// top edge). Sits alongside the existing collapse toggles: it resizes only the
+/// VISIBLE panel; a hidden panel shows a ReopenHandle instead and no divider.
+struct ResizeDivider: View {
+    enum Axis { case horizontal, vertical }
+
+    let axis: Axis
+    let panel: ResizablePanel
+    @Binding var size: Double
+    var direction: Double = 1
+
+    @State private var hovering = false
+    @State private var dragOrigin: Double?
+
+    /// Grab strip thickness — wider than the hairline so the divider is easy to
+    /// seize without a visible slab.
+    private static let grab: CGFloat = 5
+
+    private var isHorizontal: Bool { axis == .horizontal }
+
+    var body: some View {
+        ZStack {
+            Color.clear
+            Rectangle()
+                .fill(hovering ? Theme.ember.opacity(0.55) : Theme.line)
+                .frame(
+                    width: isHorizontal ? Theme.hairline : nil,
+                    height: isHorizontal ? nil : Theme.hairline
+                )
+        }
+        .frame(
+            width: isHorizontal ? Self.grab : nil,
+            height: isHorizontal ? nil : Self.grab
+        )
+        .frame(
+            maxWidth: isHorizontal ? nil : .infinity,
+            maxHeight: isHorizontal ? .infinity : nil
+        )
+        .contentShape(Rectangle())
+        .background(ResizeCursor(axis: axis))
+        .gesture(
+            DragGesture(minimumDistance: 1)
+                .onChanged { value in
+                    let origin = dragOrigin ?? size
+                    if dragOrigin == nil { dragOrigin = origin }
+                    let delta = Double(
+                        isHorizontal ? value.translation.width : value.translation.height
+                    )
+                    size = panel.clamp(origin + direction * delta)
+                }
+                .onEnded { _ in dragOrigin = nil }
+        )
+        .onHover { hovering = $0 }
+        .animation(DeckMotion.ease(), value: hovering)
+    }
+}
+
+/// AppKit resize cursor for a divider: sets the left-right / up-down cursor over
+/// its bounds via a tracking area (steadier than SwiftUI hover across a live
+/// drag) while passing mouse events straight through (hitTest → nil) so the
+/// SwiftUI DragGesture underneath still drives the resize.
+private struct ResizeCursor: NSViewRepresentable {
+    let axis: ResizeDivider.Axis
+
+    private var cursor: NSCursor {
+        axis == .horizontal ? .resizeLeftRight : .resizeUpDown
+    }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = CursorNSView()
+        view.cursor = cursor
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? CursorNSView)?.cursor = cursor
+    }
+
+    final class CursorNSView: NSView {
+        var cursor: NSCursor = .arrow
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            for area in trackingAreas { removeTrackingArea(area) }
+            addTrackingArea(NSTrackingArea(
+                rect: bounds,
+                options: [.cursorUpdate, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                owner: self,
+                userInfo: nil
+            ))
+        }
+
+        override func cursorUpdate(with event: NSEvent) { cursor.set() }
+        override func mouseEntered(with event: NSEvent) { cursor.set() }
+
+        // Let clicks and drags fall through to the SwiftUI gesture beneath.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
     }
 }
