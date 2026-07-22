@@ -50,7 +50,7 @@ struct SymbolSearchField: View {
 
     var body: some View {
         field
-            .frame(width: 210)
+            .frame(width: 240)
             .overlay(alignment: .topLeading) {
                 if focused, !hits.isEmpty { dropdown.offset(y: 30) }
             }
@@ -127,7 +127,7 @@ struct SymbolSearchField: View {
                 .buttonStyle(.plain)
             }
         }
-        .frame(width: 210)
+        .frame(width: 240)
         .background(Theme.panel)
         .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
         .overlay(

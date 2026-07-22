@@ -5,22 +5,36 @@ import SwiftUI
 
 struct DashboardPanel: View {
     @Environment(AppModel.self) private var model
+    @Environment(RailLayout.self) private var rail
+    @AppStorage(ResizablePanel.chartDock.storageKey)
+    private var dockWidth = ResizablePanel.chartDock.defaultSize
     @State private var tab: DeckTab = .positions
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
+        // The order-ticket column shares the chart trading dock's width + seam, so
+        // the two form ONE continuous right rail from chart-top to deck-bottom. The
+        // divider IS the 5pt gutter (spacing 0), matching the chart's ResizeDivider
+        // exactly — the two dividers line up as one vertical seam.
+        HStack(alignment: .top, spacing: 0) {
             VStack(spacing: 10) {
                 AccountStrip()
                 TradeDeckTables(tab: $tab)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            ResizeDivider(
+                axis: .horizontal, panel: .chartDock,
+                base: dockWidth,
+                onChange: { rail.drag = $0 },
+                onEnd: { dockWidth = $0; rail.drag = nil },
+                direction: -1
+            )
             ScrollView {
                 VStack(spacing: 10) {
                     OrderTicket()
                     RiskHUD()
                 }
             }
-            .frame(width: 300)
+            .frame(width: rail.width(persisted: dockWidth))
         }
     }
 }

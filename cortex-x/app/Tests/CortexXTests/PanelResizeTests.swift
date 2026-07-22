@@ -60,7 +60,7 @@ final class PanelResizeTests: XCTestCase {
         XCTAssertEqual(ResizablePanel.intelligence.maxSize, 520)
         XCTAssertEqual(ResizablePanel.deck.minSize, 120)
         XCTAssertEqual(ResizablePanel.deck.maxSize, 460)
-        XCTAssertEqual(ResizablePanel.chartDock.minSize, 240)
+        XCTAssertEqual(ResizablePanel.chartDock.minSize, 280)
         XCTAssertEqual(ResizablePanel.chartDock.maxSize, 560)
     }
 
@@ -108,7 +108,7 @@ final class PanelResizeTests: XCTestCase {
         XCTAssertEqual(ResizablePanel.deck.clamp(50), 120)      // below min
         XCTAssertEqual(ResizablePanel.deck.clamp(9_000), 460)   // above max
         XCTAssertEqual(ResizablePanel.deck.clamp(300), 300)     // within
-        XCTAssertEqual(ResizablePanel.chartDock.clamp(200), 240)
+        XCTAssertEqual(ResizablePanel.chartDock.clamp(200), 280)
         XCTAssertEqual(ResizablePanel.chartDock.clamp(700), 560)
     }
 }

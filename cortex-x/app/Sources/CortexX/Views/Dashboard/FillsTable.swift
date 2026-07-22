@@ -11,20 +11,23 @@ struct FillsTable: View {
     private static let minTableWidth: CGFloat = 500
 
     var body: some View {
-        ScrollView([.horizontal, .vertical]) {
-            VStack(spacing: 0) {
-                header
-                if model.fills.isEmpty {
-                    DeckEmpty(text: "no fills")
-                } else {
-                    LazyVStack(spacing: 0) {
-                        ForEach(model.fills) { row($0) }
+        // Fill-or-scroll (see PositionsTable): content width = max(viewport, floor).
+        GeometryReader { geo in
+            ScrollView([.horizontal, .vertical]) {
+                VStack(spacing: 0) {
+                    header
+                    if model.fills.isEmpty {
+                        DeckEmpty(text: "no fills")
+                    } else {
+                        LazyVStack(spacing: 0) {
+                            ForEach(model.fills) { row($0) }
+                        }
                     }
                 }
+                .frame(width: max(geo.size.width, Self.minTableWidth))
+                .frame(minHeight: geo.size.height, alignment: .topLeading)
             }
-            .frame(minWidth: Self.minTableWidth, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     private var header: some View {

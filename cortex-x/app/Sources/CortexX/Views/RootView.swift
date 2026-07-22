@@ -26,6 +26,9 @@ struct RootView: View {
     @State private var dragWatchlist: Double?
     @State private var dragIntelligence: Double?
     @State private var dragDeck: Double?
+    /// Shared right-rail width: the chart trading dock (top) and the deck order-
+    /// ticket column (bottom) render one continuous band; both dividers drive it.
+    @State private var rail = RailLayout()
 
     private var liveWatchlistWidth: Double { ResizablePanel.watchlist.clamp(dragWatchlist ?? watchlistWidth) }
     private var liveIntelligenceWidth: Double { ResizablePanel.intelligence.clamp(dragIntelligence ?? intelligenceWidth) }
@@ -40,6 +43,9 @@ struct RootView: View {
             Divider().overlay(Theme.line)
             HStack(spacing: 0) {
                 IconRail()
+                    .zIndex(2) // the hover flyout overflows right into the watchlist;
+                    // lift the rail above the later siblings so the callout is never
+                    // occluded by a highlighted watchlist card.
                 Divider().overlay(Theme.line)
                 if showWatchlist {
                     Watchlist()
@@ -103,6 +109,7 @@ struct RootView: View {
         .animation(Self.ease, value: showWatchlist)
         .animation(Self.ease, value: showIntelligence)
         .animation(Self.ease, value: showDeck)
+        .environment(rail) // the chart dock + deck ticket column share this width
     }
 }
 
@@ -408,7 +415,7 @@ enum ResizablePanel: CaseIterable {
         case .watchlist: 160
         case .intelligence: 260
         case .deck: 120
-        case .chartDock: 240
+        case .chartDock: 280
         }
     }
 

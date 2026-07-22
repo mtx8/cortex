@@ -6,8 +6,11 @@ struct TopBar: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        HStack(spacing: 20) {
-            brand
+        HStack(spacing: 16) {
+            // Fixed brand slot → the search field's left edge never shifts, and
+            // hairline seams give the search its own command bay (terminal grammar).
+            brand.frame(width: 86, alignment: .leading)
+            Divider().frame(height: 16).overlay(Theme.line)
             SymbolSearchField()
             Divider().frame(height: 16).overlay(Theme.line)
             // Isolated leaf: a ~12 Hz account mark re-lays-out only these three
@@ -41,16 +44,14 @@ struct TopBar: View {
         .padding(.vertical, 8)
     }
 
+    // Single clean wordmark — the gimmicky double-X is gone; ember is reserved
+    // for active/hover state, so the mark stays all-bone.
     private var brand: some View {
-        HStack(spacing: 2) {
-            Text("CORTEX")
-                .font(.system(size: 13, weight: .bold))
-                .tracking(1.5)
-                .foregroundStyle(Theme.bone)
-            Text("X")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundStyle(Theme.ember)
-        }
+        Text("CORTEX")
+            .font(.system(size: 13, weight: .bold))
+            .tracking(2.0)
+            .foregroundStyle(Theme.bone)
+            .fixedSize()
     }
 
 

@@ -21,7 +21,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key><string>CortexX</string>
-    <key>CFBundleDisplayName</key><string>CORTEX X</string>
+    <key>CFBundleDisplayName</key><string>CORTEX</string>
     <key>CFBundleIdentifier</key><string>com.mtxlabs.cortexx</string>
     <key>CFBundleVersion</key><string>0.1.0</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>

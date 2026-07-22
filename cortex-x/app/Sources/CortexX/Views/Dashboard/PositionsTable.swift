@@ -15,22 +15,27 @@ struct PositionsTable: View {
     private static let minTableWidth: CGFloat = 660
 
     var body: some View {
-        // Both axes scroll; header + rows share ONE minWidth so they stay aligned
-        // and scroll together when the deck is narrower than the columns need.
-        ScrollView([.horizontal, .vertical]) {
-            VStack(spacing: 0) {
-                header
-                if rows.isEmpty {
-                    DeckEmpty(text: "flat")
-                } else {
-                    LazyVStack(spacing: 0) {
-                        ForEach(rows) { row($0) }
+        // Fill-or-scroll: the content width is max(viewport, column floor) — a
+        // FIXED number, so the flexible symbol column resolves and the table fills
+        // the panel edge-to-edge (no dead band); below the floor it scrolls
+        // horizontally. minHeight fills so the empty state occupies the region
+        // instead of floating top-left.
+        GeometryReader { geo in
+            ScrollView([.horizontal, .vertical]) {
+                VStack(spacing: 0) {
+                    header
+                    if rows.isEmpty {
+                        DeckEmpty(text: "flat")
+                    } else {
+                        LazyVStack(spacing: 0) {
+                            ForEach(rows) { row($0) }
+                        }
                     }
                 }
+                .frame(width: max(geo.size.width, Self.minTableWidth))
+                .frame(minHeight: geo.size.height, alignment: .topLeading)
             }
-            .frame(minWidth: Self.minTableWidth, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     private var header: some View {

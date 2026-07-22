@@ -12,20 +12,24 @@ struct OrdersTable: View {
     private static let minTableWidth: CGFloat = 620
 
     var body: some View {
-        ScrollView([.horizontal, .vertical]) {
-            VStack(spacing: 0) {
-                header
-                if model.orders.isEmpty {
-                    DeckEmpty(text: "no orders")
-                } else {
-                    LazyVStack(spacing: 0) {
-                        ForEach(model.orders) { row($0) }
+        // Fill-or-scroll (see PositionsTable): content width = max(viewport, floor)
+        // so columns fill the panel; below the floor it scrolls horizontally.
+        GeometryReader { geo in
+            ScrollView([.horizontal, .vertical]) {
+                VStack(spacing: 0) {
+                    header
+                    if model.orders.isEmpty {
+                        DeckEmpty(text: "no orders")
+                    } else {
+                        LazyVStack(spacing: 0) {
+                            ForEach(model.orders) { row($0) }
+                        }
                     }
                 }
+                .frame(width: max(geo.size.width, Self.minTableWidth))
+                .frame(minHeight: geo.size.height, alignment: .topLeading)
             }
-            .frame(minWidth: Self.minTableWidth, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     private var header: some View {

@@ -1,4 +1,4 @@
-// CORTEX X — AI-native trading terminal.
+// CORTEX — AI-native trading terminal.
 // (c) 2026 MTX Labs. All rights reserved.
 
 import SwiftUI
