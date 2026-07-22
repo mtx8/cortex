@@ -10,10 +10,9 @@ struct TopBar: View {
             brand
             SymbolSearchField()
             Divider().frame(height: 16).overlay(Theme.line)
-            vital("equity", Fmt.money(model.account.equity), Theme.bone)
-            vital("day p&l", Fmt.signedMoney(model.account.realized_pnl_day + model.account.unrealized_pnl),
-                  Theme.pnlColor(model.account.realized_pnl_day + model.account.unrealized_pnl))
-            vital("exposure", Fmt.money(model.account.gross_exposure), Theme.bone)
+            // Isolated leaf: a ~12 Hz account mark re-lays-out only these three
+            // cells, not the brand / search / broker badge / connection.
+            AccountVitals()
             Spacer()
             if model.risk.kill_switch {
                 HStack(spacing: 6) {
@@ -31,9 +30,9 @@ struct TopBar: View {
                 .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
                 .help(model.risk.kill_reason ?? "engaged")
             }
-            vital("autonomy", model.risk.autonomy.label, Theme.bone)
+            topBarVital("autonomy", model.risk.autonomy.label, Theme.bone)
             if model.risk.caution > 0.01 {
-                vital("caution", model.risk.caution.formatted(.number.precision(.fractionLength(2))), Theme.warn)
+                topBarVital("caution", model.risk.caution.formatted(.number.precision(.fractionLength(2))), Theme.ember)
             }
             brokerBadge
             connection
@@ -54,24 +53,6 @@ struct TopBar: View {
         }
     }
 
-    private func vital(_ label: String, _ value: String, _ color: Color) -> some View {
-        // Single-line + intrinsic width so a spaced label ("day p&l") or a wide
-        // money value never wraps onto a second line when the bar is compressed —
-        // the bar clips at its trailing edge instead of misaligning.
-        VStack(alignment: .leading, spacing: 1) {
-            Text(label.uppercased())
-                .font(.system(size: 8, weight: .semibold))
-                .tracking(1.2)
-                .foregroundStyle(Theme.dim)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-            Text(value)
-                .numeric(size: 12, weight: .medium)
-                .foregroundStyle(color)
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-        }
-    }
 
     // Broker-link posture — the operator must always know whether real money
     // is at play. An explicit dim "BROKER" stamp precedes the mode so the
@@ -127,6 +108,43 @@ struct TopBar: View {
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(model.connection == .connected ? Theme.up : Theme.dim)
         }
+    }
+}
+
+/// The three account vitals (equity · day P&L · exposure). Its OWN view so a
+/// ~12 Hz account mark invalidates only these cells — the brand, symbol search,
+/// broker badge, and connection in the parent TopBar keep their layout.
+private struct AccountVitals: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let a = model.account
+        let dayPnl = a.realized_pnl_day + a.unrealized_pnl
+        HStack(spacing: 20) {
+            topBarVital("equity", Fmt.money(a.equity), Theme.bone)
+            topBarVital("day p&l", Fmt.signedMoney(dayPnl), Theme.pnlColor(dayPnl))
+            topBarVital("exposure", Fmt.money(a.gross_exposure), Theme.bone)
+        }
+    }
+}
+
+/// One TopBar stat cell (dim label over a value). Single-line + intrinsic width
+/// so a spaced label ("day p&l") or a wide money value never wraps onto a second
+/// line under compression — the bar clips at its trailing edge instead. Shared by
+/// AccountVitals and the risk cells so both read identically.
+private func topBarVital(_ label: String, _ value: String, _ color: Color) -> some View {
+    VStack(alignment: .leading, spacing: 1) {
+        Text(label.uppercased())
+            .font(.system(size: 8, weight: .semibold))
+            .tracking(1.2)
+            .foregroundStyle(Theme.dim)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+        Text(value)
+            .numeric(size: 12, weight: .medium)
+            .foregroundStyle(color)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
     }
 }
 

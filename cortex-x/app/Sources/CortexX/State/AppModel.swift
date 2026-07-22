@@ -926,11 +926,19 @@ struct MarketCoalescer {
     private var flows: [String: FlowRead] = [:]
     private var tapeBatch: [TapePrint] = []
     private var formingBars: [FormingKey: Bar] = [:]
+    /// Mark-to-market snapshots the engine can emit at feed rate (~40 Hz): the
+    /// latest account (single slot) and the latest position per symbol. Buffering
+    /// them caps TopBar / AccountStrip / PositionsTable re-layout at the display
+    /// rate instead of raw feed rate. Discrete events (.fill / .orderUpdate) are
+    /// NOT buffered — they must apply immediately and can never be coalesced away.
+    private var accountSnap: AccountSnapshot?
+    private var positionSnaps: [String: Position] = [:]
 
     /// Whether anything is buffered — lets the flush skip an empty drain.
     var hasPending: Bool {
         !ticks.isEmpty || !bookTops.isEmpty || !depths.isEmpty || !flows.isEmpty
             || !tapeBatch.isEmpty || !formingBars.isEmpty
+            || accountSnap != nil || !positionSnaps.isEmpty
     }
 
     /// Buffer `frame` for the display-rate flush, returning whether it was
@@ -966,6 +974,12 @@ struct MarketCoalescer {
             }
             formingBars[key] = bar
             return true
+        case .account(let a):
+            accountSnap = a
+            return true
+        case .position(let p):
+            positionSnaps[p.symbol] = p
+            return true
         default:
             return false
         }
@@ -982,6 +996,7 @@ struct MarketCoalescer {
         frames.reserveCapacity(
             formingBars.count + ticks.count + bookTops.count
                 + depths.count + flows.count + tapeBatch.count
+                + positionSnaps.count + (accountSnap == nil ? 0 : 1)
         )
         for bar in formingBars.values { frames.append(.bar(bar)) }
         for t in ticks.values { frames.append(.tick(t)) }
@@ -989,6 +1004,9 @@ struct MarketCoalescer {
         for d in depths.values { frames.append(.depth(d)) }
         for f in flows.values { frames.append(.flow(f)) }
         for p in tapeBatch { frames.append(.tape(p)) }
+        for p in positionSnaps.values { frames.append(.position(p)) }
+        // Account last so it reflects the freshest marks in the same flush.
+        if let a = accountSnap { frames.append(.account(a)) }
         clear()
         return frames
     }
@@ -1001,5 +1019,7 @@ struct MarketCoalescer {
         flows.removeAll(keepingCapacity: true)
         tapeBatch.removeAll(keepingCapacity: true)
         formingBars.removeAll(keepingCapacity: true)
+        accountSnap = nil
+        positionSnaps.removeAll(keepingCapacity: true)
     }
 }

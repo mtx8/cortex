@@ -121,9 +121,23 @@ final class MarketCoalescerTests: XCTestCase {
 
     func testLowFrequencyFramesArePassThrough() {
         var c = MarketCoalescer()
-        XCTAssertFalse(c.ingest(.account(.empty)))
+        // Config / discrete frames still bypass the buffer and apply immediately.
         XCTAssertFalse(c.ingest(.risk(.empty)))
         XCTAssertFalse(c.hasPending)
+    }
+
+    func testAccountAndPositionAreCoalesced() {
+        var c = MarketCoalescer()
+        // Mark-to-market snapshots (emitted up to feed rate) buffer latest-wins
+        // and flush at the display rate — they must NOT re-render at raw feed rate.
+        XCTAssertTrue(c.ingest(.account(.empty)))
+        XCTAssertTrue(c.ingest(.position(position("BTC-USD", qty: 1))))
+        XCTAssertTrue(c.hasPending)
+        let frames = c.drain()
+        XCTAssertTrue(frames.contains { if case .position = $0 { return true } else { return false } })
+        // account is emitted LAST so the flush carries the freshest marks.
+        if case .account = frames.last {} else { XCTFail("account should flush last") }
+        XCTAssertFalse(c.hasPending) // drain reset
     }
 
     // MARK: Drain resets
@@ -171,6 +185,13 @@ final class MarketCoalescerTests: XCTestCase {
 
     private func bookTop(_ symbol: String, bid: Double) -> BookTop {
         BookTop(symbol: symbol, ts_ms: 1, bid_px: bid, bid_sz: 1, ask_px: bid + 1, ask_sz: 1)
+    }
+
+    private func position(_ symbol: String, qty: Double) -> Position {
+        Position(
+            symbol: symbol, qty: qty, avg_px: 100, mark_px: 100,
+            unrealized_pnl: 0, realized_pnl: 0, ts_ms: 1
+        )
     }
 
     private func depth(_ symbol: String) -> BookDepth {
@@ -262,20 +283,40 @@ final class CoalescedReceiveTests: XCTestCase {
         XCTAssertNil(model.lastTick["BTC-USD"])
     }
 
-    func testLowFrequencyFrameAppliesImmediately() {
+    func testRiskFrameAppliesImmediately() {
         let model = AppModel()
+        // Risk (kill switch, autonomy) is interaction-critical — never buffered.
+        var r = RiskStatus.empty
+        r.kill_switch = true
+        r.kill_reason = "test"
+        model.receive(.risk(r))
+        XCTAssertTrue(model.risk.kill_switch) // no flush needed
+    }
+
+    func testAccountFrameCoalescesUntilFlush() {
+        let model = AppModel()
+        let initial = model.account.equity
         model.receive(.account(AccountSnapshot(
             equity: 5, cash: 5, gross_exposure: 0, net_exposure: 0,
             unrealized_pnl: 0, realized_pnl_day: 0, fees_paid: 0,
             open_orders: 0, daily_trades: 0, drawdown_day: 0, drawdown_total: 0, ts_ms: 1
         )))
-        XCTAssertEqual(model.account.equity, 5) // no flush needed
+        XCTAssertEqual(model.account.equity, initial, "account buffers — not applied until flush")
+        model.flushMarket()
+        XCTAssertEqual(model.account.equity, 5)
     }
 
     // MARK: Fixtures
 
     private func tick(_ symbol: String, _ px: Double) -> Tick {
         Tick(symbol: symbol, ts_ms: 0, price: px, size: 0, aggressor: nil, venue: .cboe)
+    }
+
+    private func position(_ symbol: String, qty: Double) -> Position {
+        Position(
+            symbol: symbol, qty: qty, avg_px: 100, mark_px: 100,
+            unrealized_pnl: 0, realized_pnl: 0, ts_ms: 1
+        )
     }
 
     private func bar(_ symbol: String, ts: Int64, close: Double, complete: Bool) -> Bar {
