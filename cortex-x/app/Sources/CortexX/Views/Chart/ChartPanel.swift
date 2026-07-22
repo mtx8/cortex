@@ -165,16 +165,22 @@ struct ChartPanel: View {
 
             if let top { spreadChip(top) }
 
-            Spacer(minLength: 8)
+            Spacer(minLength: 6)
 
-            RangePicker(selectedRange: $selectedRange, apply: applyRange)
-
-            IntervalPicker(
-                selectedInterval: displayInterval,
-                weeklyMode: weeklyMode,
-                pick: pickInterval,
-                pickWeekly: pickWeekly
-            )
+            // The range + interval pickers scroll horizontally when the pane is
+            // narrow (guaranteed in a half/quarter-width multi-chart grid pane)
+            // instead of clipping or shoving the identity off-line.
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 12) {
+                    RangePicker(selectedRange: $selectedRange, apply: applyRange)
+                    IntervalPicker(
+                        selectedInterval: displayInterval,
+                        weeklyMode: weeklyMode,
+                        pick: pickInterval,
+                        pickWeekly: pickWeekly
+                    )
+                }
+            }
 
             feedDot
         }

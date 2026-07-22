@@ -124,6 +124,10 @@ struct ChartWorkspace: View {
     /// fixed 320 so the DOM ladder isn't crushed; the divider clamps it live.
     @AppStorage(ResizablePanel.chartDock.storageKey)
     private var dockWidth = ResizablePanel.chartDock.defaultSize
+    /// Transient live width WHILE dragging the dock edge — persists to
+    /// @AppStorage only on drag end (smooth resize, no per-frame UserDefaults).
+    @State private var dragDock: Double?
+    private var liveDockWidth: Double { ResizablePanel.chartDock.clamp(dragDock ?? dockWidth) }
 
     private static let ease = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.2)
 
@@ -142,10 +146,13 @@ struct ChartWorkspace: View {
             if dockVisible {
                 ResizeDivider(
                     axis: .horizontal, panel: .chartDock,
-                    size: $dockWidth, direction: -1
+                    base: dockWidth,
+                    onChange: { dragDock = $0 },
+                    onEnd: { dockWidth = $0; dragDock = nil },
+                    direction: -1
                 )
                 TradingDock()
-                    .frame(width: CGFloat(ResizablePanel.chartDock.clamp(dockWidth)))
+                    .frame(width: CGFloat(liveDockWidth))
             } else if state.anyEnabled {
                 // Enabled but collapsed: a slim re-open handle pinned to the edge
                 // (mirrors the shell ReopenHandle pattern).

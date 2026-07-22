@@ -148,28 +148,48 @@ struct BookTop: Codable, Equatable {
 // MARK: - Level 2: order-book depth (ladder) + time & sales (tape)
 
 /// One price level in the order book: the resting price, the aggregate size at
-/// that level, and the order count (`count == 0` when the venue does not report
-/// one). Mirror of the engine `BookLevel` contract type (serde snake_case).
+/// that level, the order count (`count == 0` when the venue does not report
+/// one), and the market-maker / ECN route `mm` (DAS-style) when the venue
+/// attributes it — present for IBKR `reqMktDepth` L2 on equities, `nil` for
+/// anonymous/aggregated books (Coinbase level2) and delayed L1, never fabricated.
+/// Mirror of the engine `BookLevel` contract type (serde snake_case).
 struct BookLevel: Codable, Equatable {
     var px: Double
     var sz: Double
     /// Number of orders resting at this level; 0 when the venue omits it.
     var count: UInt32
+    /// Market-maker / venue route id ("NSDQ", "ARCA", …) when the book is
+    /// route-attributed; nil for anonymous/aggregated or delayed books.
+    var mm: String?
+
+    init(px: Double, sz: Double, count: UInt32, mm: String? = nil) {
+        self.px = px
+        self.sz = sz
+        self.count = count
+        self.mm = mm
+    }
 }
 
 extension BookLevel {
-    enum CodingKeys: String, CodingKey { case px, sz, count }
+    enum CodingKeys: String, CodingKey { case px, sz, count, mm }
 
     // Defensive decode: a lean/garbled level must never fail the whole depth
     // frame (Depth is a NON-critical, droppable event). Absent px/sz decode to
     // 0 (the ladder drops non-finite / non-positive prices), an absent count
-    // to 0 (venue omitted it). Memberwise init preserved via the extension so
+    // to 0 (venue omitted it), an absent/blank mm to nil (anonymous book — the
+    // montage then shows no route badge). Memberwise init preserved above so
     // construction/tests stay ergonomic; `encode(to:)` stays synthesized.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         px = try c.decodeIfPresent(Double.self, forKey: .px) ?? 0
         sz = try c.decodeIfPresent(Double.self, forKey: .sz) ?? 0
         count = try c.decodeIfPresent(UInt32.self, forKey: .count) ?? 0
+        // Trim on the SAME whitespace set as the Rust producer (str::trim strips
+        // all Unicode whitespace incl. newlines) so "\n"-padded ids collapse to
+        // nil in both, never a garbage badge.
+        let route = try c.decodeIfPresent(String.self, forKey: .mm)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        mm = (route?.isEmpty ?? true) ? nil : route
     }
 }
 

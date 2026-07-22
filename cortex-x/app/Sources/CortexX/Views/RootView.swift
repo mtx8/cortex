@@ -19,6 +19,18 @@ struct RootView: View {
     @AppStorage(ResizablePanel.deck.storageKey)
     private var deckHeight = ResizablePanel.deck.defaultSize
 
+    // Transient live drag sizes — non-nil only WHILE a divider is being dragged.
+    // The panel frames read `drag ?? persisted`, so a drag streams through cheap
+    // in-memory @State and only the drag-end commit touches @AppStorage (no
+    // per-frame UserDefaults write / observation storm → smooth resize).
+    @State private var dragWatchlist: Double?
+    @State private var dragIntelligence: Double?
+    @State private var dragDeck: Double?
+
+    private var liveWatchlistWidth: Double { ResizablePanel.watchlist.clamp(dragWatchlist ?? watchlistWidth) }
+    private var liveIntelligenceWidth: Double { ResizablePanel.intelligence.clamp(dragIntelligence ?? intelligenceWidth) }
+    private var liveDeckHeight: Double { ResizablePanel.deck.clamp(dragDeck ?? deckHeight) }
+
     private static let ease = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.2)
 
     var body: some View {
@@ -31,10 +43,13 @@ struct RootView: View {
                 Divider().overlay(Theme.line)
                 if showWatchlist {
                     Watchlist()
-                        .frame(width: CGFloat(ResizablePanel.watchlist.clamp(watchlistWidth)))
+                        .frame(width: CGFloat(liveWatchlistWidth))
                     ResizeDivider(
                         axis: .horizontal, panel: .watchlist,
-                        size: $watchlistWidth, direction: 1
+                        base: watchlistWidth,
+                        onChange: { dragWatchlist = $0 },
+                        onEnd: { watchlistWidth = $0; dragWatchlist = nil },
+                        direction: 1
                     )
                 } else {
                     ReopenHandle(panel: .watchlist, visible: $showWatchlist)
@@ -57,10 +72,13 @@ struct RootView: View {
                     if showDeck {
                         ResizeDivider(
                             axis: .vertical, panel: .deck,
-                            size: $deckHeight, direction: -1
+                            base: deckHeight,
+                            onChange: { dragDeck = $0 },
+                            onEnd: { deckHeight = $0; dragDeck = nil },
+                            direction: -1
                         )
                         DashboardPanel()
-                            .frame(height: CGFloat(ResizablePanel.deck.clamp(deckHeight)))
+                            .frame(height: CGFloat(liveDeckHeight))
                     } else {
                         ReopenHandle(panel: .deck, visible: $showDeck)
                     }
@@ -69,10 +87,13 @@ struct RootView: View {
                 if showIntelligence {
                     ResizeDivider(
                         axis: .horizontal, panel: .intelligence,
-                        size: $intelligenceWidth, direction: -1
+                        base: intelligenceWidth,
+                        onChange: { dragIntelligence = $0 },
+                        onEnd: { intelligenceWidth = $0; dragIntelligence = nil },
+                        direction: -1
                     )
                     IntelligencePanel()
-                        .frame(width: CGFloat(ResizablePanel.intelligence.clamp(intelligenceWidth)))
+                        .frame(width: CGFloat(liveIntelligenceWidth))
                 } else {
                     ReopenHandle(panel: .intelligence, visible: $showIntelligence)
                 }
@@ -431,18 +452,29 @@ enum PanelResize {
 
 /// A draggable divider that resizes an adjacent panel. Renders as a 1px hairline
 /// inside a ~5pt grab strip; hovering brightens the line to ember and shows the
-/// correct resize cursor. Dragging updates the bound @AppStorage `size`, clamped
-/// live to the panel's [min, max]. `direction` is +1 when dragging along the
-/// natural axis enlarges the panel (watchlist, whose divider is on its right
-/// edge) and -1 when it shrinks it (intelligence + chart-dock left edges, deck
-/// top edge). Sits alongside the existing collapse toggles: it resizes only the
-/// VISIBLE panel; a hidden panel shows a ReopenHandle instead and no divider.
+/// correct resize cursor.
+///
+/// SMOOTH RESIZE: the divider does NOT hold a persisted @AppStorage binding.
+/// It takes the current persisted size as a stable `base`, streams the live size
+/// through `onChange` during the drag (the caller drives a transient in-memory
+/// @State from it — no per-frame UserDefaults write, no @AppStorage observation
+/// storm), and reports the final size ONCE through `onEnd` where the caller
+/// persists it. This keeps the drag hot path off disk and out of the global
+/// observation graph. `direction` is +1 when dragging along the natural axis
+/// enlarges the panel (watchlist, divider on its right edge) and -1 when it
+/// shrinks it (intelligence + chart-dock left edges, deck top edge). Resizes only
+/// the VISIBLE panel; a hidden panel shows a ReopenHandle instead and no divider.
 struct ResizeDivider: View {
     enum Axis { case horizontal, vertical }
 
     let axis: Axis
     let panel: ResizablePanel
-    @Binding var size: Double
+    /// The current persisted size — the stable drag origin (never mutated mid-drag).
+    let base: Double
+    /// Live clamped size, fired every drag frame → drive transient @State.
+    let onChange: (Double) -> Void
+    /// Final clamped size at drag end → persist ONCE here.
+    let onEnd: (Double) -> Void
     var direction: Double = 1
 
     @State private var hovering = false
@@ -453,6 +485,12 @@ struct ResizeDivider: View {
     private static let grab: CGFloat = 5
 
     private var isHorizontal: Bool { axis == .horizontal }
+
+    private func resolved(_ value: DragGesture.Value) -> Double {
+        let origin = dragOrigin ?? base
+        let delta = Double(isHorizontal ? value.translation.width : value.translation.height)
+        return panel.clamp(origin + direction * delta)
+    }
 
     var body: some View {
         ZStack {
@@ -477,14 +515,13 @@ struct ResizeDivider: View {
         .gesture(
             DragGesture(minimumDistance: 1)
                 .onChanged { value in
-                    let origin = dragOrigin ?? size
-                    if dragOrigin == nil { dragOrigin = origin }
-                    let delta = Double(
-                        isHorizontal ? value.translation.width : value.translation.height
-                    )
-                    size = panel.clamp(origin + direction * delta)
+                    if dragOrigin == nil { dragOrigin = base }
+                    onChange(resolved(value))
                 }
-                .onEnded { _ in dragOrigin = nil }
+                .onEnded { value in
+                    onEnd(resolved(value))
+                    dragOrigin = nil
+                }
         )
         .onHover { hovering = $0 }
         .animation(DeckMotion.ease(), value: hovering)

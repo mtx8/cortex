@@ -10,18 +10,25 @@ struct PositionsTable: View {
         model.positions.values.sorted { $0.symbol < $1.symbol }
     }
 
+    /// Sum of the fixed columns + spacing + padding — the floor below which the
+    /// table scrolls horizontally instead of crushing its columns.
+    private static let minTableWidth: CGFloat = 660
+
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            if rows.isEmpty {
-                DeckEmpty(text: "flat")
-            } else {
-                ScrollView {
+        // Both axes scroll; header + rows share ONE minWidth so they stay aligned
+        // and scroll together when the deck is narrower than the columns need.
+        ScrollView([.horizontal, .vertical]) {
+            VStack(spacing: 0) {
+                header
+                if rows.isEmpty {
+                    DeckEmpty(text: "flat")
+                } else {
                     LazyVStack(spacing: 0) {
                         ForEach(rows) { row($0) }
                     }
                 }
             }
+            .frame(minWidth: Self.minTableWidth, alignment: .leading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }

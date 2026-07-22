@@ -838,7 +838,11 @@ final class AppModel {
             rebuilt[symbol] = m
         }
         bars = rebuilt
-        for p in snap.positions { positions[p.symbol] = p }
+        // Rebuild positions WHOLESALE (like orders/thoughts): a position closed
+        // while we were disconnected is absent from the reconnect snapshot and
+        // must vanish — merging would leave phantom exposure that could drive a
+        // wrong manual flatten.
+        positions = Dictionary(uniqueKeysWithValues: snap.positions.map { ($0.symbol, $0) })
         if let a = snap.account { account = a }
         if let r = snap.risk { risk = r }
         thoughts = snap.thoughts.sorted { $0.ts_ms > $1.ts_ms }

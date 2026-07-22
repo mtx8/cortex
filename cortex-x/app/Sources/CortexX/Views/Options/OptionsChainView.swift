@@ -98,11 +98,15 @@ struct OptionsChainView: View {
 
     private func chainTable(_ chain: OptionsChain) -> some View {
         let rows = strikeRows(chain)
-        return VStack(spacing: 0) {
-            chainHeader
-            Divider().overlay(Theme.line)
+        // Full calls | strike | puts grid width. When the center pane is narrower
+        // than this the whole grid scrolls horizontally as ONE unit (header + rows
+        // stay aligned) instead of clipping the outer columns.
+        let gridWidth = callPutColWidth * 12 + strikeColWidth
+        return ScrollView([.horizontal, .vertical]) {
             ScrollViewReader { proxy in
-                ScrollView {
+                VStack(spacing: 0) {
+                    chainHeader
+                    Divider().overlay(Theme.line)
                     LazyVStack(spacing: 0) {
                         ForEach(rows) { row in
                             StrikeRow(row: row, spot: chain.underlying_px)
@@ -110,6 +114,7 @@ struct OptionsChainView: View {
                         }
                     }
                 }
+                .frame(minWidth: gridWidth, alignment: .leading)
                 .onAppear {
                     if let atm = rows.min(by: {
                         abs($0.strike - chain.underlying_px) < abs($1.strike - chain.underlying_px)

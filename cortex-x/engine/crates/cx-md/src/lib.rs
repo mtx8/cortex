@@ -20,8 +20,14 @@ mod agg;
 mod backfill;
 mod coinbase;
 mod equity;
+mod l2book;
 pub mod options;
 mod synthetic;
+
+/// The market-maker-attributed L2 book assembler (DAS-style routes) fed by the
+/// IBKR `reqMktDepth` per-maker stream. Public so the (feature-gated) adapter
+/// can forward `updateMktDepthL2` callbacks into it.
+pub use l2book::L2Book;
 
 /// The IBKR market-data integration point: once the IBKR adapter (cx-broker,
 /// `ibkr` feature) is connected with the operator's market-data subscriptions,

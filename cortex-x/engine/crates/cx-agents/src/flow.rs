@@ -617,8 +617,8 @@ mod tests {
         use cx_core::events::BookLevel;
         BookDepth {
             symbol: symbol.into(),
-            bids: vec![BookLevel { px: 100.0, sz: bid_sz, count: 0 }],
-            asks: vec![BookLevel { px: 100.1, sz: ask_sz, count: 0 }],
+            bids: vec![BookLevel::agg(100.0, bid_sz, 0)],
+            asks: vec![BookLevel::agg(100.1, ask_sz, 0)],
             depth: 20,
             source: source.into(),
             is_live,

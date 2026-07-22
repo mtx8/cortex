@@ -440,7 +440,7 @@ mod tests {
     use super::*;
 
     fn level(px: f64, sz: f64) -> BookLevel {
-        BookLevel { px, sz, count: 0 }
+        BookLevel::agg(px, sz, 0)
     }
 
     fn print(px: f64, sz: f64, aggressor: Option<Side>, ts_ms: i64) -> TapePrint {

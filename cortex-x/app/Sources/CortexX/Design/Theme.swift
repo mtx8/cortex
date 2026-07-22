@@ -52,7 +52,10 @@ extension Color {
 
 // MARK: - Reusable styles
 
-/// 11pt uppercase tracked section label.
+/// 11pt uppercase tracked section label. Single-line by contract: it heads many
+/// horizontally-constrained columns (Regimes board, Company relations, Meridian
+/// panes, dock panels), so a two-word title ("entering bull", "latest filings")
+/// truncates instead of wrapping to a second line when its column is narrow.
 struct SectionLabel: View {
     let text: String
     var body: some View {
@@ -60,6 +63,7 @@ struct SectionLabel: View {
             .font(.system(size: 11, weight: .semibold))
             .tracking(2.5)
             .foregroundStyle(Theme.dim)
+            .lineLimit(1)
     }
 }
 

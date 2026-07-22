@@ -296,19 +296,14 @@ pub(crate) async fn run(
 pub(crate) fn equity_depth(symbol: &str, q: &EquityQuote) -> BookDepth {
     let mut bids = Vec::new();
     let mut asks = Vec::new();
+    // Delayed L1 stand-in — a single anonymous level per side, never route-
+    // attributed (`mm: None`). Real market-maker routes come only from the live
+    // IBKR reqMktDepth path below.
     if q.bid.is_finite() && q.bid > 0.0 {
-        bids.push(BookLevel {
-            px: q.bid,
-            sz: q.bid_size.max(0.0),
-            count: 0,
-        });
+        bids.push(BookLevel::agg(q.bid, q.bid_size.max(0.0), 0));
     }
     if q.ask.is_finite() && q.ask > 0.0 && q.ask >= q.bid {
-        asks.push(BookLevel {
-            px: q.ask,
-            sz: q.ask_size.max(0.0),
-            count: 0,
-        });
+        asks.push(BookLevel::agg(q.ask, q.ask_size.max(0.0), 0));
     }
     BookDepth {
         symbol: symbol.to_string(),

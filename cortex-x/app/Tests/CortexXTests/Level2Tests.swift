@@ -28,6 +28,31 @@ final class Level2Tests: XCTestCase {
         XCTAssertTrue(d.is_live)
     }
 
+    func testDecodeDepthFrameCarriesMarketMakerRoutes() throws {
+        // IBKR-style attributed L2: each level carries an mm route; a blank/absent
+        // route decodes to nil (never an empty badge).
+        let json = #"{"type":"depth","symbol":"AAPL","bids":[{"px":190.10,"sz":300,"count":0,"mm":"NSDQ"},{"px":190.10,"sz":150,"count":0,"mm":"ARCA"},{"px":190.05,"sz":90,"count":0,"mm":"  "}],"asks":[{"px":190.15,"sz":200,"count":0,"mm":"EDGX"}],"depth":10,"source":"ibkr L2","is_live":true,"ts_ms":1}"#
+        guard case .depth(let d) = try ServerFrame.decode(Data(json.utf8)) else {
+            return XCTFail("expected depth")
+        }
+        XCTAssertEqual(d.bids.count, 3)
+        XCTAssertEqual(d.bids[0].mm, "NSDQ")
+        XCTAssertEqual(d.bids[1].mm, "ARCA")           // same price, different maker — kept separate
+        XCTAssertEqual(d.bids[1].px, d.bids[0].px)
+        XCTAssertNil(d.bids[2].mm, "blank route id must decode to nil")
+        XCTAssertEqual(d.asks[0].mm, "EDGX")
+    }
+
+    func testDecodeAnonymousDepthHasNilRoutes() throws {
+        // Coinbase-style aggregated book: no mm key at all -> nil routes.
+        let json = #"{"type":"depth","symbol":"BTC-USD","bids":[{"px":64000,"sz":1.2,"count":0}],"asks":[{"px":64001,"sz":0.8,"count":0}],"depth":20,"source":"coinbase l2","is_live":true,"ts_ms":1}"#
+        guard case .depth(let d) = try ServerFrame.decode(Data(json.utf8)) else {
+            return XCTFail("expected depth")
+        }
+        XCTAssertNil(d.bids.first?.mm)
+        XCTAssertNil(d.asks.first?.mm)
+    }
+
     func testDecodeTapeFrameAggressorBuy() throws {
         let json = #"{"type":"tape","symbol":"AAPL","px":190.12,"sz":100,"aggressor":"buy","ts_ms":5,"is_live":true}"#
         guard case .tape(let p) = try ServerFrame.decode(Data(json.utf8)) else {

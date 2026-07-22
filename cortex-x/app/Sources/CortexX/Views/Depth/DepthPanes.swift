@@ -34,6 +34,10 @@ struct DomLadder: View {
         var spread: Double?
         var bidTotal: Double
         var askTotal: Double
+        /// True when the venue route-attributes levels (IBKR L2 marketMaker) —
+        /// then the montage shows a DAS-style MM route column. False for
+        /// anonymous/aggregated books (Coinbase) and delayed L1.
+        var hasRoutes: Bool
         var isEmpty: Bool { bids.isEmpty && asks.isEmpty }
     }
 
@@ -47,7 +51,8 @@ struct DomLadder: View {
             mid: DepthLadder.mid(bestBid: bids.first?.px, bestAsk: asks.first?.px),
             spread: DepthLadder.spread(bestBid: bids.first?.px, bestAsk: asks.first?.px),
             bidTotal: DepthMontage.cumulativeSize(bids),
-            askTotal: DepthMontage.cumulativeSize(asks)
+            askTotal: DepthMontage.cumulativeSize(asks),
+            hasRoutes: bids.contains { $0.mm != nil } || asks.contains { $0.mm != nil }
         )
     }
 
@@ -62,7 +67,7 @@ struct DomLadder: View {
         VStack(spacing: 0) {
             insideStrip(b)
             Divider().overlay(Theme.line)
-            columnHeader
+            columnHeader(b.hasRoutes)
             Divider().overlay(Theme.line)
             columns(b)
         }
@@ -89,9 +94,13 @@ struct DomLadder: View {
                 .font(.system(size: 8, weight: .semibold))
                 .tracking(1.2)
                 .foregroundStyle(Theme.dim)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
             Text(value)
                 .font(.system(size: 12, weight: .medium).monospacedDigit())
                 .foregroundStyle(color)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
         }
     }
 
@@ -120,10 +129,16 @@ struct DomLadder: View {
 
     // MARK: Column header (matches the montage columns exactly)
 
-    private var columnHeader: some View {
+    /// Column labels matching the montage. When the book is route-attributed
+    /// (IBKR L2) an "MM" label sits at each outer rail, DAS-style; otherwise the
+    /// outer label is just SIZE.
+    private func columnHeader(_ hasRoutes: Bool) -> some View {
         HStack(spacing: 0) {
-            // Left (bid) half: SIZE at the outer rail, BID by the spine.
+            // Left (bid) half: [MM] SIZE at the outer rail, BID by the spine.
             HStack(spacing: 0) {
+                if hasRoutes {
+                    DeckHeaderCell("mm").frame(width: Self.routeWidth, alignment: .leading)
+                }
                 DeckHeaderCell("size")
                 Spacer(minLength: 0)
                 Text("BID")
@@ -133,7 +148,7 @@ struct DomLadder: View {
                     .padding(.trailing, 6)
             }
             .frame(maxWidth: .infinity)
-            // Right (ask) half: ASK by the spine, SIZE at the outer rail.
+            // Right (ask) half: ASK by the spine, SIZE [MM] at the outer rail.
             HStack(spacing: 0) {
                 Text("ASK")
                     .font(.system(size: 10, weight: .semibold))
@@ -142,6 +157,9 @@ struct DomLadder: View {
                     .padding(.leading, 6)
                 Spacer(minLength: 0)
                 DeckHeaderCell("size")
+                if hasRoutes {
+                    DeckHeaderCell("mm").frame(width: Self.routeWidth, alignment: .trailing)
+                }
             }
             .frame(maxWidth: .infinity)
         }
@@ -149,6 +167,10 @@ struct DomLadder: View {
         .padding(.vertical, 6)
         .background(Theme.ink)
     }
+
+    /// Width reserved at the outer rail for the DAS-style MM route badge when the
+    /// book is attributed (equity IBKR L2). Zero-cost when hidden.
+    static let routeWidth: CGFloat = 38
 
     // MARK: Columns (the montage body)
 
@@ -169,10 +191,17 @@ struct DomLadder: View {
                 let askRows = DepthMontage.column(
                     b.asks, rowHeight: Double(Self.rowHeight), capacity: capacity, topY: 0
                 )
+                // Scale the depth histogram to the largest VISIBLE level, not the
+                // whole book — a huge resting size below the fold must not squash
+                // every drawn bar to a sliver.
+                let visMax = DepthLadder.maxSize(
+                    bids: bidRows.map(\.level), asks: askRows.map(\.level)
+                )
                 Canvas(opaque: true, rendersAsynchronously: false) { ctx, size in
                     MontageCanvas(
                         bidRows: bidRows, askRows: askRows,
-                        maxSize: b.maxSize, inset: Self.rowInset
+                        maxSize: visMax, inset: Self.rowInset,
+                        routeWidth: b.hasRoutes ? Self.routeWidth : 0
                     ).draw(in: ctx, size: size)
                 }
                 .contentShape(Rectangle())
@@ -209,6 +238,9 @@ private struct MontageCanvas {
     let askRows: [MontageRow]
     let maxSize: Double
     let inset: CGFloat
+    /// Width of the DAS-style MM route column at each outer rail; 0 = the book
+    /// is anonymous (crypto / delayed) and no route badges are drawn.
+    var routeWidth: CGFloat = 0
 
     func draw(in ctx: GraphicsContext, size: CGSize) {
         // Opaque ink base (the Canvas is declared opaque for the perf win).
@@ -276,13 +308,32 @@ private struct MontageCanvas {
             anchor: isBid ? .trailing : .leading
         )
 
-        // SIZE at the outer rail (secondary).
+        // MM route badge at the very outer rail (DAS-style), when attributed.
+        // Bids: [MM][SIZE]…PRICE ; asks: PRICE…[SIZE][MM] — MM hugs the outer
+        // edge, SIZE sits just inside the reserved route column.
+        if routeWidth > 0, let mm = level.mm, !mm.isEmpty {
+            // GraphicsContext.draw doesn't clip — cap the id so a long MPID can't
+            // spill into the SIZE column (MPIDs are ≤4 chars; 5 is a safe bound).
+            let badge = mm.count > 5 ? String(mm.prefix(5)) : mm
+            let routeText = Text(badge)
+                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .foregroundStyle(row.isBest ? Theme.ember : Theme.ember.opacity(0.7))
+            ctx.draw(
+                routeText,
+                at: CGPoint(x: isBid ? inset + 2 : width - inset - 2, y: cy),
+                anchor: isBid ? .leading : .trailing
+            )
+        }
+
+        // SIZE at the outer rail (secondary), shifted inward past the route
+        // column when the book is attributed.
         let sizeText = Text(DashFormat.qty(level.sz))
             .font(.system(size: 10, weight: row.isBest ? .medium : .regular).monospacedDigit())
             .foregroundStyle(row.isBest ? Theme.bone : Theme.dim)
+        let sizeInset = inset + 3 + routeWidth
         ctx.draw(
             sizeText,
-            at: CGPoint(x: isBid ? inset + 3 : width - inset - 3, y: cy),
+            at: CGPoint(x: isBid ? sizeInset : width - sizeInset, y: cy),
             anchor: isBid ? .leading : .trailing
         )
     }

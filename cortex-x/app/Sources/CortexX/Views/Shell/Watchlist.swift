@@ -292,23 +292,32 @@ private struct WatchlistRow: View {
                         Text(symbol)
                             .font(.system(size: 12, weight: isSelected ? .semibold : .medium))
                             .foregroundStyle(Theme.bone)
+                            .lineLimit(1)
                         if let pos = model.positions[symbol], abs(pos.qty) > 1e-12 {
                             Text(pos.qty > 0 ? "Long \(Fmt.qty(abs(pos.qty)))" : "Short \(Fmt.qty(abs(pos.qty)))")
                                 .font(.system(size: 9, weight: .medium))
                                 .foregroundStyle(pos.qty > 0 ? Theme.up : Theme.down)
+                                .lineLimit(1)
                         }
                     }
-                    Spacer()
+                    Spacer(minLength: 4)
+                    // The price column wins the width fight so the symbol side
+                    // truncates first at the 160pt-min rail; the price shrinks
+                    // before truncating.
                     VStack(alignment: .trailing, spacing: 2) {
                         Text(model.lastPrice(symbol).map(Fmt.price) ?? "—")
                             .numeric(size: 12, weight: .medium)
                             .foregroundStyle(Theme.bone)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
                         if let pct = model.sessionChangePct(symbol) {
                             Text(Fmt.signedPct(pct))
                                 .numeric(size: 10)
                                 .foregroundStyle(Theme.pnlColor(pct))
+                                .lineLimit(1)
                         }
                     }
+                    .layoutPriority(1)
                 }
                 .padding(.leading, 4)
                 .padding(.vertical, 7)

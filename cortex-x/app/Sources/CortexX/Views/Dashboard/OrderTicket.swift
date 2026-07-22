@@ -22,9 +22,27 @@ struct OrderTicket: View {
     @State private var limitText = ""
     @State private var stopText = ""
     @State private var showHelp = false
-    /// Non-nil while a real-money order is awaiting its explicit confirmation.
-    @State private var pendingLiveSide: Side?
+    /// Non-nil while a real-money action is awaiting its explicit confirmation —
+    /// an entry (BUY/SELL) OR a position unwind (FLATTEN/REVERSE). Every path to
+    /// a live broker funnels through here so no real-money order fires unconfirmed.
+    @State private var pendingLive: PendingLiveOrder?
     @FocusState private var focus: TicketFocus?
+
+    /// A real-money action staged for one explicit confirmation before it fires
+    /// at a connected LIVE broker. Paper / IBKR-paper never stages — it dispatches
+    /// immediately, so the common path is untouched.
+    private enum PendingLiveOrder: Equatable {
+        case entry(Side)
+        case flatten
+        case reverse
+        var label: String {
+            switch self {
+            case .entry(let s): "Send \(s == .buy ? "BUY" : "SELL") — real money"
+            case .flatten: "FLATTEN position — real money"
+            case .reverse: "REVERSE position — real money"
+            }
+        }
+    }
 
     /// SETTINGS ▸ PREFERENCES: require an explicit confirmation before any order
     /// that would route to a LIVE broker account. On by default — a real-money
@@ -76,7 +94,9 @@ struct OrderTicket: View {
     private var effectiveQty: Double? {
         switch sizingMode {
         case .shares:
-            return Self.parse(qtyText)
+            // Floor equities to whole shares (crypto stays fractional) — same
+            // rule the $/% modes apply, so a typed "10.7" can't submit 10.7 AAPL.
+            return OrderSizing.normalize(shares: Self.parse(qtyText), whole: whole)
         case .dollars:
             guard let d = Self.parse(dollarText), let p = price else { return nil }
             return OrderSizing.shares(dollars: d, price: p, whole: whole)
@@ -179,7 +199,10 @@ struct OrderTicket: View {
         .animation(DeckMotion.ease(), value: focus)
         .onChange(of: orderType) { _, _ in seedPricesIfNeeded() }
         .onChange(of: model.selectedSymbol) { _, _ in
-            if symbolOverride == nil { seedPricesIfNeeded() }
+            // New instrument → drop the previous symbol's literal limit/stop
+            // prices BEFORE reseeding, so a $190 equity's stop can never be
+            // submitted against a $43k crypto.
+            if symbolOverride == nil { resetPricesForNewSymbol() }
         }
         // The LEVEL 2 depth-ladder click seam: a price the operator clicked in
         // the montage lands in `model.pendingTicketPrice`; seat it into the
@@ -191,17 +214,21 @@ struct OrderTicket: View {
         .confirmationDialog(
             "Place a LIVE order?",
             isPresented: Binding(
-                get: { pendingLiveSide != nil },
-                set: { if !$0 { pendingLiveSide = nil } }
+                get: { pendingLive != nil },
+                set: { if !$0 { pendingLive = nil } }
             ),
             titleVisibility: .visible,
-            presenting: pendingLiveSide
-        ) { s in
-            Button("Send \(s == .buy ? "BUY" : "SELL") — real money", role: .destructive) {
-                dispatch(s)
-                pendingLiveSide = nil
+            presenting: pendingLive
+        ) { action in
+            Button(action.label, role: .destructive) {
+                switch action {
+                case .entry(let s): dispatch(s)
+                case .flatten: performFlatten()
+                case .reverse: performReverse()
+                }
+                pendingLive = nil
             }
-            Button("Cancel", role: .cancel) { pendingLiveSide = nil }
+            Button("Cancel", role: .cancel) { pendingLive = nil }
         } message: { _ in
             Text("This routes to your live broker account. Real money — orders execute at your broker.")
         }
@@ -642,19 +669,25 @@ struct OrderTicket: View {
     }
 
     private var flattenReverseRow: some View {
-        HStack(spacing: 8) {
+        // FLATTEN and REVERSE gate SEPARATELY: closing is allowed under a kill
+        // switch, but reversing (which opens a LARGER opposite position) is not —
+        // it must never be a way around a halt.
+        let noPosition = position == nil || model.connection != .connected
+        return HStack(spacing: 8) {
             Button { flatten() } label: {
                 Text("FLATTEN").frame(maxWidth: .infinity)
             }
             .buttonStyle(DeckTintedButtonStyle(tint: Theme.bone, border: Theme.line))
+            .disabled(noPosition)
+            .opacity(noPosition ? 0.45 : 1)
 
             Button { reverse() } label: {
                 Text("REVERSE").frame(maxWidth: .infinity)
             }
             .buttonStyle(DeckTintedButtonStyle(tint: Theme.bone, border: Theme.line))
+            .disabled(noPosition || model.risk.kill_switch)
+            .opacity(noPosition || model.risk.kill_switch ? 0.45 : 1)
         }
-        .disabled(position == nil || model.connection != .connected)
-        .opacity(position == nil ? 0.45 : 1)
         .help(position == nil ? "no position on \(symbol)" : "market unwind of \(symbol)")
     }
 
@@ -668,6 +701,16 @@ struct OrderTicket: View {
         // override is cleared so the ticket simply follows the selection it set.
         symbolOverride = nil
         model.selectSymbol(s)
+        resetPricesForNewSymbol()
+    }
+
+    /// Drop the previous instrument's literal limit/stop prices, then reseed from
+    /// the new symbol's book — a stale price from a different instrument must
+    /// never survive a symbol switch. Sizing ($/%) recomputes off the live price
+    /// via `effectiveQty`, so it is left intact.
+    private func resetPricesForNewSymbol() {
+        limitText = ""
+        stopText = ""
         seedPricesIfNeeded()
     }
 
@@ -759,10 +802,15 @@ struct OrderTicket: View {
         // (unless the operator lowered that backstop in SETTINGS). Paper and
         // IBKR-paper dispatch immediately — the common path is untouched.
         if LiveOrderConfirm.required(isLiveVenue: isLiveVenue, confirmBeforeLive: confirmBeforeLiveOrder) {
-            pendingLiveSide = s
+            pendingLive = .entry(s)
             return
         }
         dispatch(s)
+    }
+
+    /// Whether a real-money action must be confirmed before it fires.
+    private var mustConfirmLive: Bool {
+        LiveOrderConfirm.required(isLiveVenue: isLiveVenue, confirmBeforeLive: confirmBeforeLiveOrder)
     }
 
     /// The final send — after any live confirmation. Re-checks the gate so a
@@ -779,7 +827,16 @@ struct OrderTicket: View {
 
     private func submitArmed() { submit(side) }
 
+    /// FLATTEN: close the position at market. A live venue confirms first (a
+    /// real-money order must never fire unconfirmed); closing is allowed even
+    /// under a kill switch (reducing risk is always desirable).
     private func flatten() {
+        guard position != nil else { return }
+        if mustConfirmLive { pendingLive = .flatten; return }
+        performFlatten()
+    }
+
+    private func performFlatten() {
         guard let p = position, let a = PositionAction.flatten(positionQty: p.qty) else { return }
         model.placeOrder(
             symbol: p.symbol, side: a.side, qty: a.qty, type: .market,
@@ -787,8 +844,18 @@ struct OrderTicket: View {
         )
     }
 
+    /// REVERSE: flip to a 2×|qty| opposite position at market. Blocked under a
+    /// kill switch (it OPENS a larger position — the opposite of a halt) and
+    /// confirmed first on a live venue.
     private func reverse() {
-        guard let p = position, let a = PositionAction.reverse(positionQty: p.qty) else { return }
+        guard position != nil, !model.risk.kill_switch else { return }
+        if mustConfirmLive { pendingLive = .reverse; return }
+        performReverse()
+    }
+
+    private func performReverse() {
+        guard !model.risk.kill_switch,
+            let p = position, let a = PositionAction.reverse(positionQty: p.qty) else { return }
         model.placeOrder(
             symbol: p.symbol, side: a.side, qty: a.qty, type: .market,
             limitPx: nil, stopPx: nil

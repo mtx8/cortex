@@ -6,18 +6,23 @@ import SwiftUI
 struct FillsTable: View {
     @Environment(AppModel.self) private var model
 
+    /// Column floor below which the table scrolls horizontally rather than
+    /// crushing its columns.
+    private static let minTableWidth: CGFloat = 500
+
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            if model.fills.isEmpty {
-                DeckEmpty(text: "no fills")
-            } else {
-                ScrollView {
+        ScrollView([.horizontal, .vertical]) {
+            VStack(spacing: 0) {
+                header
+                if model.fills.isEmpty {
+                    DeckEmpty(text: "no fills")
+                } else {
                     LazyVStack(spacing: 0) {
                         ForEach(model.fills) { row($0) }
                     }
                 }
             }
+            .frame(minWidth: Self.minTableWidth, alignment: .leading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }

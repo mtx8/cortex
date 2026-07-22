@@ -7,18 +7,23 @@ import SwiftUI
 struct OrdersTable: View {
     @Environment(AppModel.self) private var model
 
+    /// Column floor below which the table scrolls horizontally instead of
+    /// crushing its columns (fixed cols + symbol min + spacing + padding).
+    private static let minTableWidth: CGFloat = 620
+
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            if model.orders.isEmpty {
-                DeckEmpty(text: "no orders")
-            } else {
-                ScrollView {
+        ScrollView([.horizontal, .vertical]) {
+            VStack(spacing: 0) {
+                header
+                if model.orders.isEmpty {
+                    DeckEmpty(text: "no orders")
+                } else {
                     LazyVStack(spacing: 0) {
                         ForEach(model.orders) { row($0) }
                     }
                 }
             }
+            .frame(minWidth: Self.minTableWidth, alignment: .leading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }

@@ -18,6 +18,17 @@ final class OrderTicketSupportTests: XCTestCase {
         XCTAssertEqual(OrderSizing.shares(dollars: 950, price: 190, whole: true), 5)
     }
 
+    func testNormalizeSharesFloorsEquityKeepsCrypto() {
+        // A typed SHARES count follows the same rule as $/% sizing.
+        XCTAssertEqual(OrderSizing.normalize(shares: 10.7, whole: true), 10)  // equity floors
+        XCTAssertEqual(OrderSizing.normalize(shares: 10, whole: true), 10)
+        XCTAssertEqual(OrderSizing.normalize(shares: 0.5, whole: false), 0.5) // crypto fractional
+        XCTAssertNil(OrderSizing.normalize(shares: 0.7, whole: true))         // floors to 0 → nil
+        XCTAssertNil(OrderSizing.normalize(shares: .nan, whole: true))
+        XCTAssertNil(OrderSizing.normalize(shares: -3, whole: false))
+        XCTAssertNil(OrderSizing.normalize(shares: nil, whole: true))
+    }
+
     func testDollarSharesCryptoKeepsFraction() {
         // $1,000 of a $40,000 coin = 0.025 units, unfloored.
         let s = try? XCTUnwrap(OrderSizing.shares(dollars: 1_000, price: 40_000, whole: false))

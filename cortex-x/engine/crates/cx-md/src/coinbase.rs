@@ -419,21 +419,15 @@ impl DepthBook {
             .iter()
             .rev()
             .take(DEPTH_LEVELS)
-            .map(|(&k, &sz)| BookLevel {
-                px: f64::from_bits(k),
-                sz,
-                count: 0,
-            })
+            // Coinbase level2 is an anonymous aggregated book — no market-maker
+            // attribution, so every level is `mm: None` (never a fabricated id).
+            .map(|(&k, &sz)| BookLevel::agg(f64::from_bits(k), sz, 0))
             .collect();
         let asks: Vec<BookLevel> = self
             .asks
             .iter()
             .take(DEPTH_LEVELS)
-            .map(|(&k, &sz)| BookLevel {
-                px: f64::from_bits(k),
-                sz,
-                count: 0,
-            })
+            .map(|(&k, &sz)| BookLevel::agg(f64::from_bits(k), sz, 0))
             .collect();
         BookDepth {
             symbol: self.symbol.clone(),

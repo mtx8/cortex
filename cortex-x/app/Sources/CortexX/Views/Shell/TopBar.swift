@@ -22,6 +22,8 @@ struct TopBar: View {
                         .font(.system(size: 10, weight: .bold))
                         .tracking(1.2)
                         .foregroundStyle(Theme.down)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                 }
                 .padding(.horizontal, 10)
                 .padding(.vertical, 4)
@@ -53,14 +55,21 @@ struct TopBar: View {
     }
 
     private func vital(_ label: String, _ value: String, _ color: Color) -> some View {
+        // Single-line + intrinsic width so a spaced label ("day p&l") or a wide
+        // money value never wraps onto a second line when the bar is compressed —
+        // the bar clips at its trailing edge instead of misaligning.
         VStack(alignment: .leading, spacing: 1) {
             Text(label.uppercased())
                 .font(.system(size: 8, weight: .semibold))
                 .tracking(1.2)
                 .foregroundStyle(Theme.dim)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
             Text(value)
                 .numeric(size: 12, weight: .medium)
                 .foregroundStyle(color)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
         }
     }
 
@@ -86,6 +95,8 @@ struct TopBar: View {
                 .font(.system(size: 10, weight: s.isLive ? .bold : .semibold))
                 .tracking(1.2)
                 .foregroundStyle(s.textColor)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
             if s.showDot {
                 Circle()
                     .fill(s.dotColor)

@@ -40,6 +40,16 @@ enum OrderSizing {
         return sized > 0 ? sized : nil
     }
 
+    /// Normalize a directly-entered share count to the instrument's rule: floor
+    /// equities to whole shares, keep crypto fractional. The SHARES sizing mode
+    /// routes through here so a typed "10.7" on an equity floors to 10 exactly
+    /// like the $/% modes do, instead of submitting 10.7 shares.
+    static func normalize(shares: Double?, whole: Bool) -> Double? {
+        guard let s = shares, s.isFinite, s > 0 else { return nil }
+        let sized = whole ? s.rounded(.down) : s
+        return sized > 0 ? sized : nil
+    }
+
     /// Shares from a fraction of buying power (0.25 = 25%) at `price`. Routes
     /// through `shares` so the whole-vs-fractional rule is shared.
     static func sharesFromBuyingPower(

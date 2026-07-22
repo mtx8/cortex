@@ -218,10 +218,18 @@ struct RegimesView: View {
             if labeled {
                 SectionLabel(text: "equities")
             }
-            HStack(alignment: .top, spacing: 10) {
-                ForEach(RegimeColumnKind.allCases, id: \.self) { column in
-                    boardColumn(column, rows: partitioned[column] ?? [])
-                        .frame(maxWidth: .infinity)
+            // Five columns fill the pane when there's room, but never shrink
+            // below a readable floor — below that the board scrolls horizontally
+            // instead of crushing the two-word column headers.
+            GeometryReader { geo in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(alignment: .top, spacing: 10) {
+                        ForEach(RegimeColumnKind.allCases, id: \.self) { column in
+                            boardColumn(column, rows: partitioned[column] ?? [])
+                                .frame(minWidth: 160, maxWidth: .infinity)
+                        }
+                    }
+                    .frame(minWidth: geo.size.width, alignment: .leading)
                 }
             }
         }

@@ -62,6 +62,10 @@ struct DeckMetric: View {
                 .numeric(size: size, weight: weight)
                 .foregroundStyle(color)
                 .lineLimit(1)
+                // Shrink a wide money value before truncating, so a narrow deck
+                // shows "$1,234,567" scaled down rather than a useless "$1,2…".
+                .minimumScaleFactor(0.7)
+                .truncationMode(.tail)
         }
     }
 }

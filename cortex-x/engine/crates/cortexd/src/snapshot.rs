@@ -503,8 +503,8 @@ mod tests {
     fn sample_depth(symbol: &str) -> BookDepth {
         BookDepth {
             symbol: symbol.to_string(),
-            bids: vec![BookLevel { px: 100.0, sz: 1.0, count: 1 }],
-            asks: vec![BookLevel { px: 101.0, sz: 1.0, count: 1 }],
+            bids: vec![BookLevel::agg(100.0, 1.0, 1)],
+            asks: vec![BookLevel::agg(101.0, 1.0, 1)],
             depth: 1,
             source: "test".into(),
             is_live: true,

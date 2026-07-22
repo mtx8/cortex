@@ -60,12 +60,43 @@ impl BookTop {
 
 /// One price level of an order book (LEVEL 2 depth). `count` is the number of
 /// resting orders at that price; it is `0` when the venue aggregates size only
-/// and omits the order count (Coinbase level2), never a fabricated value.
+/// and omits the order count (Coinbase level2), never a fabricated value. `mm`
+/// is the market-maker / ECN route id for THIS level (DAS-style attribution),
+/// present ONLY when the venue actually attributes it — IBKR `reqMktDepth`
+/// (non-smart, per-exchange) supplies a `marketMaker` string for equities with
+/// a Level 2 subscription (NASDAQ TotalView etc.). It is `None` for aggregated /
+/// anonymous books (Coinbase level2) and for delayed L1, never a fabricated id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BookLevel {
     pub px: f64,
     pub sz: f64,
     pub count: u32,
+    /// Market-maker / venue route id for this level (e.g. "NSDQ", "ARCA",
+    /// "EDGX"), or `None` when the book is anonymous/aggregated or delayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm: Option<String>,
+}
+
+impl BookLevel {
+    /// An anonymous / aggregated level (no market-maker attribution) — Coinbase
+    /// level2, delayed L1, and any book the venue does not route-attribute.
+    pub fn agg(px: f64, sz: f64, count: u32) -> Self {
+        Self { px, sz, count, mm: None }
+    }
+
+    /// A market-maker-attributed level — an IBKR `reqMktDepth` `marketMaker`
+    /// string (DAS-style route). Blank / whitespace-only ids collapse to `None`
+    /// so the UI never shows an empty route badge.
+    pub fn routed(px: f64, sz: f64, count: u32, mm: impl Into<String>) -> Self {
+        let mm = mm.into();
+        let mm = mm.trim();
+        Self {
+            px,
+            sz,
+            count,
+            mm: if mm.is_empty() { None } else { Some(mm.to_string()) },
+        }
+    }
 }
 
 /// A LEVEL 2 market-depth snapshot for one symbol: the top N levels each side,
@@ -1270,10 +1301,10 @@ mod tests {
         let ev = EngineEvent::Depth(BookDepth {
             symbol: "BTC-USD".into(),
             bids: vec![
-                BookLevel { px: 64_000.5, sz: 1.2, count: 0 },
-                BookLevel { px: 63_999.0, sz: 0.4, count: 0 },
+                BookLevel::agg(64_000.5, 1.2, 0),
+                BookLevel::agg(63_999.0, 0.4, 0),
             ],
-            asks: vec![BookLevel { px: 64_001.0, sz: 0.8, count: 0 }],
+            asks: vec![BookLevel::agg(64_001.0, 0.8, 0)],
             depth: 20,
             source: "coinbase l2".into(),
             is_live: true,
