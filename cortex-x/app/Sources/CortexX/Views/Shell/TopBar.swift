@@ -8,6 +8,7 @@ struct TopBar: View {
     var body: some View {
         HStack(spacing: 20) {
             brand
+            SymbolSearchField()
             Divider().frame(height: 16).overlay(Theme.line)
             vital("equity", Fmt.money(model.account.equity), Theme.bone)
             vital("day p&l", Fmt.signedMoney(model.account.realized_pnl_day + model.account.unrealized_pnl),

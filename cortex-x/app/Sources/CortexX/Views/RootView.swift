@@ -24,6 +24,7 @@ struct RootView: View {
     var body: some View {
         VStack(spacing: 0) {
             TopBar()
+                .zIndex(1) // so the global symbol-search dropdown floats over the content below
             Divider().overlay(Theme.line)
             HStack(spacing: 0) {
                 IconRail()

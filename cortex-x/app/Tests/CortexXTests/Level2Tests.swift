@@ -368,6 +368,61 @@ final class Level2Tests: XCTestCase {
         XCTAssertTrue(b.note.contains("delayed"))
     }
 
+    // MARK: Side-by-side montage geometry (DepthMontage)
+
+    func testMontageRowCapacityFloorsAndIsNaNSafe() {
+        XCTAssertEqual(DepthMontage.rowCapacity(height: 100, rowHeight: 22), 4) // 100/22 = 4.5 -> 4
+        XCTAssertEqual(DepthMontage.rowCapacity(height: 22, rowHeight: 22), 1)
+        XCTAssertEqual(DepthMontage.rowCapacity(height: 10, rowHeight: 22), 0)  // shorter than one row
+        XCTAssertEqual(DepthMontage.rowCapacity(height: .nan, rowHeight: 22), 0)
+        XCTAssertEqual(DepthMontage.rowCapacity(height: 100, rowHeight: 0), 0)
+        XCTAssertEqual(DepthMontage.rowCapacity(height: -5, rowHeight: 22), 0)
+    }
+
+    func testMontageColumnBuildsRankedRowsBestFirstCappedToCapacity() {
+        let bids = DepthLadder.sortedBids([level(190.00, 1), level(190.10, 2), level(190.05, 3)])
+        let rows = DepthMontage.column(bids, rowHeight: 20, capacity: 2, topY: 0)
+        XCTAssertEqual(rows.count, 2)                          // capped to capacity
+        XCTAssertEqual(rows.map(\.level.px), [190.10, 190.05]) // best-first
+        XCTAssertEqual(rows.map(\.rank), [0, 1])               // 0 = inside market
+        XCTAssertTrue(rows[0].isBest)
+        XCTAssertFalse(rows[1].isBest)
+        XCTAssertEqual(rows[0].minY, 0)
+        XCTAssertEqual(rows[1].minY, 20)                       // stacked by rowHeight
+        XCTAssertEqual(rows[1].maxY, 40)
+    }
+
+    func testMontageColumnEmptyOnZeroCapacityOrRowHeight() {
+        let asks = DepthLadder.sortedAsks([level(101, 1)])
+        XCTAssertTrue(DepthMontage.column(asks, rowHeight: 20, capacity: 0, topY: 0).isEmpty)
+        XCTAssertTrue(DepthMontage.column(asks, rowHeight: 0, capacity: 5, topY: 0).isEmpty)
+    }
+
+    func testMontageLevelHitTestIsHalfOpenAndBoundedByRows() {
+        let bids = DepthLadder.sortedBids([level(190.10, 2), level(190.05, 3)])
+        let rows = DepthMontage.column(bids, rowHeight: 20, capacity: 5, topY: 0)
+        XCTAssertEqual(DepthMontage.level(atY: 0, rows: rows)?.px, 190.10)   // top of row 0
+        XCTAssertEqual(DepthMontage.level(atY: 19.9, rows: rows)?.px, 190.10)
+        XCTAssertEqual(DepthMontage.level(atY: 20, rows: rows)?.px, 190.05)  // half-open: boundary -> next row
+        XCTAssertEqual(DepthMontage.level(atY: 39.9, rows: rows)?.px, 190.05)
+        XCTAssertNil(DepthMontage.level(atY: 40, rows: rows))                // past the last row
+        XCTAssertNil(DepthMontage.level(atY: -1, rows: rows))
+    }
+
+    func testMontageCumulativeSizeSkipsInvalid() {
+        let levels = [level(1, 10), level(2, 5), level(3, .nan), level(4, -2)]
+        XCTAssertEqual(DepthMontage.cumulativeSize(levels), 15, accuracy: 1e-9)
+        XCTAssertEqual(DepthMontage.cumulativeSize([]), 0)
+    }
+
+    func testMontageImbalanceSignedClampedAndEmptySafe() {
+        XCTAssertEqual(DepthMontage.imbalance(bidTotal: 75, askTotal: 25), 0.5, accuracy: 1e-9)  // bid-heavy
+        XCTAssertEqual(DepthMontage.imbalance(bidTotal: 25, askTotal: 75), -0.5, accuracy: 1e-9) // ask-heavy
+        XCTAssertEqual(DepthMontage.imbalance(bidTotal: 50, askTotal: 50), 0, accuracy: 1e-9)
+        XCTAssertEqual(DepthMontage.imbalance(bidTotal: 0, askTotal: 0), 0)   // empty book, no divide-by-zero
+        XCTAssertEqual(DepthMontage.imbalance(bidTotal: 10, askTotal: 0), 1)  // one-sided clamps to ±1
+    }
+
     // MARK: Fixtures
 
     private func level(_ px: Double, _ sz: Double, count: UInt32 = 0) -> BookLevel {

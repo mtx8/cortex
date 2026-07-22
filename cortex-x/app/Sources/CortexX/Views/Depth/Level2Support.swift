@@ -214,6 +214,75 @@ enum LadderGeometry {
     }
 }
 
+// MARK: - Two-column montage layout (modern side-by-side bid | ask)
+
+/// One montage row: a single price level in one column, in top→bottom display
+/// order — the inside market (best bid / best ask) at the TOP, deeper levels
+/// below. The Canvas paints these rows and the click hit-test maps a click y
+/// back to one, so the pixels the operator sees and the price a click seats into
+/// the ticket can never drift apart.
+struct MontageRow: Equatable {
+    var minY: Double
+    var height: Double
+    var level: BookLevel
+    /// 0 = inside market (best bid/ask), increasing away from the spread.
+    var rank: Int
+    var isBest: Bool { rank == 0 }
+    var maxY: Double { minY + height }
+}
+
+/// Pure geometry for the side-by-side Level 2 montage: bids fill the LEFT column
+/// best-first from the top, asks the RIGHT column best-first from the top. Both
+/// columns share ONE row height and top origin, so the best bid and best ask sit
+/// on the same top row, flanking the spread. NaN-safe; no SwiftUI here so the row
+/// math + click mapping stay unit-tested independent of the renderer.
+enum DepthMontage {
+    /// How many level rows fit a column of `height` at `rowHeight`. Non-finite /
+    /// non-positive geometry fits none.
+    static func rowCapacity(height: Double, rowHeight: Double) -> Int {
+        guard height.isFinite, height > 0, rowHeight.isFinite, rowHeight > 0 else { return 0 }
+        return max(0, Int((height / rowHeight).rounded(.down)))
+    }
+
+    /// Build ONE column's top→bottom rows from best-first levels, capped to what
+    /// fits. `topY` is where the first row starts; the best level is rank 0 at the
+    /// top. A non-positive capacity / row height yields no rows.
+    static func column(
+        _ bestFirst: [BookLevel], rowHeight: Double, capacity: Int, topY: Double
+    ) -> [MontageRow] {
+        guard rowHeight.isFinite, rowHeight > 0, capacity > 0 else { return [] }
+        var out: [MontageRow] = []
+        var y = topY.isFinite ? topY : 0
+        for (i, level) in bestFirst.prefix(capacity).enumerated() {
+            out.append(MontageRow(minY: y, height: rowHeight, level: level, rank: i))
+            y += rowHeight
+        }
+        return out
+    }
+
+    /// The level whose drawn row spans `y`, or nil past the last row. Rows are
+    /// half-open `[minY, maxY)` so adjacent rows never both claim a boundary pixel.
+    static func level(atY y: Double, rows: [MontageRow]) -> BookLevel? {
+        for row in rows where y >= row.minY && y < row.maxY { return row.level }
+        return nil
+    }
+
+    /// Sum of a side's visible sizes — the cumulative depth for the imbalance
+    /// readout. Non-finite / non-positive sizes are skipped.
+    static func cumulativeSize(_ levels: [BookLevel]) -> Double {
+        levels.reduce(0) { $0 + (($1.sz.isFinite && $1.sz > 0) ? $1.sz : 0) }
+    }
+
+    /// Book imbalance in −1…1: (bid − ask) / (bid + ask). 0 when both sides are
+    /// empty. Positive = bid-heavy (resting buy pressure), negative = ask-heavy.
+    static func imbalance(bidTotal: Double, askTotal: Double) -> Double {
+        let sum = bidTotal + askTotal
+        guard sum.isFinite, sum > 0 else { return 0 }
+        let v = (bidTotal - askTotal) / sum
+        return Swift.min(Swift.max(v, -1), 1)
+    }
+}
+
 // MARK: - Tape aggressor tone
 
 /// The direction a tape print pushed the market, decoupled from SwiftUI so the
