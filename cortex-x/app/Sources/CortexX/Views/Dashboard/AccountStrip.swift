@@ -83,7 +83,7 @@ struct DeckDrawdownBar: View {
 
     private var color: Color {
         if fraction >= 0.85 { return Theme.down }
-        if fraction >= 0.5 { return Theme.warn }
+        if fraction >= 0.5 { return Theme.ember }
         return Theme.bone
     }
 

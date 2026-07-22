@@ -612,10 +612,11 @@ private struct NewsItemRow: View {
     @State private var hovering = false
 
     private var toneColor: Color {
-        guard item.tone.isFinite else { return Theme.dim }
-        if item.tone > 0 { return Theme.up }
-        if item.tone < 0 { return Theme.down }
-        return Theme.dim
+        // Sentiment is NOT money direction — keep green/red reserved for P&L /
+        // returns. The +/- sign carries polarity; the value reads in bone (dim
+        // when zero / non-finite).
+        guard item.tone.isFinite, item.tone != 0 else { return Theme.dim }
+        return Theme.bone
     }
 
     private var toneText: String {

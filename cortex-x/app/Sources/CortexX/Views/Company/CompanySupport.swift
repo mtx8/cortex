@@ -226,10 +226,10 @@ struct CompanyNewsRow: View {
     @State private var hovering = false
 
     private var toneColor: Color {
-        guard item.tone.isFinite else { return Theme.dim }
-        if item.tone > 0 { return Theme.up }
-        if item.tone < 0 { return Theme.down }
-        return Theme.dim
+        // Sentiment ≠ money direction — green/red stay reserved for P&L/returns.
+        // The +/- sign carries polarity; bone value, dim when zero/non-finite.
+        guard item.tone.isFinite, item.tone != 0 else { return Theme.dim }
+        return Theme.bone
     }
 
     private var toneText: String {

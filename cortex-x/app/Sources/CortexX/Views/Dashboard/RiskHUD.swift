@@ -102,14 +102,9 @@ struct RiskHUD: View {
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(Theme.dim)
                 .frame(width: 48, alignment: .leading)
-            DeckGaugeBar(
-                fraction: caution,
-                style: AnyShapeStyle(LinearGradient(
-                    colors: [Theme.ember, Theme.down],
-                    startPoint: .leading,
-                    endPoint: .trailing
-                ))
-            )
+            // Flat-matte: one solid accent (ember), escalating to the destructive
+            // tone only past a high threshold — never a gradient.
+            DeckGaugeBar(fraction: caution, color: caution >= 0.75 ? Theme.down : Theme.ember)
             Text(String(format: "%.2f", caution))
                 .numeric(size: 10)
                 .foregroundStyle(Theme.dim)
@@ -127,7 +122,7 @@ struct RiskHUD: View {
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(Theme.dim)
                 .frame(width: 48, alignment: .leading)
-            DeckGaugeBar(fraction: 1 - throttle, color: Theme.warn)
+            DeckGaugeBar(fraction: 1 - throttle, color: Theme.ember)
             Text(String(format: "%.2f", throttle))
                 .numeric(size: 10)
                 .foregroundStyle(Theme.dim)
