@@ -49,6 +49,9 @@ enum CompanyFormat {
 
 struct CompanyView: View {
     @Environment(AppModel.self) private var model
+    /// Active board tab. Falls back to overview when the current company lacks the
+    /// selected tab (graph-walking to a company with less data). Reset on symbol.
+    @State private var tab: CompanyTab = .default
 
     /// Stale-card guard: a profile only renders for the company being
     /// inspected (companySymbol — NOT the watchlist selection, so graph
@@ -107,16 +110,165 @@ struct CompanyView: View {
     // MARK: Board
 
     private func board(_ p: CompanyProfile) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let tabs = CompanyTab.available(for: p)
+        // Clamp: walking the graph to a company without the active tab falls back
+        // to overview rather than showing an empty pane.
+        let active = tabs.contains(tab) ? tab : .overview
+        return VStack(alignment: .leading, spacing: 0) {
             header(p)
             Divider().overlay(Theme.line)
-            if CompanyFormat.isMinimal(p) {
-                minimalLayout(p)
-            } else {
-                threeColumns(p)
+            if tabs.count > 1 {
+                tabBar(tabs, active: active)
+                Divider().overlay(Theme.line)
             }
+            tabContent(p, active)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             Divider().overlay(Theme.line)
             footer(p)
+        }
+        .onChange(of: model.companySymbol) { _, _ in tab = .default }
+    }
+
+    // MARK: Tab bar + content router
+
+    private func tabBar(_ tabs: [CompanyTab], active: CompanyTab) -> some View {
+        HStack(spacing: 4) {
+            ForEach(tabs) { t in
+                DeckSegment(title: t.title, isOn: active == t) {
+                    withAnimation(DeckMotion.ease()) { tab = t }
+                }
+                .fixedSize()
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(3)
+        .padding(.horizontal, 13)
+        .padding(.vertical, 5)
+    }
+
+    @ViewBuilder
+    private func tabContent(_ p: CompanyProfile, _ active: CompanyTab) -> some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 18) {
+                switch active {
+                case .overview: overviewTab(p)
+                case .financials:
+                    fundamentalsSection(p)
+                    filingsSection(p)
+                case .statistics: statisticsSection(p)
+                case .supplyChain: supplyChainTab(p)
+                }
+            }
+            .frame(maxWidth: 980, alignment: .leading)
+            .padding(16)
+        }
+    }
+
+    // MARK: Overview tab
+
+    @ViewBuilder
+    private func overviewTab(_ p: CompanyProfile) -> some View {
+        if !p.description.isEmpty {
+            // Left-aligned lede on a reading measure — shares ONE leading edge
+            // with the strip/segments below (no more screen-centered description).
+            Text(p.description)
+                .font(.system(size: 12))
+                .foregroundStyle(Theme.dim)
+                .lineSpacing(2)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 720, alignment: .leading)
+        }
+        overviewStatStrip(p)
+        segmentsSection(p.segments)
+        newsSection(p)
+    }
+
+    /// A compact glance strip for the overview: market cap · revenue · rev yoy ·
+    /// net margin. Reuses the shared metric cell; the fuller grids live under the
+    /// FINANCIALS and STATISTICS tabs.
+    @ViewBuilder
+    private func overviewStatStrip(_ p: CompanyProfile) -> some View {
+        let f = p.fundamentals
+        let cap = CompanyStats.marketCap(shares: f?.shares_outstanding, lastPrice: model.lastPrice(p.symbol))
+        if cap != nil || f != nil {
+            HStack(alignment: .top, spacing: 24) {
+                metric("market cap", CompanyFormat.abbrevMoney(cap))
+                if let f {
+                    metric("revenue", CompanyFormat.abbrevMoney(f.revenue))
+                    metric("rev yoy", CompanyFormat.pct(f.revenue_yoy, signed: true),
+                           tint: f.revenue_yoy.map { Theme.pnlColor($0) })
+                    metric("net margin", CompanyFormat.pct(f.net_margin))
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(12)
+            .panel()
+        }
+    }
+
+    // MARK: Supply-chain tab (suppliers / customers / competitors, collapsible)
+
+    @ViewBuilder
+    private func supplyChainTab(_ p: CompanyProfile) -> some View {
+        GeometryReader { geo in
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 18) {
+                    if geo.size.width >= 720 {
+                        HStack(alignment: .top, spacing: 18) {
+                            CollapsibleSection("suppliers", count: p.suppliers.count) {
+                                relationList(p.suppliers)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            CollapsibleSection("customers", count: p.customers.count) {
+                                relationList(p.customers)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                        }
+                    } else {
+                        CollapsibleSection("suppliers", count: p.suppliers.count) {
+                            relationList(p.suppliers)
+                        }
+                        CollapsibleSection("customers", count: p.customers.count) {
+                            relationList(p.customers)
+                        }
+                    }
+                    CollapsibleSection("competitors", count: p.competitors.count, startsExpanded: false) {
+                        competitorsGrid(p.competitors)
+                    }
+                }
+            }
+        }
+        .frame(minHeight: 320)
+    }
+
+    /// The relation card list (preserves the openCompany graph-walk).
+    @ViewBuilder
+    private func relationList(_ relations: [Relation]) -> some View {
+        if relations.isEmpty {
+            Text("none curated").font(.system(size: 10)).foregroundStyle(Theme.dim)
+        } else {
+            LazyVStack(spacing: 8) {
+                ForEach(relations) { relation in
+                    RelationCard(relation: relation) { symbol in model.openCompany(symbol) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func competitorsGrid(_ competitors: [String]) -> some View {
+        if competitors.isEmpty {
+            Text("none curated").font(.system(size: 10)).foregroundStyle(Theme.dim)
+        } else {
+            LazyVGrid(
+                columns: [GridItem(.adaptive(minimum: 72), spacing: 6)],
+                alignment: .leading, spacing: 6
+            ) {
+                ForEach(competitors, id: \.self) { competitor in
+                    CompetitorChip(name: competitor) { model.openCompany(competitor) }
+                }
+            }
         }
     }
 
@@ -159,74 +311,6 @@ struct CompanyView: View {
         [p.sector, p.industry, p.country]
             .filter { !$0.isEmpty }
             .joined(separator: " · ")
-    }
-
-    private func threeColumns(_ p: CompanyProfile) -> some View {
-        GeometryReader { geo in
-            let side = max(170, min(280, geo.size.width * 0.26))
-            HStack(alignment: .top, spacing: 12) {
-                relationColumn(title: "suppliers", relations: p.suppliers)
-                    .frame(width: side)
-                centerColumn(p)
-                    .frame(maxWidth: .infinity)
-                relationColumn(title: "customers", relations: p.customers)
-                    .frame(width: side)
-            }
-            .padding(12)
-        }
-    }
-
-    // MARK: Relation columns
-
-    private func relationColumn(title: String, relations: [Relation]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                SectionLabel(text: title)
-                Text("\(relations.count)")
-                    .numeric(size: 10)
-                    .foregroundStyle(Theme.dim)
-            }
-            if relations.isEmpty {
-                Text("none curated")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.dim)
-                    .padding(.top, 4)
-            } else {
-                ScrollView(showsIndicators: false) {
-                    LazyVStack(spacing: 8) {
-                        ForEach(relations) { relation in
-                            RelationCard(relation: relation) { symbol in
-                                model.openCompany(symbol)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: Center column
-
-    private func centerColumn(_ p: CompanyProfile) -> some View {
-        ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 18) {
-                if !p.description.isEmpty {
-                    Text(p.description)
-                        .font(.system(size: 11))
-                        .foregroundStyle(Theme.dim)
-                        .lineSpacing(2)
-                        .lineLimit(4)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                segmentsSection(p.segments)
-                fundamentalsSection(p)
-                statisticsSection(p)
-                filingsSection(p)
-                competitorsSection(p.competitors)
-                newsSection(p)
-            }
-            .padding(.vertical, 2)
-        }
     }
 
     @ViewBuilder
@@ -323,9 +407,15 @@ struct CompanyView: View {
     private func statisticsSection(_ p: CompanyProfile) -> some View {
         let f = p.fundamentals
         if f?.shares_outstanding != nil || f?.public_float_usd != nil {
-            let cap = CompanyStats.marketCap(
-                shares: f?.shares_outstanding, lastPrice: model.lastPrice(p.symbol)
-            )
+            let px = model.lastPrice(p.symbol)
+            let cap = CompanyStats.marketCap(shares: f?.shares_outstanding, lastPrice: px)
+            // Float on the SHARE axis so it reads correctly BELOW shares out.
+            let fShares = CompanyStats.floatShares(floatUSD: f?.public_float_usd, lastPrice: px)
+            let fPct = CompanyStats.floatPct(floatShares: fShares, sharesOutstanding: f?.shares_outstanding)
+            // Honesty gate: if the derived float exceeds ~102% of shares out, the
+            // stale-price estimate has broken down — suppress the derived cells
+            // (show —) and keep only the exact reported dollar figure.
+            let derivedOK = (fPct ?? 0) <= 1.02
             VStack(alignment: .leading, spacing: 8) {
                 SectionLabel(text: "statistics")
                 LazyVGrid(
@@ -343,9 +433,19 @@ struct CompanyView: View {
                         note: CompanyStats.sharesNote
                     )
                     CompanyStatCell(
-                        label: CompanyStats.floatLabel,
+                        label: CompanyStats.floatSharesLabel,
+                        value: derivedOK ? "≈ " + CompanyStats.abbrevCount(fShares) : "—",
+                        note: CompanyStats.floatSharesNote
+                    )
+                    CompanyStatCell(
+                        label: CompanyStats.floatPctLabel,
+                        value: derivedOK ? CompanyFormat.pct(fPct) : "—",
+                        note: CompanyStats.floatPctNote
+                    )
+                    CompanyStatCell(
+                        label: CompanyStats.floatUsdLabel,
                         value: CompanyFormat.abbrevMoney(f?.public_float_usd),
-                        note: CompanyStats.floatNote
+                        note: CompanyStats.floatUsdNote
                     )
                 }
                 .padding(12)
@@ -414,54 +514,6 @@ struct CompanyView: View {
                 }
             }
         }
-    }
-
-    @ViewBuilder
-    private func competitorsSection(_ competitors: [String]) -> some View {
-        if !competitors.isEmpty {
-            VStack(alignment: .leading, spacing: 8) {
-                SectionLabel(text: "competitors")
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 72), spacing: 6)],
-                    alignment: .leading, spacing: 6
-                ) {
-                    ForEach(competitors, id: \.self) { competitor in
-                        CompetitorChip(name: competitor) {
-                            // Safe to always attempt: an uncurated symbol just
-                            // returns a minimal profile — no fake data either way.
-                            model.openCompany(competitor)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // MARK: Minimal (crypto / uncurated) layout
-
-    private func minimalLayout(_ p: CompanyProfile) -> some View {
-        ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 18) {
-                if !p.description.isEmpty {
-                    Text(p.description)
-                        .font(.system(size: 12))
-                        .foregroundStyle(Theme.bone)
-                        .lineSpacing(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Text("no supply-chain graph curated for this asset")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.dim)
-                fundamentalsSection(p)
-                statisticsSection(p)
-                filingsSection(p)
-                competitorsSection(p.competitors)
-                newsSection(p)
-            }
-            .frame(maxWidth: 560, alignment: .leading)
-            .padding(16)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: Footer

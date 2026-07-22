@@ -259,17 +259,38 @@ final class IntelViewsTests: XCTestCase {
         XCTAssertFalse(CompanyStats.abbrevCount(24.6e9).contains("$"))
     }
 
-    func testFloatIsLabeledAsDollarsNeverShares() {
-        // The float label/note must read as a DOLLAR value and must never claim
-        // to be a share count — the whole point of the honest labeling.
-        XCTAssertTrue(CompanyStats.floatLabel.contains("$"))
-        XCTAssertTrue(CompanyStats.floatLabel.lowercased().contains("float"))
-        XCTAssertFalse(CompanyStats.floatLabel.lowercased().contains("share"))
-        XCTAssertFalse(CompanyStats.floatNote.lowercased().contains("share"))
-        // The float value formats as money (with a dollar sign)…
-        XCTAssertTrue(CompanyFormat.abbrevMoney(3.2e12).contains("$"))
-        // …while the share-count label is the one that says "share".
+    func testFloatLabelsSeparateDollarFromShareAxis() {
+        // Float on the SHARE axis (count / %) reads as float, NOT dollars; the
+        // demoted $ float cell is the only one carrying a dollar sign.
+        XCTAssertTrue(CompanyStats.floatSharesLabel.lowercased().contains("float"))
+        XCTAssertFalse(CompanyStats.floatSharesLabel.contains("$"))
+        XCTAssertTrue(CompanyStats.floatPctLabel.lowercased().contains("float"))
+        XCTAssertTrue(CompanyStats.floatUsdLabel.contains("$"))
+        // The share-count stat is the one that says "share".
         XCTAssertTrue(CompanyStats.sharesLabel.lowercased().contains("share"))
+    }
+
+    func testFloatSharesDerivationIsNilSafe() {
+        // ≈ dollar float ÷ last price. $2.6T / $220 ≈ 11.8B shares.
+        let fs = try? XCTUnwrap(CompanyStats.floatShares(floatUSD: 2.6e12, lastPrice: 220))
+        XCTAssertEqual(fs ?? .nan, 2.6e12 / 220, accuracy: 1)
+        XCTAssertNil(CompanyStats.floatShares(floatUSD: nil, lastPrice: 220))
+        XCTAssertNil(CompanyStats.floatShares(floatUSD: 2.6e12, lastPrice: nil))
+        XCTAssertNil(CompanyStats.floatShares(floatUSD: 0, lastPrice: 220))
+        XCTAssertNil(CompanyStats.floatShares(floatUSD: -1, lastPrice: 220))
+        XCTAssertNil(CompanyStats.floatShares(floatUSD: .nan, lastPrice: 220))
+        XCTAssertNil(CompanyStats.floatShares(floatUSD: 2.6e12, lastPrice: 0))
+    }
+
+    func testFloatPctIsBoundedAndNilSafe() {
+        // Float shares 11.8B of 15.1B outstanding ≈ 78% — always < 1 for a real
+        // company (float is a subset of outstanding).
+        let pct = try? XCTUnwrap(CompanyStats.floatPct(floatShares: 1.18e10, sharesOutstanding: 1.51e10))
+        XCTAssertEqual(pct ?? .nan, 0.781, accuracy: 0.01)
+        XCTAssertLessThan(pct ?? 2, 1.0)
+        XCTAssertNil(CompanyStats.floatPct(floatShares: nil, sharesOutstanding: 1.51e10))
+        XCTAssertNil(CompanyStats.floatPct(floatShares: 1.18e10, sharesOutstanding: 0))
+        XCTAssertNil(CompanyStats.floatPct(floatShares: .nan, sharesOutstanding: 1.51e10))
     }
 
     // MARK: - Filings ordering (newest-first, defensive)

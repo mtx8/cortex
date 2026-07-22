@@ -19,8 +19,15 @@ enum CompanyStats {
     static let marketCapNote = "shares × last price"
     static let sharesLabel = "shares out"
     static let sharesNote = "shares outstanding"
-    static let floatLabel = "$ float"
-    static let floatNote = "public float (USD, 10-K cover)"
+    // Float shown on the SHARE axis (count + % of shares out) so it reads
+    // correctly BELOW shares outstanding; the exact reported DOLLAR float stays
+    // as a demoted disclosure cell. A dollar figure is never mislabeled a count.
+    static let floatSharesLabel = "public float"
+    static let floatSharesNote = "≈ float ÷ last price"
+    static let floatPctLabel = "float %"
+    static let floatPctNote = "of shares out"
+    static let floatUsdLabel = "$ float"
+    static let floatUsdNote = "public float (USD, dei cover)"
 
     /// Market cap = shares_outstanding × last price, computed CLIENT-side.
     /// nil-safe: any nil, non-finite, or non-positive input yields nil — never
@@ -30,6 +37,27 @@ enum CompanyStats {
               let px = lastPrice, px.isFinite, px > 0 else { return nil }
         let cap = shares * px
         return cap.isFinite ? cap : nil
+    }
+
+    /// Estimated public-float SHARE count ≈ reported dollar float ÷ last price.
+    /// APPROXIMATE — the dollar float (dei:EntityPublicFloat) is a past fiscal-
+    /// cover figure divided by the CURRENT price, so it is disclosed with `≈` and
+    /// gated by the caller on `floatPct <= ~1.02`. nil-safe (never fabricates).
+    static func floatShares(floatUSD: Double?, lastPrice: Double?) -> Double? {
+        guard let usd = floatUSD, usd.isFinite, usd > 0,
+              let px = lastPrice, px.isFinite, px > 0 else { return nil }
+        let shares = usd / px
+        return shares.isFinite ? shares : nil
+    }
+
+    /// Float as a fraction of shares outstanding (0.78 → 78%). A bounded ratio can
+    /// never be mistaken for a share count. nil-safe. The view suppresses the
+    /// derived cells when this exceeds ~1.02 (the stale-price estimate broke down).
+    static func floatPct(floatShares: Double?, sharesOutstanding: Double?) -> Double? {
+        guard let fs = floatShares, fs.isFinite, fs > 0,
+              let so = sharesOutstanding, so.isFinite, so > 0 else { return nil }
+        let pct = fs / so
+        return pct.isFinite ? pct : nil
     }
 
     /// Abbreviated share COUNT: 24.6B / 890M / 12.5K / 950. No `$` — this is a
@@ -51,6 +79,91 @@ enum CompanyStats {
         if a >= 1e6 { return fmt(a / 1e6, "M") }
         if a >= 1e3 { return fmt(a / 1e3, "K") }
         return sign + a.formatted(.number.precision(.fractionLength(0)).grouping(.automatic))
+    }
+}
+
+// MARK: - Company tabs (Yahoo / Bloomberg grammar)
+
+/// The company board's tabs. OVERVIEW always shows; the rest gate on real data
+/// so a minimal crypto profile (BTC-USD) collapses to just [overview] and the
+/// tab bar hides. Raw values are stable (never rename — @State restores by tab).
+enum CompanyTab: String, CaseIterable, Identifiable {
+    case overview, financials, statistics, supplyChain
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .overview: "overview"
+        case .financials: "financials"
+        case .statistics: "statistics"
+        case .supplyChain: "supply chain"
+        }
+    }
+
+    static let `default`: CompanyTab = .overview
+
+    /// The tabs backed by real data for this profile.
+    static func available(for p: CompanyProfile) -> [CompanyTab] {
+        var tabs: [CompanyTab] = [.overview]
+        let f = p.fundamentals
+        if f != nil || !p.filings.isEmpty { tabs.append(.financials) }
+        if f?.shares_outstanding != nil || f?.public_float_usd != nil { tabs.append(.statistics) }
+        if !p.suppliers.isEmpty || !p.customers.isEmpty || !p.competitors.isEmpty {
+            tabs.append(.supplyChain)
+        }
+        return tabs
+    }
+}
+
+// MARK: - Collapsible section (supply-chain expand/collapse)
+
+/// A section whose body expands/collapses under the single sanctioned easing:
+/// a header (rotating chevron + label + count) over a revealed body. Ember only
+/// on hover; a hairline under the header is the only chrome — no pills, no
+/// shadows. Used by the SUPPLY CHAIN tab.
+struct CollapsibleSection<Content: View>: View {
+    let title: String
+    let count: Int
+    @ViewBuilder let content: () -> Content
+
+    @State private var expanded: Bool
+    @State private var hovering = false
+
+    init(_ title: String, count: Int, startsExpanded: Bool = true,
+         @ViewBuilder content: @escaping () -> Content) {
+        self.title = title
+        self.count = count
+        self.content = content
+        _expanded = State(initialValue: startsExpanded)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(DeckMotion.ease()) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(hovering ? Theme.ember : Theme.dim)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                    SectionLabel(text: title)
+                    Text("\(count)")
+                        .numeric(size: 10)
+                        .foregroundStyle(Theme.dim)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .onHover { hovering = $0 }
+            Rectangle().fill(Theme.line).frame(height: Theme.hairline).padding(.top, 8)
+            if expanded {
+                content()
+                    .padding(.top, 10)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
     }
 }
 
