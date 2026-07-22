@@ -233,10 +233,25 @@ impl TradePipeline {
                 .filter(|w| w[0].close > 0.0 && w[1].close > 0.0)
                 .map(|w| (w[1].close / w[0].close).ln())
                 .collect();
-            const M1_BARS_PER_YEAR: f64 = 525_600.0;
+            // Annualize per-bar vol by the RIGHT number of M1 bars per year for
+            // the asset class: crypto trades 24/7 (525,600 = 365×24×60), but
+            // equities trade regular hours only (252 × 390 = 98,280). Using the
+            // crypto constant for an equity overstates its annualized vol ~2.3×,
+            // so vol-targeting undersizes equities ~2× (and pins high-vol names to
+            // the 0.25 floor, where it stops adapting entirely).
+            const CRYPTO_M1_BARS_PER_YEAR: f64 = 525_600.0;
+            const EQUITY_M1_BARS_PER_YEAR: f64 = 98_280.0;
+            let bars_per_year = match cx_core::types::asset_class_of(&sig.symbol) {
+                cx_core::types::AssetClass::Equity => EQUITY_M1_BARS_PER_YEAR,
+                // Crypto is 24/7; futures/FX are ~24h markets — all annualize on
+                // the near-continuous constant. Only equities trade a short RTH.
+                cx_core::types::AssetClass::Crypto
+                | cx_core::types::AssetClass::Future
+                | cx_core::types::AssetClass::Fx => CRYPTO_M1_BARS_PER_YEAR,
+            };
             const TARGET_ANNUAL_VOL: f64 = 0.30;
             let vol_scalar = cx_ta::quant::ewma_vol(&rets, 0.94)
-                .map(|per_bar| per_bar * M1_BARS_PER_YEAR.sqrt())
+                .map(|per_bar| per_bar * bars_per_year.sqrt())
                 .map(|ann| cx_ta::quant::vol_target_scalar(TARGET_ANNUAL_VOL, ann))
                 .unwrap_or(1.0);
             // Correlation-aware diversification: shrink when the candidate
@@ -445,7 +460,20 @@ impl TradePipeline {
     /// ATR trail restores its watermark on one).
     pub async fn submit_through_risk(&self, mut intent: OrderIntent, last_px: f64) -> RiskDecision {
         let view = self.oms.view();
-        let decision = self.risk.evaluate(&intent, &view, last_px);
+        // The real exit is the ATR trail — hand the risk gate the per-share stop
+        // distance (trail_atr_mult × warm ATR) so its single-trade loss bound
+        // sizes against the ACTUAL stop, not a fixed 2% that understates high-vol
+        // names. None when the trail is off or the ATR hasn't warmed yet.
+        let stop_distance = if self.cfg.risk.trail_enabled {
+            self.atr
+                .lock()
+                .ok()
+                .and_then(|m| m.get(&intent.symbol).and_then(|a| a.value()))
+                .map(|atr| self.cfg.risk.trail_atr_mult * atr)
+        } else {
+            None
+        };
+        let decision = self.risk.evaluate(&intent, &view, last_px, stop_distance);
         match &decision {
             RiskDecision::Approved { qty, notes } => {
                 if !notes.is_empty() {

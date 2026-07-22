@@ -82,11 +82,18 @@ impl RiskEngine {
 
     /// The gate. Checks run in a fixed order; each one appends a note when
     /// it modifies the order and a reason when it blocks it.
+    ///
+    /// `stop_distance` is the per-share adverse move to the order's ACTUAL exit
+    /// (the ATR trail: `trail_atr_mult × ATR`), when known and warm. The
+    /// single-trade loss bound sizes against it so the advertised max-loss holds
+    /// at the real stop, not a fixed 2% that understates high-vol names. `None`
+    /// (cold ATR, or callers that don't track it) falls back to `LOSS_STOP_PCT`.
     pub fn evaluate(
         &self,
         intent: &OrderIntent,
         view: &PortfolioView,
         last_px: f64,
+        stop_distance: Option<f64>,
     ) -> RiskDecision {
         let mut notes: Vec<String> = Vec::new();
 
@@ -185,14 +192,21 @@ impl RiskEngine {
                 ));
             }
 
-            // 8. Single-trade loss bound at the configured adverse stop.
-            let loss_qty = self.cfg.max_single_trade_loss / (LOSS_STOP_PCT * last_px);
+            // 8. Single-trade loss bound at the ACTUAL adverse stop. The real
+            // exit is the ATR trail, so bound size by the per-share loss AT THAT
+            // stop distance; a warm ATR (via `stop_distance`) makes the max-loss
+            // guarantee honest for high-vol names where trail_atr_mult×ATR > 2%.
+            // Falls back to LOSS_STOP_PCT of price when ATR isn't warm.
+            let (per_share_loss, stop_label) = match stop_distance {
+                Some(d) if d.is_finite() && d > 0.0 => (d, "ATR trail".to_string()),
+                _ => (LOSS_STOP_PCT * last_px, format!("{:.0}% stop", LOSS_STOP_PCT * 100.0)),
+            };
+            let loss_qty = self.cfg.max_single_trade_loss / per_share_loss;
             if loss_qty.is_finite() && qty > loss_qty {
                 qty = loss_qty.max(0.0);
                 notes.push(format!(
-                    "loss bound clamped qty to {qty:.8} (max loss {:.2} at {:.0}% stop)",
+                    "loss bound clamped qty to {qty:.8} (max loss {:.2} at {stop_label})",
                     self.cfg.max_single_trade_loss,
-                    LOSS_STOP_PCT * 100.0
                 ));
             }
 
@@ -368,26 +382,26 @@ mod tests {
         let eng = RiskEngine::new(cfg(), kill.clone());
         kill.engage("test");
 
-        let d = eng.evaluate(&intent(Side::Buy, 1.0), &view_flat(), 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 1.0), &view_flat(), 100.0, None);
         assert!(reject_reason(&d).contains("kill switch"));
 
         let v = view_with("BTC-USD", 5.0, 100.0);
-        let d = eng.evaluate(&reduce(Side::Sell, 5.0), &v, 100.0);
+        let d = eng.evaluate(&reduce(Side::Sell, 5.0), &v, 100.0, None);
         assert_eq!(approved_qty(&d), 5.0);
 
         let mut flatten = reduce(Side::Sell, 2.0);
         flatten.source = OrderSource::RiskFlatten;
-        assert!(eng.evaluate(&flatten, &v, 100.0).is_approved());
+        assert!(eng.evaluate(&flatten, &v, 100.0, None).is_approved());
 
         // Reduce-only from a strategy is NOT exempt under kill.
         let mut strat = reduce(Side::Sell, 2.0);
         strat.source = OrderSource::Strategy("x".into());
-        assert!(!eng.evaluate(&strat, &v, 100.0).is_approved());
+        assert!(!eng.evaluate(&strat, &v, 100.0, None).is_approved());
 
         // Non-reduce-only manual is NOT exempt either.
         let mut manual = intent(Side::Sell, 2.0);
         manual.source = OrderSource::Manual;
-        assert!(!eng.evaluate(&manual, &v, 100.0).is_approved());
+        assert!(!eng.evaluate(&manual, &v, 100.0, None).is_approved());
     }
 
     // -- input sanity ------------------------------------------------------
@@ -398,22 +412,22 @@ mod tests {
         let v = view_flat();
         for bad_qty in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
             assert!(!eng
-                .evaluate(&intent(Side::Buy, bad_qty), &v, 100.0)
+                .evaluate(&intent(Side::Buy, bad_qty), &v, 100.0, None)
                 .is_approved());
         }
         for bad_px in [f64::NAN, f64::INFINITY, 0.0, -100.0] {
             assert!(!eng
-                .evaluate(&intent(Side::Buy, 1.0), &v, bad_px)
+                .evaluate(&intent(Side::Buy, 1.0), &v, bad_px, None)
                 .is_approved());
         }
         let mut lim = intent(Side::Buy, 1.0);
         lim.order_type = OrderType::Limit;
         for bad in [None, Some(f64::NAN), Some(0.0), Some(-5.0)] {
             lim.limit_px = bad;
-            assert!(!eng.evaluate(&lim, &v, 100.0).is_approved());
+            assert!(!eng.evaluate(&lim, &v, 100.0, None).is_approved());
         }
         lim.limit_px = Some(99.5);
-        assert!(eng.evaluate(&lim, &v, 100.0).is_approved());
+        assert!(eng.evaluate(&lim, &v, 100.0, None).is_approved());
     }
 
     #[test]
@@ -422,7 +436,7 @@ mod tests {
         let mut v = view_flat();
         v.equity = f64::NAN;
         assert!(!eng
-            .evaluate(&intent(Side::Buy, 1.0), &v, 100.0)
+            .evaluate(&intent(Side::Buy, 1.0), &v, 100.0, None)
             .is_approved());
     }
 
@@ -432,14 +446,14 @@ mod tests {
     fn reduce_only_must_reduce_and_clamps_to_position() {
         let eng = engine();
         // No position at all.
-        let d = eng.evaluate(&reduce(Side::Sell, 1.0), &view_flat(), 100.0);
+        let d = eng.evaluate(&reduce(Side::Sell, 1.0), &view_flat(), 100.0, None);
         assert!(reject_reason(&d).contains("no open position"));
         // Same direction as the position: would increase.
         let v = view_with("BTC-USD", 5.0, 100.0);
-        let d = eng.evaluate(&reduce(Side::Buy, 1.0), &v, 100.0);
+        let d = eng.evaluate(&reduce(Side::Buy, 1.0), &v, 100.0, None);
         assert!(reject_reason(&d).contains("increase"));
         // Oversized exit clamps to |position| with a note.
-        let d = eng.evaluate(&reduce(Side::Sell, 8.0), &v, 100.0);
+        let d = eng.evaluate(&reduce(Side::Sell, 8.0), &v, 100.0, None);
         match &d {
             RiskDecision::Approved { qty, notes } => {
                 assert_eq!(*qty, 5.0);
@@ -449,7 +463,7 @@ mod tests {
         }
         // Short position closes with a buy.
         let v = view_with("BTC-USD", -5.0, 100.0);
-        let d = eng.evaluate(&reduce(Side::Buy, 3.0), &v, 100.0);
+        let d = eng.evaluate(&reduce(Side::Buy, 3.0), &v, 100.0, None);
         assert_eq!(approved_qty(&d), 3.0);
     }
 
@@ -462,11 +476,11 @@ mod tests {
         eng.on_equity(96_900.0, 1); // day dd 3.1% >= 3% limit -> halt
         assert_eq!(eng.throttle(), 0.0);
 
-        let d = eng.evaluate(&intent(Side::Buy, 1.0), &view_flat(), 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 1.0), &view_flat(), 100.0, None);
         assert!(reject_reason(&d).contains("drawdown halt"));
 
         let v = view_with("BTC-USD", 8.0, 100.0);
-        let d = eng.evaluate(&reduce(Side::Sell, 8.0), &v, 100.0);
+        let d = eng.evaluate(&reduce(Side::Sell, 8.0), &v, 100.0, None);
         assert_eq!(approved_qty(&d), 8.0);
     }
 
@@ -475,7 +489,7 @@ mod tests {
     #[test]
     fn order_notional_cap_rejects() {
         let eng = engine(); // cap 25_000
-        let d = eng.evaluate(&intent(Side::Buy, 300.0), &view_flat(), 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 300.0), &view_flat(), 100.0, None);
         assert!(reject_reason(&d).contains("notional"));
     }
 
@@ -483,7 +497,7 @@ mod tests {
     fn position_cap_clamps_and_rejects() {
         // equity 100k, pct 10% -> cap qty 100 at px 100.
         let eng = engine();
-        let d = eng.evaluate(&intent(Side::Buy, 150.0), &view_flat(), 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 150.0), &view_flat(), 100.0, None);
         match &d {
             RiskDecision::Approved { qty, notes } => {
                 assert!((qty - 100.0).abs() < 1e-9);
@@ -493,15 +507,15 @@ mod tests {
         }
         // Existing 90 -> fit 10 >= 10% of 50: clamp.
         let v = view_with("BTC-USD", 90.0, 100.0);
-        let d = eng.evaluate(&intent(Side::Buy, 50.0), &v, 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 50.0), &v, 100.0, None);
         assert!((approved_qty(&d) - 10.0).abs() < 1e-9);
         // Existing 99 -> fit 1 < 10% of 50: reject.
         let v = view_with("BTC-USD", 99.0, 100.0);
-        let d = eng.evaluate(&intent(Side::Buy, 50.0), &v, 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 50.0), &v, 100.0, None);
         assert!(reject_reason(&d).contains("position cap"));
         // Opposite side has room: selling from +90 is fine.
         let v = view_with("BTC-USD", 90.0, 100.0);
-        let d = eng.evaluate(&intent(Side::Sell, 50.0), &v, 100.0);
+        let d = eng.evaluate(&intent(Side::Sell, 50.0), &v, 100.0, None);
         assert_eq!(approved_qty(&d), 50.0);
     }
 
@@ -514,12 +528,12 @@ mod tests {
         v.positions.insert("ETH-USD".into(), (1.0, 100.0));
         v.positions.insert("SOL-USD".into(), (1.0, 100.0));
         // New symbol blocked.
-        let d = eng.evaluate(&intent(Side::Buy, 1.0), &v, 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 1.0), &v, 100.0, None);
         assert!(reject_reason(&d).contains("concurrent"));
         // Adding to an existing symbol still allowed.
         let mut add = intent(Side::Buy, 1.0);
         add.symbol = "ETH-USD".into();
-        assert!(eng.evaluate(&add, &v, 100.0).is_approved());
+        assert!(eng.evaluate(&add, &v, 100.0, None).is_approved());
     }
 
     #[test]
@@ -527,7 +541,7 @@ mod tests {
         let eng = engine();
         let mut v = view_flat();
         v.daily_trades = cfg().max_daily_trades;
-        let d = eng.evaluate(&intent(Side::Buy, 1.0), &v, 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 1.0), &v, 100.0, None);
         assert!(reject_reason(&d).contains("daily trade cap"));
     }
 
@@ -539,11 +553,31 @@ mod tests {
         c.max_order_notional = 1e9;
         c.max_position_pct = 1.0;
         let eng = engine_with(c);
-        let d = eng.evaluate(&intent(Side::Buy, 400.0), &view_flat(), 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 400.0), &view_flat(), 100.0, None);
         match &d {
             RiskDecision::Approved { qty, notes } => {
                 assert!((qty - 250.0).abs() < 1e-9);
                 assert!(notes.iter().any(|n| n.contains("loss bound")));
+            }
+            _ => panic!("expected clamped approval"),
+        }
+    }
+
+    #[test]
+    fn loss_bound_uses_atr_stop_when_provided() {
+        // The real exit is wider than the 2% fallback: an ATR stop of $5/share
+        // at px 100 (vs $2 for the 2% proxy) → max loss 500 / 5 = 100 shares,
+        // TIGHTER than the 250 the 2% fallback allows. Proves the advertised
+        // max-loss holds at the ACTUAL stop for a high-vol name.
+        let mut c = cfg();
+        c.max_order_notional = 1e9;
+        c.max_position_pct = 1.0;
+        let eng = engine_with(c);
+        let d = eng.evaluate(&intent(Side::Buy, 400.0), &view_flat(), 100.0, Some(5.0));
+        match &d {
+            RiskDecision::Approved { qty, notes } => {
+                assert!((qty - 100.0).abs() < 1e-9, "atr stop should clamp to 100, got {qty}");
+                assert!(notes.iter().any(|n| n.contains("ATR trail")));
             }
             _ => panic!("expected clamped approval"),
         }
@@ -554,7 +588,7 @@ mod tests {
     #[test]
     fn tighten_only_property_holds_for_any_caution_state() {
         let base =
-            approved_qty(&engine().evaluate(&intent(Side::Buy, 10.0), &view_flat(), 100.0));
+            approved_qty(&engine().evaluate(&intent(Side::Buy, 10.0), &view_flat(), 100.0, None));
         assert_eq!(base, 10.0);
         for c in [
             0.0,
@@ -573,7 +607,7 @@ mod tests {
                 let eng = engine();
                 eng.set_caution(scope, c, "test");
                 let q =
-                    approved_qty(&eng.evaluate(&intent(Side::Buy, 10.0), &view_flat(), 100.0));
+                    approved_qty(&eng.evaluate(&intent(Side::Buy, 10.0), &view_flat(), 100.0, None));
                 assert!(
                     q <= base + 1e-12,
                     "caution {c} ({scope:?}) grew qty: {q} > {base}"
@@ -588,7 +622,7 @@ mod tests {
         // caution 1.0 with max_shrink 0.95 -> multiplier exactly 0.05.
         let eng = engine();
         eng.set_caution(None, 1.0, "worst case");
-        let q = approved_qty(&eng.evaluate(&intent(Side::Buy, 10.0), &view_flat(), 100.0));
+        let q = approved_qty(&eng.evaluate(&intent(Side::Buy, 10.0), &view_flat(), 100.0, None));
         assert!((q - 0.5).abs() < 1e-9);
     }
 
@@ -611,7 +645,7 @@ mod tests {
         let eng = engine_with(c);
         eng.set_caution(None, 0.9, "flash");
         assert_eq!(eng.caution_for("BTC-USD"), 0.0);
-        let q = approved_qty(&eng.evaluate(&intent(Side::Buy, 10.0), &view_flat(), 100.0));
+        let q = approved_qty(&eng.evaluate(&intent(Side::Buy, 10.0), &view_flat(), 100.0, None));
         assert_eq!(q, 10.0);
     }
 
@@ -647,7 +681,7 @@ mod tests {
         assert!((eng.throttle() - 2.0 / 3.0).abs() < 1e-9);
         eng.on_equity(97_000.0, 3); // dd at the limit -> halted
         assert_eq!(eng.throttle(), 0.0);
-        let d = eng.evaluate(&intent(Side::Buy, 1.0), &view_flat(), 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 1.0), &view_flat(), 100.0, None);
         assert!(reject_reason(&d).contains("drawdown halt"));
     }
 
@@ -656,7 +690,7 @@ mod tests {
         let eng = engine();
         eng.on_equity(100_000.0, 0);
         eng.on_equity(98_000.0, 1); // throttle 2/3
-        let d = eng.evaluate(&intent(Side::Buy, 9.0), &view_flat(), 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 9.0), &view_flat(), 100.0, None);
         match &d {
             RiskDecision::Approved { qty, notes } => {
                 assert!((qty - 6.0).abs() < 1e-6);
@@ -718,7 +752,7 @@ mod tests {
     #[test]
     fn dust_qty_rounds_to_rejection() {
         let eng = engine();
-        let d = eng.evaluate(&intent(Side::Buy, 4e-9), &view_flat(), 100.0);
+        let d = eng.evaluate(&intent(Side::Buy, 4e-9), &view_flat(), 100.0, None);
         assert!(reject_reason(&d).contains("rounds to zero"));
     }
 

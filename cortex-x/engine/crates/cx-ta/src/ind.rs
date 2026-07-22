@@ -186,6 +186,13 @@ impl Atr {
         }
         self.value
     }
+
+    /// The current ATR without advancing it — `None` until it has warmed over a
+    /// full `period`. Lets the risk gate read the live stop distance at
+    /// order-evaluation time without needing a bar to update.
+    pub fn value(&self) -> Option<f64> {
+        self.value
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
