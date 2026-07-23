@@ -10,14 +10,15 @@ final class ShellTests: XCTestCase {
         // FILINGS moved into the NEWS desk as a tab — it is no longer a center
         // section. LEVEL 2 (the DAS depth ladder + tape) is no longer a standalone
         // section either — it folded INTO the chart section's trading dock (DOM /
-        // T&S / FLOW panels beside the chart), so CenterMode has no `.level2`. The
-        // icon rail derives its cmd-number shortcuts from all cases but SETTINGS
-        // (index + 1); SETTINGS is a separate foot-of-rail entry (gearshape,
-        // cmd-,) and must stay LAST so the numbered shortcuts remain contiguous
-        // and the rail stays in lockstep with this list.
+        // T&S / FLOW panels beside the chart), so CenterMode has no `.level2`.
+        // HEATMAP sits right after SCANNER (the market map is a sibling of the
+        // screener). The icon rail derives its cmd-number shortcuts from all
+        // cases but SETTINGS (index + 1); SETTINGS is a separate foot-of-rail
+        // entry (gearshape, cmd-,) and must stay LAST so the numbered shortcuts
+        // remain contiguous and the rail stays in lockstep with this list.
         XCTAssertEqual(
             AppModel.CenterMode.allCases,
-            [.chart, .scanner, .news, .company, .options, .foundry, .regimes, .meridian, .settings]
+            [.chart, .scanner, .heatmap, .news, .company, .options, .foundry, .regimes, .meridian, .settings]
         )
         // Settings sits off the numbered rail — always last.
         XCTAssertEqual(AppModel.CenterMode.allCases.last, .settings)

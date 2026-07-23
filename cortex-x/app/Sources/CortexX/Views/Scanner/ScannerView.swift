@@ -211,13 +211,21 @@ struct ScanSort: Equatable, Codable {
 /// what order — persisted as one @AppStorage value (JSON). Columns can be added,
 /// removed, and drag-reordered; a new catalog column is appended by `reconciled`
 /// so it never silently vanishes for an existing user.
-struct ScanColumnLayout: RawRepresentable, Codable, Equatable {
+struct ScanColumnLayout: RawRepresentable, Equatable {
     var order: [ScanColumn]
     var visible: Set<ScanColumn>
 
     init(order: [ScanColumn], visible: Set<ScanColumn>) {
         self.order = order
         self.visible = visible
+    }
+
+    // Explicit memberwise equality. RawRepresentable would otherwise supply an
+    // == that compares rawValue (a JSON string), which is order-sensitive and
+    // therefore unstable for the Set — two value-equal layouts would compare
+    // unequal whenever the set serialized in a different order.
+    static func == (lhs: ScanColumnLayout, rhs: ScanColumnLayout) -> Bool {
+        lhs.order == rhs.order && lhs.visible == rhs.visible
     }
 
     /// The shown columns in order.
@@ -247,14 +255,26 @@ struct ScanColumnLayout: RawRepresentable, Codable, Equatable {
         return ScanColumnLayout(order: order, visible: v)
     }
 
-    // @AppStorage RawRepresentable bridge (JSON string).
+    // @AppStorage RawRepresentable bridge (JSON string). NOTE: the type is
+    // deliberately NOT Codable — a RawRepresentable<String> that also conforms
+    // to Codable inherits the stdlib's default encode(to:), which re-encodes
+    // self.rawValue and recurses through JSONEncoder forever (stack overflow).
+    // We bridge through a plain Codable payload instead.
+    private struct Payload: Codable {
+        var order: [ScanColumn]
+        var visible: [ScanColumn]
+    }
     var rawValue: String {
-        (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        // Sort the set into a stable order so the JSON is deterministic — an
+        // unsorted Set would serialize differently each access, thrashing
+        // @AppStorage writes and SwiftUI change detection.
+        let payload = Payload(order: order, visible: visible.sorted { $0.rawValue < $1.rawValue })
+        return (try? JSONEncoder().encode(payload)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
     }
     init?(rawValue: String) {
         guard let data = rawValue.data(using: .utf8),
-              let v = try? JSONDecoder().decode(ScanColumnLayout.self, from: data) else { return nil }
-        self = v
+              let p = try? JSONDecoder().decode(Payload.self, from: data) else { return nil }
+        self.init(order: p.order, visible: Set(p.visible))
     }
 
     /// The default DETAILS layout: identity + live price/change + the headline
@@ -1350,9 +1370,11 @@ private struct ScanRowView: View {
     }
 
     private var changeCell: some View {
-        Text(ScanFormat.pct(change))
+        // sessionChangePct is already a PERCENT (×100) — use Fmt.signedPct like the
+        // summary table, NOT ScanFormat.pct (which would ×100 a second time).
+        Text(change.flatMap { $0.isFinite ? Fmt.signedPct($0) : nil } ?? "—")
             .numeric(size: 10)
-            .foregroundStyle(change.map(Theme.pnlColor) ?? Theme.dim)
+            .foregroundStyle(change.flatMap { $0.isFinite ? Theme.pnlColor($0) : nil } ?? Theme.dim)
             .frame(width: ScanCol.change, alignment: .trailing)
     }
 

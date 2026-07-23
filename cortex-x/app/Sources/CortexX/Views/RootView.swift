@@ -65,6 +65,7 @@ struct RootView: View {
                         switch model.centerMode {
                         case .chart: ChartWorkspace()
                         case .scanner: ScannerView()
+                        case .heatmap: HeatmapView()
                         case .news: NewsView()
                         case .company: CompanyView()
                         case .options: OptionsChainView()
@@ -261,6 +262,7 @@ private struct IconRail: View {
     private static let sections: [(mode: AppModel.CenterMode, icon: String, name: String)] = [
         (.chart, "chart.xyaxis.line", "terminal"),
         (.scanner, "scope", "scanner"),
+        (.heatmap, "rectangle.grid.3x2.fill", "heatmap"),
         (.news, "newspaper", "news"),
         (.company, "building.2", "company"),
         (.options, "square.grid.3x3", "options"),

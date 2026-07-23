@@ -290,6 +290,9 @@ final class ScannerVerdictTests: XCTestCase {
         let layout = ScanColumnLayout.detailsDefault
         let restored = ScanColumnLayout(rawValue: layout.rawValue)
         XCTAssertEqual(restored, layout)
+        // rawValue must be deterministic (sorted set) so persistence is stable.
+        XCTAssertEqual(layout.rawValue, layout.rawValue)
+        XCTAssertEqual(restored?.rawValue, layout.rawValue)
         XCTAssertEqual(restored?.shown.first, .symbol)
         // Reconcile appends any catalog column missing from a persisted order
         // (forward-compat: a new column never vanishes for an existing layout).
