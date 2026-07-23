@@ -717,6 +717,54 @@ struct ScannerView: View {
 
     // MARK: Filter builder & saved screens
 
+    /// One-tap threshold screens (the requested "RSI ≤ 30" among them). Each is a
+    /// real ScanFilter toggled on/off; active = ember. Honest numeric screens.
+    private static let quickFilters: [(label: String, filter: ScanFilter)] = [
+        ("RSI ≤ 30", ScanFilter(column: .rsi, op: .lte, value: 30)),
+        ("RSI ≥ 70", ScanFilter(column: .rsi, op: .gte, value: 70)),
+        ("RVOL ≥ 2×", ScanFilter(column: .volSurge, op: .gte, value: 2)),
+        ("1M ≥ 0", ScanFilter(column: .ret1m, op: .gte, value: 0)),
+        ("COMP ≥ 80", ScanFilter(column: .composite, op: .gte, value: 80)),
+    ]
+
+    private func quickActive(_ f: ScanFilter) -> Bool {
+        filters.contains { $0.column == f.column && $0.op == f.op && $0.value == f.value }
+    }
+
+    private func toggleQuick(_ f: ScanFilter) {
+        if let i = filters.firstIndex(where: { $0.column == f.column && $0.op == f.op && $0.value == f.value }) {
+            filters.remove(at: i)
+        } else {
+            filters.append(ScanFilter(column: f.column, op: f.op, value: f.value))
+        }
+    }
+
+    private var quickFilterChips: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                Text("QUICK")
+                    .font(.system(size: 9, weight: .semibold)).tracking(1.2)
+                    .foregroundStyle(Theme.dim)
+                ForEach(Self.quickFilters.indices, id: \.self) { i in
+                    let q = Self.quickFilters[i]
+                    let on = quickActive(q.filter)
+                    Button { withAnimation(DeckMotion.ease()) { toggleQuick(q.filter) } } label: {
+                        Text(q.label)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(on ? Theme.ember : Theme.dim)
+                            .padding(.horizontal, 8).padding(.vertical, 3)
+                            .background(on ? Theme.emberTint : Color.clear)
+                            .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+                            .overlay(RoundedRectangle(cornerRadius: Theme.chipRadius)
+                                .strokeBorder(on ? Theme.ember.opacity(0.5) : Theme.line, lineWidth: Theme.hairline))
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
     private var filterBar: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
@@ -753,6 +801,7 @@ struct ScannerView: View {
                 Spacer()
                 screensMenu
             }
+            quickFilterChips
             if filtersOpen {
                 ForEach($filters) { $filter in
                     ScanFilterRowView(filter: $filter) {
