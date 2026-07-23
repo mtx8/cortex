@@ -404,18 +404,49 @@ enum ChartMath {
         return out
     }
 
-    /// Axis label: HH:mm intraday, dd MMM for daily bars.
-    static func timeLabel(_ tsMs: Int64, interval: Interval) -> String {
-        let date = Date(timeIntervalSince1970: Double(tsMs) / 1000)
-        return interval == .d1 ? dayFormatter.string(from: date) : clockFormatter.string(from: date)
+    /// The timezone an instrument's clock should read in: US equities on
+    /// EXCHANGE time (Eastern), crypto on UTC (24/7, the conventional reference).
+    /// A trading terminal must label times in a market-meaningful zone, not the
+    /// operator's arbitrary device-local zone.
+    static func exchangeTimeZone(for symbol: String) -> TimeZone {
+        // Equities are bare tickers; crypto products carry a dash ("BTC-USD").
+        // Inline (not AppModel.isEquity) so this stays nonisolated for Canvas draw.
+        let isEquity = !symbol.contains("-")
+        if isEquity {
+            return TimeZone(identifier: "America/New_York") ?? TimeZone(identifier: "UTC")!
+        }
+        return TimeZone(identifier: "UTC")!
     }
 
-    /// Crosshair readout timestamp — fuller than the axis label.
-    static func readoutTimeLabel(_ tsMs: Int64, interval: Interval) -> String {
+    /// A day-boundary key (YYYYMMDD) in the given zone, so the axis can tell when
+    /// consecutive gridlines cross a session/day and switch to a DATE label —
+    /// making a data gap read as a new session instead of a jumping clock.
+    static func dayKey(_ tsMs: Int64, tz: TimeZone) -> Int {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = tz
         let date = Date(timeIntervalSince1970: Double(tsMs) / 1000)
-        return interval == .d1
-            ? readoutDayFormatter.string(from: date)
-            : readoutClockFormatter.string(from: date)
+        let c = cal.dateComponents([.year, .month, .day], from: date)
+        return (c.year ?? 0) * 10_000 + (c.month ?? 0) * 100 + (c.day ?? 0)
+    }
+
+    /// Axis label in the given zone: HH:mm intraday, dd MMM for daily bars OR at a
+    /// day boundary (`showDate`) so a session change reads clearly. `tz` defaults
+    /// to the device zone for callers that don't pass one.
+    static func timeLabel(
+        _ tsMs: Int64, interval: Interval, tz: TimeZone = .current, showDate: Bool = false
+    ) -> String {
+        let date = Date(timeIntervalSince1970: Double(tsMs) / 1000)
+        let f = (interval == .d1 || showDate) ? dayFormatter : clockFormatter
+        f.timeZone = tz
+        return f.string(from: date)
+    }
+
+    /// Crosshair readout timestamp — fuller than the axis label, in the same zone.
+    static func readoutTimeLabel(_ tsMs: Int64, interval: Interval, tz: TimeZone = .current) -> String {
+        let date = Date(timeIntervalSince1970: Double(tsMs) / 1000)
+        let f = interval == .d1 ? readoutDayFormatter : readoutClockFormatter
+        f.timeZone = tz
+        return f.string(from: date)
     }
 
     private static let clockFormatter = makeFormatter("HH:mm")

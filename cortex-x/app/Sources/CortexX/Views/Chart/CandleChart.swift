@@ -272,7 +272,7 @@ struct CandleChart: View {
         if x + chipW > frame.plotWidth - 4 { x = max(4, info.snapX - chipW - 14) }
         let y = min(max(info.y + 12, 8), max(8, frame.paneBottom - 170))
         return VStack(alignment: .leading, spacing: 6) {
-            ReadoutChip(bar: info.bar, prevClose: info.prevClose, interval: interval)
+            ReadoutChip(bar: info.bar, prevClose: info.prevClose, interval: interval, symbol: symbol)
             if !info.signals.isEmpty { SignalChip(signals: info.signals) }
             if !info.topThoughts.isEmpty { ThoughtChip(thoughts: info.topThoughts) }
         }
@@ -539,12 +539,13 @@ private struct ReadoutChip: View {
     let bar: Bar
     let prevClose: Double
     let interval: Interval
+    let symbol: String
 
     var body: some View {
         let delta = bar.close - prevClose
         let pct = prevClose != 0 ? delta / prevClose * 100 : 0
         VStack(alignment: .leading, spacing: 3) {
-            Text(ChartMath.readoutTimeLabel(bar.ts_open_ms, interval: interval))
+            Text(ChartMath.readoutTimeLabel(bar.ts_open_ms, interval: interval, tz: ChartMath.exchangeTimeZone(for: symbol)))
                 .font(.system(size: 10, weight: .medium))
                 .monospacedDigit()
                 .foregroundStyle(Theme.bone)
@@ -640,6 +641,7 @@ private struct ThoughtChip: View {
 
 private struct ChartFrame {
     // Inputs
+    let symbol: String
     let bars: [Bar]
     let interval: Interval
     /// True bar width in ms (weekly bars ride the `.d1` interval).
@@ -701,6 +703,7 @@ private struct ChartFrame {
         shadeExtendedHours: Bool, indicatorCache: IndicatorCache
     ) {
         guard !bars.isEmpty, size.width > 140, size.height > 140 else { return nil }
+        self.symbol = symbol
         self.bars = bars
         self.interval = interval
         self.barSpanMs = max(barSpanMs, 1)
@@ -1064,17 +1067,27 @@ private struct ChartFrame {
         }
 
         // Vertical time gridlines + bottom labels, anchored to wall-clock buckets
+        // and read in EXCHANGE time (ET for equities, UTC for crypto). When two
+        // shown gridlines cross a day/session boundary, the later one switches to
+        // a DATE label so a data gap reads as a new session, not a jumping clock.
         let step = Int64(timeStep())
+        let tz = ChartMath.exchangeTimeZone(for: symbol)
+        var prevDayKey: Int?
         for i in range {
             guard (bars[i].ts_open_ms / interval.ms) % step == 0 else { continue }
             let xx = x(i).rounded() + 0.5
             guard xx > 2, xx < plotWidth - 2 else { continue }
+            let dk = ChartMath.dayKey(bars[i].ts_open_ms, tz: tz)
+            let crossedDay = prevDayKey != nil && dk != prevDayKey!
+            prevDayKey = dk
             var p = Path()
             p.move(to: CGPoint(x: xx, y: 0))
             p.addLine(to: CGPoint(x: xx, y: paneBottom))
             ctx.stroke(p, with: .color(gridColor), lineWidth: 1)
             ctx.draw(
-                axisText(ChartMath.timeLabel(bars[i].ts_open_ms, interval: interval)),
+                axisText(ChartMath.timeLabel(
+                    bars[i].ts_open_ms, interval: interval, tz: tz, showDate: crossedDay
+                )),
                 at: CGPoint(x: xx, y: paneBottom + timeAxisHeight / 2), anchor: .center
             )
         }
@@ -1440,7 +1453,7 @@ private struct ChartFrame {
         }
 
         drawTag(
-            ctx, text: ChartMath.readoutTimeLabel(info.bar.ts_open_ms, interval: interval),
+            ctx, text: ChartMath.readoutTimeLabel(info.bar.ts_open_ms, interval: interval, tz: ChartMath.exchangeTimeZone(for: symbol)),
             center: CGPoint(x: xx, y: paneBottom + timeAxisHeight / 2),
             background: Theme.panel
         )
@@ -1566,7 +1579,7 @@ private struct ChartFrame {
         p.addLine(to: CGPoint(x: xx, y: mainRect.maxY))
         clipped.stroke(p, with: .color(color), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
         drawTag(
-            ctx, text: ChartMath.readoutTimeLabel(point.ts_ms, interval: interval),
+            ctx, text: ChartMath.readoutTimeLabel(point.ts_ms, interval: interval, tz: ChartMath.exchangeTimeZone(for: symbol)),
             center: CGPoint(x: xx, y: paneBottom + timeAxisHeight / 2),
             background: Theme.panel, textColor: color
         )
