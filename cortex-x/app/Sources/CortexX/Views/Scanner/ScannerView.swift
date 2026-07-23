@@ -103,12 +103,15 @@ enum ScanPreset: String, CaseIterable, Codable {
 /// Table columns in display order. Codable (raw string) so filters and
 /// saved screens can persist column references.
 enum ScanColumn: String, CaseIterable, Codable {
-    case symbol, composite, momentum, trend, breakout, meanrev, volState,
-         rsi, zscore, ret1w, ret1m, ret3m, dist52wHi, volSurge, regime, flags
+    case symbol, price, change, composite, momentum, trend, breakout, meanrev, volState,
+         rsi, zscore, ret1w, ret1m, ret3m, dist52wHi, volSurge,
+         sector, marketCap, floatUsd, shortFloat, news, regime, flags
 
     var title: String {
         switch self {
         case .symbol: "sym"
+        case .price: "last"
+        case .change: "chg%"
         case .composite: "composite"
         case .momentum: "mom"
         case .trend: "trend"
@@ -122,12 +125,23 @@ enum ScanColumn: String, CaseIterable, Codable {
         case .ret3m: "3m%"
         case .dist52wHi: "Δ52w-hi"
         case .volSurge: "v/avg"
+        case .sector: "sector"
+        case .marketCap: "mktcap"
+        case .floatUsd: "float$"
+        case .shortFloat: "short%flt"
+        case .news: "news"
         case .regime: "regime"
         case .flags: "flags"
         }
     }
 
-    var sortable: Bool { self != .flags }
+    /// Categorical / boolean / client-injected columns aren't row-key sortable.
+    var sortable: Bool {
+        switch self {
+        case .flags, .news, .sector, .shortFloat, .floatUsd, .marketCap, .change: false
+        default: true
+        }
+    }
 }
 
 /// One sort order over the scan table. nil readings sort last in BOTH
@@ -139,6 +153,7 @@ struct ScanSort: Equatable, Codable {
     /// Numeric sort key for value columns; nil for string columns / flags.
     static func key(_ row: ScanRow, _ column: ScanColumn) -> Double? {
         switch column {
+        case .price: row.last_close // real proxy for a live-price sort
         case .composite: row.composite
         case .momentum: row.momentum
         case .trend: row.trend
@@ -152,7 +167,8 @@ struct ScanSort: Equatable, Codable {
         case .ret3m: row.ret_3m
         case .dist52wHi: row.dist_52w_high
         case .volSurge: row.vol_surge
-        case .symbol, .regime, .flags: nil
+        // Categorical / boolean / client-injected → no static key.
+        case .symbol, .change, .sector, .marketCap, .floatUsd, .shortFloat, .news, .regime, .flags: nil
         }
     }
 
@@ -189,6 +205,65 @@ struct ScanSort: Equatable, Codable {
         }
         return ScanSort(column: column, ascending: column == .symbol || column == .regime)
     }
+}
+
+/// The operator's DETAILS-table column configuration — which columns show and in
+/// what order — persisted as one @AppStorage value (JSON). Columns can be added,
+/// removed, and drag-reordered; a new catalog column is appended by `reconciled`
+/// so it never silently vanishes for an existing user.
+struct ScanColumnLayout: RawRepresentable, Codable, Equatable {
+    var order: [ScanColumn]
+    var visible: Set<ScanColumn>
+
+    init(order: [ScanColumn], visible: Set<ScanColumn>) {
+        self.order = order
+        self.visible = visible
+    }
+
+    /// The shown columns in order.
+    var shown: [ScanColumn] { order.filter(visible.contains) }
+
+    /// Forward-compat: append any catalog column missing from a persisted order.
+    func reconciled() -> ScanColumnLayout {
+        var o = order
+        for c in ScanColumn.allCases where !o.contains(c) { o.append(c) }
+        return ScanColumnLayout(order: o, visible: visible)
+    }
+
+    func moving(_ col: ScanColumn, before target: ScanColumn) -> ScanColumnLayout {
+        guard col != target, let from = order.firstIndex(of: col) else { return self }
+        var o = order
+        o.remove(at: from)
+        let to = o.firstIndex(of: target) ?? o.count
+        o.insert(col, at: to)
+        return ScanColumnLayout(order: o, visible: visible)
+    }
+
+    func toggling(_ col: ScanColumn) -> ScanColumnLayout {
+        var v = visible
+        if v.contains(col) { v.remove(col) } else { v.insert(col) }
+        // symbol is the anchor — never hide it.
+        v.insert(.symbol)
+        return ScanColumnLayout(order: order, visible: v)
+    }
+
+    // @AppStorage RawRepresentable bridge (JSON string).
+    var rawValue: String {
+        (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    }
+    init?(rawValue: String) {
+        guard let data = rawValue.data(using: .utf8),
+              let v = try? JSONDecoder().decode(ScanColumnLayout.self, from: data) else { return nil }
+        self = v
+    }
+
+    /// The default DETAILS layout: identity + live price/change + the headline
+    /// analytics + sector, with the deeper score grid available but off.
+    static let detailsDefault = ScanColumnLayout(
+        order: ScanColumn.allCases,
+        visible: [.symbol, .price, .change, .composite, .rsi, .ret1m, .ret3m,
+                  .volSurge, .sector, .news, .regime, .flags]
+    )
 }
 
 /// Scanner-local number formatting. Scores are percentiles (0-100), returns
@@ -229,6 +304,14 @@ enum ScanFormat {
     static func ratio(_ v: Double?) -> String {
         guard let v, v.isFinite else { return "—" }
         return String(format: "%.1fx", v)
+    }
+
+    /// Adaptive last price: big numbers lose the cents, small keep 2dp.
+    static func priceFmt(_ v: Double?) -> String {
+        guard let v, v.isFinite else { return "—" }
+        if abs(v) >= 1000 { return String(format: "%.0f", v) }
+        if abs(v) >= 1 { return String(format: "%.2f", v) }
+        return String(format: "%.4f", v)
     }
 
     /// First `max` flags shown as chips, the rest collapse to "+n".
@@ -281,9 +364,19 @@ private enum ScanCol {
     /// The single trailing row-action affordance (hover/selected ellipsis).
     static let trailing: CGFloat = 24
 
+    static let price: CGFloat = 62
+    static let change: CGFloat = 56
+    static let sector: CGFloat = 96
+    static let mktcap: CGFloat = 74
+    static let floatUsd: CGFloat = 70
+    static let shortFloat: CGFloat = 66
+    static let news: CGFloat = 38
+
     static func width(_ column: ScanColumn) -> CGFloat {
         switch column {
         case .symbol: sym
+        case .price: price
+        case .change: change
         case .composite: composite
         case .momentum, .trend, .breakout, .meanrev, .volState: score
         case .rsi: rsi
@@ -291,6 +384,11 @@ private enum ScanCol {
         case .ret1w, .ret1m, .ret3m: ret
         case .dist52wHi: dist
         case .volSurge: ratio
+        case .sector: sector
+        case .marketCap: mktcap
+        case .floatUsd: floatUsd
+        case .shortFloat: shortFloat
+        case .news: news
         case .regime: regime
         case .flags: flags
         }
@@ -298,15 +396,18 @@ private enum ScanCol {
 
     static func alignment(_ column: ScanColumn) -> Alignment {
         switch column {
-        case .symbol, .composite, .regime, .flags: .leading
+        case .symbol, .composite, .sector, .news, .regime, .flags: .leading
         default: .trailing
         }
     }
 
     /// Total content width: columns + gaps + the trailing affordances.
-    static var minWidth: CGFloat {
-        let cols = ScanColumn.allCases.map(width).reduce(0, +)
-        return cols + gap * CGFloat(ScanColumn.allCases.count) + trailing + 24
+    static var minWidth: CGFloat { shownWidth(ScanColumn.allCases) }
+
+    /// Content width for a specific set of shown columns (drives the h-scroll floor).
+    static func shownWidth(_ columns: [ScanColumn]) -> CGFloat {
+        let cols = columns.map(width).reduce(0, +)
+        return cols + gap * CGFloat(columns.count) + trailing + 24
     }
 }
 
@@ -334,6 +435,9 @@ struct ScannerView: View {
     @AppStorage(ScanPrefs.details) private var showDetails = false
     @AppStorage(ScanPrefs.showAlerts) private var showAlerts = false
     @AppStorage(ScanPrefs.showAIPicks) private var showAIPicks = false
+    // Configurable, drag-reorderable DETAILS columns (persisted).
+    @AppStorage(ScanPrefs.columns) private var columnLayout = ScanColumnLayout.detailsDefault
+    @State private var draggingColumn: ScanColumn?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -989,6 +1093,9 @@ struct ScannerView: View {
                         ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                             ScanRowView(
                                 row: row,
+                                columns: columnLayout.shown,
+                                price: model.lastPrice(row.symbol),
+                                change: model.sessionChangePct(row.symbol),
                                 headline: news[row.symbol],
                                 aiDisabled: aiDisabled,
                                 selected: model.selectedSymbol == row.symbol,
@@ -1006,17 +1113,18 @@ struct ScannerView: View {
                         headerRow
                     }
                 }
-                .frame(minWidth: ScanCol.minWidth, alignment: .leading)
+                .frame(minWidth: ScanCol.shownWidth(columnLayout.shown), alignment: .leading)
             }
         }
     }
 
     private var headerRow: some View {
         HStack(spacing: ScanCol.gap) {
-            ForEach(ScanColumn.allCases, id: \.self) { col in
+            ForEach(columnLayout.shown, id: \.self) { col in
                 headerCell(col)
             }
-            Spacer(minLength: ScanCol.trailing)
+            Spacer(minLength: 4)
+            columnsMenu
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -1024,10 +1132,12 @@ struct ScannerView: View {
         .deckRowRule(1)
     }
 
+    /// A header cell that BOTH sorts (tap) and drag-reorders its column (drag
+    /// past threshold). The dragged column dims; a drop reorders the layout.
     private func headerCell(_ col: ScanColumn) -> some View {
         let active = sort?.column == col
         return Button {
-            sort = ScanSort.toggling(sort, column: col)
+            if col.sortable { sort = ScanSort.toggling(sort, column: col) }
         } label: {
             HStack(spacing: 3) {
                 if ScanCol.alignment(col) == .trailing { Spacer(minLength: 0) }
@@ -1048,7 +1158,63 @@ struct ScannerView: View {
         }
         .buttonStyle(.plain)
         .disabled(!col.sortable)
+        .opacity(draggingColumn == col ? 0.35 : 1)
+        .draggable(col) {
+            draggingColumn = col
+            return Text(col.title.uppercased())
+                .font(.system(size: 9, weight: .semibold))
+                .tracking(1.0)
+                .foregroundStyle(Theme.ember)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .overlay(RoundedRectangle(cornerRadius: Theme.chipRadius)
+                    .strokeBorder(Theme.ember, lineWidth: Theme.hairline))
+        }
+        .dropDestination(for: ScanColumn.self) { items, _ in
+            draggingColumn = nil
+            guard let moved = items.first, moved != col else { return false }
+            withAnimation(DeckMotion.ease()) {
+                columnLayout = columnLayout.moving(moved, before: col).reconciled()
+            }
+            return true
+        }
         .animation(DeckMotion.ease(), value: active)
+    }
+
+    /// Add / remove columns (checkmark = shown); the trailing header affordance.
+    private var columnsMenu: some View {
+        Menu {
+            ForEach(ScanColumn.allCases, id: \.self) { col in
+                Button {
+                    columnLayout = columnLayout.toggling(col).reconciled()
+                } label: {
+                    if columnLayout.visible.contains(col) {
+                        Label(col.title, systemImage: "checkmark")
+                    } else {
+                        Text(col.title)
+                    }
+                }
+                .disabled(col == .symbol)
+            }
+            Divider()
+            Button("reset columns") { columnLayout = .detailsDefault }
+        } label: {
+            Image(systemName: "slider.horizontal.3")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(Theme.dim)
+                .frame(width: ScanCol.trailing, height: 16)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .help("add / remove columns")
+    }
+}
+
+extension ScanColumn: Transferable {
+    static var transferRepresentation: some TransferRepresentation {
+        ProxyRepresentation(exporting: \.rawValue, importing: { ScanColumn(rawValue: $0) ?? .symbol })
     }
 }
 
@@ -1056,6 +1222,11 @@ struct ScannerView: View {
 
 private struct ScanRowView: View {
     let row: ScanRow
+    /// The shown columns, in the operator's order (drives the cell layout).
+    let columns: [ScanColumn]
+    /// Live client-injected values (nil → the cell renders "—" / a proxy).
+    let price: Double?
+    let change: Double?
     /// Latest in-window headline title for this symbol; nil = no news action.
     let headline: String?
     let aiDisabled: Bool
@@ -1069,22 +1240,7 @@ private struct ScanRowView: View {
     var body: some View {
         Button(action: openChart) {
             HStack(spacing: ScanCol.gap) {
-                symbolCell
-                compositeCell
-                scoreCell(row.momentum)
-                scoreCell(row.trend)
-                scoreCell(row.breakout)
-                scoreCell(row.meanrev)
-                scoreCell(row.vol_state)
-                rawCell(ScanFormat.raw(row.rsi_14, decimals: 0), present: row.rsi_14 != nil, width: ScanCol.rsi)
-                rawCell(ScanFormat.raw(row.zscore_20, decimals: 2, signed: true), present: row.zscore_20 != nil, width: ScanCol.z)
-                returnCell(row.ret_1w)
-                returnCell(row.ret_1m)
-                returnCell(row.ret_3m)
-                rawCell(ScanFormat.distFromHigh(row.dist_52w_high), present: row.dist_52w_high != nil, width: ScanCol.dist)
-                rawCell(ScanFormat.ratio(row.vol_surge), present: row.vol_surge != nil, width: ScanCol.ratio)
-                regimeCell
-                flagsCell
+                ForEach(columns, id: \.self) { col in cell(col) }
                 ScanRowActionsMenu(
                     symbol: row.symbol, headline: headline, aiDisabled: aiDisabled,
                     visible: hovering || selected,
@@ -1102,6 +1258,95 @@ private struct ScanRowView: View {
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .animation(DeckMotion.ease(), value: hovering)
+    }
+
+    /// Each column's cell — self-framed to ScanCol.width so header + body stay
+    /// aligned regardless of order.
+    @ViewBuilder
+    private func cell(_ col: ScanColumn) -> some View {
+        switch col {
+        case .symbol: symbolCell
+        case .price: priceCell
+        case .change: changeCell
+        case .composite: compositeCell
+        case .momentum: scoreCell(row.momentum)
+        case .trend: scoreCell(row.trend)
+        case .breakout: scoreCell(row.breakout)
+        case .meanrev: scoreCell(row.meanrev)
+        case .volState: scoreCell(row.vol_state)
+        case .rsi: rsiCell
+        case .zscore: rawCell(ScanFormat.raw(row.zscore_20, decimals: 2, signed: true), present: row.zscore_20 != nil, width: ScanCol.z)
+        case .ret1w: returnCell(row.ret_1w)
+        case .ret1m: returnCell(row.ret_1m)
+        case .ret3m: returnCell(row.ret_3m)
+        case .dist52wHi: rawCell(ScanFormat.distFromHigh(row.dist_52w_high), present: row.dist_52w_high != nil, width: ScanCol.dist)
+        case .volSurge: rawCell(ScanFormat.ratio(row.vol_surge), present: row.vol_surge != nil, width: ScanCol.ratio)
+        case .sector: sectorCell
+        case .marketCap: marketCapCell
+        case .floatUsd: rawCell(CompanyFormat.abbrevMoney(row.public_float_usd), present: row.public_float_usd != nil, width: ScanCol.floatUsd)
+        // Short % of float is FINRA-gated (bi-monthly) — "—" until wired.
+        case .shortFloat: rawCell("—", present: false, width: ScanCol.shortFloat)
+        case .news: newsCell
+        case .regime: regimeCell
+        case .flags: flagsCell
+        }
+    }
+
+    private var priceCell: some View {
+        let p = price ?? (row.last_close.isFinite ? row.last_close : nil)
+        return Text(ScanFormat.priceFmt(p))
+            .numeric(size: 10)
+            .foregroundStyle(p != nil ? Theme.bone : Theme.dim)
+            .frame(width: ScanCol.price, alignment: .trailing)
+    }
+
+    private var changeCell: some View {
+        Text(ScanFormat.pct(change))
+            .numeric(size: 10)
+            .foregroundStyle(change.map(Theme.pnlColor) ?? Theme.dim)
+            .frame(width: ScanCol.change, alignment: .trailing)
+    }
+
+    private var sectorCell: some View {
+        Text(row.sector ?? "—")
+            .font(.system(size: 10))
+            .foregroundStyle(row.sector == nil ? Theme.dim : Theme.bone)
+            .lineLimit(1)
+            .frame(width: ScanCol.sector, alignment: .leading)
+    }
+
+    private var marketCapCell: some View {
+        let p = price ?? (row.last_close.isFinite ? row.last_close : nil)
+        let cap: Double? = {
+            guard let s = row.shares_outstanding, s.isFinite, s > 0,
+                  let px = p, px > 0 else { return nil }
+            let c = s * px
+            return c.isFinite ? c : nil
+        }()
+        return rawCell(CompanyFormat.abbrevMoney(cap), present: cap != nil, width: ScanCol.mktcap)
+    }
+
+    /// News flag: an ember newspaper glyph when a headline landed this window.
+    private var newsCell: some View {
+        Image(systemName: "newspaper")
+            .font(.system(size: 9))
+            .foregroundStyle(headline != nil ? Theme.ember : Theme.dim.opacity(0.35))
+            .frame(width: ScanCol.news, alignment: .leading)
+            .help(headline ?? "no recent headline")
+    }
+
+    /// RSI with an ember oversold marker at ≤ 30 (the requested threshold cue).
+    private var rsiCell: some View {
+        HStack(spacing: 3) {
+            Spacer(minLength: 0)
+            if let rsi = row.rsi_14, rsi <= 30 {
+                Circle().fill(Theme.ember).frame(width: 4, height: 4)
+            }
+            Text(ScanFormat.raw(row.rsi_14, decimals: 0))
+                .numeric(size: 10)
+                .foregroundStyle(row.rsi_14 != nil ? Theme.bone : Theme.dim)
+        }
+        .frame(width: ScanCol.rsi, alignment: .trailing)
     }
 
     private var symbolCell: some View {

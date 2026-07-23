@@ -263,4 +263,6 @@ enum ScanPrefs {
     static let showAlerts = "scannerShowAlerts"
     /// Show the header AI-PICKS action. Default off.
     static let showAIPicks = "scannerShowAIPicks"
+    /// The persisted DETAILS-table column layout (order + visibility), JSON.
+    static let columns = "scannerColumns.v1"
 }

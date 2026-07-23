@@ -271,9 +271,42 @@ final class ScannerVerdictTests: XCTestCase {
         XCTAssertEqual(ScanSummary.columns.count, 6)
     }
 
-    func testDetailsColumnSetIsTheFullPercentileGrid() {
-        // The opt-in details view keeps the full 16-column grid.
-        XCTAssertEqual(ScanColumn.allCases.count, 16)
+    func testDetailsCatalogHasTheAdvancedColumns() {
+        // The configurable catalog now carries price/change/sector/market-cap/
+        // float/short%/news on top of the percentile grid.
+        XCTAssertEqual(ScanColumn.allCases.count, 23)
+        for c: ScanColumn in [.price, .change, .sector, .marketCap, .floatUsd, .shortFloat, .news] {
+            XCTAssertTrue(ScanColumn.allCases.contains(c))
+        }
+        // Categorical / injected columns aren't row-key sortable.
+        XCTAssertFalse(ScanColumn.sector.sortable)
+        XCTAssertFalse(ScanColumn.news.sortable)
+        XCTAssertFalse(ScanColumn.change.sortable)
+        XCTAssertTrue(ScanColumn.price.sortable)
+    }
+
+    func testColumnLayoutRoundTripsAndReconciles() {
+        // Persists + restores order + visibility via its RawRepresentable JSON.
+        let layout = ScanColumnLayout.detailsDefault
+        let restored = ScanColumnLayout(rawValue: layout.rawValue)
+        XCTAssertEqual(restored, layout)
+        XCTAssertEqual(restored?.shown.first, .symbol)
+        // Reconcile appends any catalog column missing from a persisted order
+        // (forward-compat: a new column never vanishes for an existing layout).
+        let partial = ScanColumnLayout(order: [.symbol, .price], visible: [.symbol, .price])
+        let reconciled = partial.reconciled()
+        XCTAssertEqual(reconciled.order.count, ScanColumn.allCases.count)
+        XCTAssertEqual(reconciled.shown, [.symbol, .price]) // visibility preserved
+    }
+
+    func testColumnLayoutMoveAndToggle() {
+        let base = ScanColumnLayout(order: [.symbol, .price, .change, .rsi], visible: [.symbol, .price, .change, .rsi])
+        // Move rsi before price.
+        let moved = base.moving(.rsi, before: .price)
+        XCTAssertEqual(moved.order, [.symbol, .rsi, .price, .change])
+        // Toggling hides a column; symbol can never be hidden.
+        XCTAssertFalse(base.toggling(.price).visible.contains(.price))
+        XCTAssertTrue(base.toggling(.symbol).visible.contains(.symbol))
     }
 
     func testSummarySortabilityMatchesDesign() {
