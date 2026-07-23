@@ -39,9 +39,10 @@ struct TopBar: View {
             brokerBadge
             connection
         }
-        // Leading inset clears the macOS traffic-light buttons (hidden title bar),
-        // so the search sits cleanly in the top-left instead of under them.
-        .padding(.leading, 78)
+        // Align the global search's left edge with the watchlist's search field
+        // directly below it — icon rail (48) + divider (1) + watchlist padding (12)
+        // = 61 — for perfect vertical symmetry of the two search boxes.
+        .padding(.leading, 61)
         .padding(.trailing, 16)
         .padding(.vertical, 8)
     }
