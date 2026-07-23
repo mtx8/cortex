@@ -99,6 +99,10 @@ pub fn spawn_poller(bus: Arc<Bus>, cfg: Config) {
         let cadence = Duration::from_secs(cfg.intel.gdelt_poll_secs.max(300));
         let egress = Egress::new();
         let mut state = MeridianState::default();
+        // Warm the 30-day baselines from GDELT history BEFORE the first poll, so
+        // the machine can fire chains immediately instead of after a 7-day cold
+        // start (the root cause of the always-empty machine).
+        backfill(&egress, &mut state).await;
         let mut rx = bus.subscribe();
         let mut rx_open = true;
         let mut last_caution_ms: i64 = 0;
@@ -233,6 +237,29 @@ impl MeridianState {
                 .update(tone_sum / f64::from(fresh), now);
         }
         fresh
+    }
+
+    /// Warm a theme's daily baseline from historical GDELT volume (oldest-first
+    /// raw daily article counts), aligned to the days ending YESTERDAY — today is
+    /// left for the live poll so the two never double-count. Only seeds a theme
+    /// with no baseline yet, so a re-backfill after a restart can't stack. This is
+    /// what makes MERIDIAN's z-scores valid immediately instead of after a 7-day
+    /// cold start; the counts are real GDELT history, never fabricated.
+    fn seed_baseline(&mut self, theme: &'static str, daily_oldest_first: &[u32], now: i64) {
+        let hist = self.counts.entry(theme).or_default();
+        if !hist.is_empty() {
+            return;
+        }
+        let max_days = (BASELINE_RETAIN_MS / DAY_MS) as usize;
+        let n = daily_oldest_first.len();
+        let start = n.saturating_sub(max_days);
+        let kept = &daily_oldest_first[start..];
+        // Oldest kept point sits `kept.len()` days back; the newest sits 1 day
+        // back (yesterday). Each is a full day apart → distinct day buckets.
+        for (i, &count) in kept.iter().enumerate() {
+            let days_ago = (kept.len() - i) as i64;
+            hist.push_back((now - days_ago * DAY_MS, count));
+        }
     }
 
     /// 24h article-count z-score vs the 30d daily baseline. None until at
@@ -505,6 +532,61 @@ fn gdelt_url(query: &str) -> String {
     )
 }
 
+/// Warm every theme's 30-day baseline from GDELT history so the machine is live
+/// on the FIRST poll instead of after a 7-day cold start — the reason "THE
+/// MACHINE" and the nature/tech forces used to sit permanently at neutral. Runs
+/// once at poller startup; best-effort per theme (a failed fetch just leaves that
+/// theme cold, which degrades gracefully to the old behavior). Same allowlisted
+/// GDELT host as the live poll.
+pub async fn backfill(egress: &Egress, state: &mut MeridianState) {
+    let now = now_ms();
+    for (theme, query) in THEMES {
+        let url = gdelt_timeline_url(query);
+        match egress.get_text(&url).await {
+            Ok(raw) => {
+                let daily = parse_timeline_counts(&raw);
+                if !daily.is_empty() {
+                    state.seed_baseline(theme, &daily, now);
+                    tracing::info!(theme, days = daily.len(), "meridian baseline backfilled");
+                }
+            }
+            Err(e) => tracing::warn!(theme, error = %e, "meridian backfill failed; theme stays cold"),
+        }
+        tokio::time::sleep(QUERY_GAP).await;
+    }
+}
+
+/// GDELT DOC timeline of RAW daily article counts over the last 30 days — the
+/// baseline series each theme's live 24h count is z-scored against.
+fn gdelt_timeline_url(query: &str) -> String {
+    format!(
+        "https://api.gdeltproject.org/api/v2/doc/doc?query={}&mode=TimelineVolRaw&timespan=30d&format=json",
+        url_encode(query)
+    )
+}
+
+/// Raw daily article counts (oldest-first) from a GDELT `TimelineVolRaw` payload
+/// (`timeline[0].data[].value`). Non-finite / negative values floor to 0; a
+/// malformed payload yields an empty series (the theme stays honestly cold).
+fn parse_timeline_counts(raw: &str) -> Vec<u32> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(data) = v
+        .get("timeline")
+        .and_then(|t| t.as_array())
+        .and_then(|a| a.first())
+        .and_then(|s| s.get("data"))
+        .and_then(|d| d.as_array())
+    else {
+        return Vec::new();
+    };
+    data.iter()
+        .filter_map(|pt| pt.get("value").and_then(|x| x.as_f64()))
+        .map(|f| if f.is_finite() && f > 0.0 { f.round() as u32 } else { 0 })
+        .collect()
+}
+
 /// Minimal percent-encoder (RFC 3986 unreserved kept verbatim). Local on
 /// purpose: no new crate deps.
 fn url_encode(s: &str) -> String {
@@ -733,6 +815,45 @@ mod tests {
         // the 11d it would see if last_ts had slid backward.
         e.update(0.0, 14 * DAY_MS);
         assert!((e.value.unwrap() + 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_timeline_counts_extracts_and_is_malformed_safe() {
+        let raw = r#"{"timeline":[{"series":"Article Count","data":[
+            {"date":"20260601T000000Z","value":10},
+            {"date":"20260602T000000Z","value":12},
+            {"date":"20260603T000000Z","value":8}]}]}"#;
+        assert_eq!(parse_timeline_counts(raw), vec![10, 12, 8]);
+        assert!(parse_timeline_counts("not json").is_empty());
+        assert!(parse_timeline_counts("{}").is_empty());
+        // Non-finite / negative floor to 0 (never a fabricated count).
+        assert_eq!(
+            parse_timeline_counts(r#"{"timeline":[{"data":[{"value":-5},{"value":7}]}]}"#),
+            vec![0, 7]
+        );
+    }
+
+    #[test]
+    fn backfill_seed_warms_theme_z_immediately_and_never_double_counts() {
+        let now = 40 * DAY_MS;
+        let mut st = MeridianState::default();
+        // 8 quiet historical days → theme_z is valid immediately (no 7-day wait).
+        st.seed_baseline("armed_conflict", &[2u32; 8], now);
+        assert_eq!(st.counts.get("armed_conflict").unwrap().len(), 8);
+        // A live 24h spike now fires well above the seeded baseline.
+        st.counts.get_mut("armed_conflict").unwrap().push_back((now, 30));
+        let z = st.theme_z("armed_conflict", now).expect("baseline warm");
+        assert!(z > 3.0, "z {z}");
+        // Re-seeding a warm theme is a no-op (a restart's re-backfill can't stack).
+        st.seed_baseline("armed_conflict", &[2u32; 8], now);
+        let seeded = st
+            .counts
+            .get("armed_conflict")
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| *c == 2)
+            .count();
+        assert_eq!(seeded, 8);
     }
 
     fn seed_baseline(st: &mut MeridianState, theme: &'static str, days: i64, per_day: u32, t0: i64) {
