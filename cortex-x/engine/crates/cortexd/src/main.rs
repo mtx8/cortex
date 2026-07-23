@@ -109,7 +109,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Intel squadron: REGIMES scanner + MERIDIAN poller (COMPANY is on-demand).
-    cx_intel::start(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
+    // The FINRA short-interest cache is shared by the scanner (row enrichment)
+    // and the on-demand company profile, so it lives here and threads into both.
+    let short_interest = Arc::new(cx_intel::short_interest::ShortInterestStore::new());
+    cx_intel::start(
+        Arc::clone(&bus),
+        Arc::clone(&store),
+        cfg.clone(),
+        Arc::clone(&short_interest),
+    );
 
     // AUTORESEARCH (scanner weights): the composite-weight self-optimization
     // loop — same contract as the strategy loop above (frozen data, bounded
@@ -228,7 +236,12 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
             Command::GetCompany { symbol } => {
-                cx_intel::serve_company(Arc::clone(&bus), symbol, cfg.intel.enable_company);
+                cx_intel::serve_company(
+                    Arc::clone(&bus),
+                    symbol,
+                    cfg.intel.enable_company,
+                    Arc::clone(&short_interest),
+                );
             }
             Command::GetFilings {
                 query,

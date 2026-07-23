@@ -277,7 +277,12 @@ impl ScanWeights {
 ///   applied via the clamped route (hard bounds compiled in here).
 /// Keeps the last flag set per symbol (bounded by the scanned universe) so
 /// each board carries the flags that TRANSITIONED on that cycle as alerts.
-pub fn spawn_scanner(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) {
+pub fn spawn_scanner(
+    bus: Arc<Bus>,
+    store: Arc<BarStore>,
+    cfg: Config,
+    short_interest: Arc<crate::short_interest::ShortInterestStore>,
+) {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
         let cadence = std::time::Duration::from_secs(cfg.intel.scanner_secs.max(60));
@@ -301,6 +306,7 @@ pub fn spawn_scanner(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) {
                     if board.rows.is_empty() {
                         continue;
                     }
+                    enrich_short_interest(&mut board.rows, &short_interest);
                     if let Some(prev) = &prev_flags {
                         board.alerts = alert_transitions(prev, &board.rows, board.ts_ms);
                     }
@@ -332,6 +338,22 @@ pub fn spawn_scanner(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) {
             }
         }
     });
+}
+
+/// Overlay FINRA short interest (shares) onto freshly scanned rows. Purely
+/// additive: a symbol absent from the snapshot keeps `short_interest: None`
+/// (the UI renders "—"). Short % of float is computed in the client from this
+/// plus the float — it stays "—" here until EDGAR float also reaches the scan
+/// rows, at which point it lights up with no further change.
+fn enrich_short_interest(
+    rows: &mut [ScanRow],
+    short_interest: &crate::short_interest::ShortInterestStore,
+) {
+    for row in rows.iter_mut() {
+        if let Some(reading) = short_interest.get(&row.symbol) {
+            row.short_interest = Some(reading.current);
+        }
+    }
 }
 
 /// One scan cycle with the base recipe and no regime context — the

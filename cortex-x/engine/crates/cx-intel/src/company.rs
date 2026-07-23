@@ -140,6 +140,24 @@ pub enum FundamentalsOutcome {
 }
 
 /// Latest annual fundamentals from EDGAR company facts.
+/// Overlay a FINRA short-interest reading onto a profile's fundamentals. Short
+/// % of float is computed downstream in the client from `short_interest ÷
+/// float_shares`, where `float_shares` is ESTIMATED as `public_float_usd ÷
+/// last_price` (EDGAR gives the dollar float + shares outstanding, never a
+/// float-share count). A no-op when the profile has no fundamentals block — a
+/// non-filer has no float to divide by, so the UI keeps showing "—". FINRA's
+/// avg-daily-volume (which drives days-to-cover, and needs no float) fills the
+/// gap only when EDGAR left it empty.
+pub fn apply_short_interest(profile: &mut CompanyProfile, si: &crate::short_interest::ShortInterest) {
+    if let Some(f) = profile.fundamentals.as_mut() {
+        f.short_interest = Some(si.current);
+        f.short_interest_date = Some(si.settlement_date.clone());
+        if f.avg_daily_volume.is_none() {
+            f.avg_daily_volume = si.avg_daily_volume;
+        }
+    }
+}
+
 pub async fn fetch_fundamentals(
     egress: &Egress,
     symbol: &str,

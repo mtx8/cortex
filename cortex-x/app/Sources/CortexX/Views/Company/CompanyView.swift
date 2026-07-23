@@ -556,18 +556,24 @@ struct CompanyView: View {
                 CompanyStatCell(label: CompanyStats.floatSharesLabel,
                                 value: derivedOK ? "≈ " + CompanyStats.abbrevCount(fShares) : "—",
                                 note: CompanyStats.floatSharesNote)
+                // ≈ because float% rides the estimated float-share count
+                // (dollar float ÷ current price), same as the "public float" cell.
                 CompanyStatCell(label: CompanyStats.floatPctLabel,
-                                value: derivedOK ? CompanyFormat.pct(fPct) : "—", note: CompanyStats.floatPctNote)
+                                value: derivedOK ? "≈ " + CompanyFormat.pct(fPct) : "—", note: CompanyStats.floatPctNote)
                 CompanyStatCell(label: CompanyStats.floatUsdLabel,
                                 value: CompanyFormat.abbrevMoney(f?.public_float_usd), note: CompanyStats.floatUsdNote)
-                // Short interest (FINRA, bi-monthly) — renders "—" honestly until
-                // the FINRA short-interest fetch is wired.
+                // Short interest — REAL FINRA Rule 4560 data (keyless bi-monthly
+                // consolidated file), as-of the settlement date in the note. The
+                // shares figure is exact; the % is ≈ because its float denominator
+                // is the estimated float-share count (which can over-state short%
+                // if the stock rallied since its 10-K cover). "—" when float is
+                // unavailable or the symbol is absent from the file; never fabricated.
                 CompanyStatCell(label: CompanyStats.shortPctFloatLabel,
-                                value: derivedOK ? CompanyFormat.pct(shortPct) : "—",
+                                value: derivedOK ? "≈ " + CompanyFormat.pct(shortPct) : "—",
                                 note: CompanyStats.shortAsOfNote(f?.short_interest_date))
                 CompanyStatCell(label: CompanyStats.daysToCoverLabel,
                                 value: CompanyStats.daysLabel(dtc),
-                                note: f?.short_interest == nil
+                                note: dtc == nil
                                     ? CompanyStats.daysToCoverNote
                                     : CompanyStats.shortAsOfNote(f?.short_interest_date))
             }

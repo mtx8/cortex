@@ -15,6 +15,7 @@ pub mod meridian;
 pub mod news;
 pub mod regimes;
 pub mod scanner;
+pub mod short_interest;
 pub mod splc_data;
 
 use std::sync::Arc;
@@ -28,7 +29,12 @@ use cx_core::Bus;
 /// Spawn the intel squadron's background tasks (REGIMES scanner + MERIDIAN
 /// poller + SCANNER + NEWS poller). COMPANY is on-demand — dispatch
 /// [`serve_company`] from the command loop instead.
-pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) {
+pub fn start(
+    bus: Arc<Bus>,
+    store: Arc<BarStore>,
+    cfg: Config,
+    short_interest: Arc<short_interest::ShortInterestStore>,
+) {
     if cfg.intel.enable_regimes {
         regimes::spawn_scanner(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
     }
@@ -36,7 +42,17 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) {
         meridian::spawn_poller(Arc::clone(&bus), cfg.clone());
     }
     if cfg.intel.enable_scanner {
-        scanner::spawn_scanner(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
+        scanner::spawn_scanner(
+            Arc::clone(&bus),
+            Arc::clone(&store),
+            cfg.clone(),
+            Arc::clone(&short_interest),
+        );
+    }
+    // FINRA short-interest refresh feeds the scanner AND the on-demand company
+    // profile, so keep it warm whenever either consumer is enabled.
+    if cfg.intel.enable_scanner || cfg.intel.enable_company {
+        short_interest::spawn_refresh(Arc::clone(&short_interest));
     }
     if cfg.intel.enable_news {
         news::spawn_poller(Arc::clone(&bus), cfg.clone());
@@ -46,7 +62,12 @@ pub fn start(bus: Arc<Bus>, store: Arc<BarStore>, cfg: Config) {
 /// Handle `Command::GetCompany`: build the profile (curated graph + EDGAR
 /// fundamentals, each degrading independently) and publish it. Never errors
 /// outward — an unfetchable side is disclosed in the profile's source labels.
-pub fn serve_company(bus: Arc<Bus>, symbol: String, enabled: bool) {
+pub fn serve_company(
+    bus: Arc<Bus>,
+    symbol: String,
+    enabled: bool,
+    short_interest: Arc<short_interest::ShortInterestStore>,
+) {
     tokio::spawn(async move {
         if !enabled {
             // Still answer: a silent request leaves the client's loading
@@ -55,7 +76,13 @@ pub fn serve_company(bus: Arc<Bus>, symbol: String, enabled: bool) {
             return;
         }
         let egress = Egress::new();
-        let profile = company::fetch_company(&egress, &symbol).await;
+        let mut profile = company::fetch_company(&egress, &symbol).await;
+        // Overlay real FINRA short interest (keyless) so Statistics can show a
+        // true short % of float / days-to-cover; a symbol not in the snapshot
+        // leaves the fields None (UI "—").
+        if let Some(reading) = short_interest.get(&symbol) {
+            company::apply_short_interest(&mut profile, &reading);
+        }
         bus.publish(EngineEvent::Company(profile));
     });
 }

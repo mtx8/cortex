@@ -21,6 +21,10 @@ pub const ALLOWED_HOSTS: &[&str] = &[
     // EDGAR full-text search (intel/FILINGS dedicated browser). Same hardened
     // egress: https-only, no redirects, byte cap, timeout; keyless, no secrets.
     "efts.sec.gov",
+    // FINRA consolidated bi-monthly short interest (Rule 4560) — keyless public
+    // CSV, the authoritative source for short % of float. Same hardened egress:
+    // https-only, no redirects, byte cap, timeout; no credentials ever sent.
+    "cdn.finra.org",
     "api.gdeltproject.org",
     // Read-only news/RSS + Atom feeds (intel/NEWS side only). Same hardened
     // egress: https-only, no redirects, byte cap, timeout. No credentials

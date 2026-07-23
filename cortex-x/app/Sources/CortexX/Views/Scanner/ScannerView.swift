@@ -265,11 +265,15 @@ struct ScanColumnLayout: RawRepresentable, Equatable {
         var visible: [ScanColumn]
     }
     var rawValue: String {
-        // Sort the set into a stable order so the JSON is deterministic — an
-        // unsorted Set would serialize differently each access, thrashing
-        // @AppStorage writes and SwiftUI change detection.
+        // Full determinism so persistence never thrashes: sort the visible SET
+        // into a stable array AND set .sortedKeys (JSONEncoder otherwise emits
+        // the object's top-level keys in a per-process hash order). Without both,
+        // rawValue varies between encodes of an unchanged layout, causing
+        // needless @AppStorage writes + SwiftUI change-detection churn.
         let payload = Payload(order: order, visible: visible.sorted { $0.rawValue < $1.rawValue })
-        return (try? JSONEncoder().encode(payload)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return (try? encoder.encode(payload)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
     }
     init?(rawValue: String) {
         guard let data = rawValue.data(using: .utf8),
@@ -1353,8 +1357,7 @@ private struct ScanRowView: View {
         case .sector: sectorCell
         case .marketCap: marketCapCell
         case .floatUsd: rawCell(CompanyFormat.abbrevMoney(row.public_float_usd), present: row.public_float_usd != nil, width: ScanCol.floatUsd)
-        // Short % of float is FINRA-gated (bi-monthly) — "—" until wired.
-        case .shortFloat: rawCell("—", present: false, width: ScanCol.shortFloat)
+        case .shortFloat: shortFloatCell
         case .news: newsCell
         case .regime: regimeCell
         case .flags: flagsCell
@@ -1395,6 +1398,24 @@ private struct ScanRowView: View {
             return c.isFinite ? c : nil
         }()
         return rawCell(CompanyFormat.abbrevMoney(cap), present: cap != nil, width: ScanCol.mktcap)
+    }
+
+    private var shortFloatCell: some View {
+        // Real FINRA short interest (bi-monthly, keyless) ÷ the derived float-share
+        // estimate (float$ ÷ price), gated by the SAME honesty check the company
+        // view uses. Renders "—" until scan rows also carry EDGAR float; never
+        // fabricated. Once float reaches the rows this lights up with no change.
+        let p = price ?? (row.last_close.isFinite ? row.last_close : nil)
+        let fShares = CompanyStats.floatShares(floatUSD: row.public_float_usd, lastPrice: p)
+        let fPct = CompanyStats.floatPct(floatShares: fShares, sharesOutstanding: row.shares_outstanding)
+        let derivedOK = (fPct ?? 0) <= 1.02
+        let pct = derivedOK
+            ? CompanyStats.shortPctFloat(shortInterest: row.short_interest, floatShares: fShares)
+            : nil
+        // ≈ — the float denominator is the estimated float-share count, same
+        // honesty marker the company view uses.
+        return rawCell(pct != nil ? "≈" + CompanyFormat.pct(pct) : "—",
+                       present: pct != nil, width: ScanCol.shortFloat)
     }
 
     /// News flag: an ember newspaper glyph when a headline landed this window.
