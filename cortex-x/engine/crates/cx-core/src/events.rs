@@ -595,6 +595,18 @@ pub struct Fundamentals {
     /// Public float as a DOLLAR amount from the latest 10-K cover (dei
     /// `EntityPublicFloat`) — NOT a share count. Honestly a $ value.
     pub public_float_usd: Option<f64>,
+    /// FINRA consolidated short interest — shares sold short (a COUNT, not $),
+    /// published BI-MONTHLY on settlement dates with a ~2-week delay (Rule 4560).
+    /// There is no live short-interest source; `short_interest_date` discloses the
+    /// settlement date so the UI never styles it as live. Additive/serde-default.
+    #[serde(default)]
+    pub short_interest: Option<f64>,
+    /// Settlement date the short interest is "as of" ("YYYY-MM-DD").
+    #[serde(default)]
+    pub short_interest_date: Option<String>,
+    /// Average daily volume (shares/day) for days-to-cover = short interest ÷ avg.
+    #[serde(default)]
+    pub avg_daily_volume: Option<f64>,
     /// e.g. "FY" or "Q2"; `fiscal_year` e.g. "2026".
     pub period: String,
     pub fiscal_year: String,

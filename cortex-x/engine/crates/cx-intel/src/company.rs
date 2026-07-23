@@ -370,6 +370,11 @@ pub(crate) fn parse_companyfacts(raw: &str) -> Result<Option<Fundamentals>, CxEr
         cash: val(&cash),
         shares_outstanding,
         public_float_usd,
+        // Short interest is a separate FINRA (Rule 4560) integration, not EDGAR —
+        // left None here; a dedicated bi-monthly fetch populates it later.
+        short_interest: None,
+        short_interest_date: None,
+        avg_daily_volume: None,
         period: "FY".into(),
         fiscal_year,
     }))

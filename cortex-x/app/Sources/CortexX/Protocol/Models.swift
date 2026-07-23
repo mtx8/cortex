@@ -731,6 +731,15 @@ struct Fundamentals: Codable, Equatable {
     /// NEW OPTIONAL wire field — aggregate public float in USD, as reported on
     /// the 10-K cover page. A DOLLAR value, never a share count. Absent → nil.
     var public_float_usd: Double? = nil
+    /// FINRA consolidated short interest — shares short (a COUNT), published
+    /// BI-MONTHLY on settlement dates with a ~2-week delay. Never live; the date
+    /// discloses "as of". Absent (no FINRA fetch yet) → nil, and the STATISTICS
+    /// cells render "—". The synthesized decoder handles decodeIfPresent.
+    var short_interest: Double? = nil
+    /// Settlement date the short interest is as-of ("YYYY-MM-DD").
+    var short_interest_date: String? = nil
+    /// Average daily volume (shares/day) — the days-to-cover denominator.
+    var avg_daily_volume: Double? = nil
     var period: String
     var fiscal_year: String
 }

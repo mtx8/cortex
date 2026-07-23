@@ -28,6 +28,13 @@ enum CompanyStats {
     static let floatPctNote = "of shares out"
     static let floatUsdLabel = "$ float"
     static let floatUsdNote = "public float (USD, dei cover)"
+    // Short interest is FINRA Rule 4560 — bi-monthly, ~2wk delayed. Never live.
+    static let shortPctFloatLabel = "short % float"
+    static let daysToCoverLabel = "days to cover"
+    static let daysToCoverNote = "short int ÷ avg vol"
+    static func shortAsOfNote(_ date: String?) -> String {
+        (date?.isEmpty == false) ? "as of \(date!) · bi-monthly" : "bi-monthly (FINRA)"
+    }
 
     /// Market cap = shares_outstanding × last price, computed CLIENT-side.
     /// nil-safe: any nil, non-finite, or non-positive input yields nil — never
@@ -92,6 +99,31 @@ enum CompanyStats {
     static func ratioLabel(_ v: Double?) -> String {
         guard let v, v.isFinite else { return "—" }
         return String(format: "%.1f×", v)
+    }
+
+    /// Short interest as a fraction of float shares (0.18 → 18%). Uses the SAME
+    /// derived float-share estimate as the float cells, so the caller gates it on
+    /// the same honesty check. nil-safe.
+    static func shortPctFloat(shortInterest: Double?, floatShares: Double?) -> Double? {
+        guard let si = shortInterest, si.isFinite, si > 0,
+              let fs = floatShares, fs.isFinite, fs > 0 else { return nil }
+        let p = si / fs
+        return p.isFinite ? p : nil
+    }
+
+    /// Days-to-cover = short interest ÷ average daily volume. Price/float-
+    /// independent (no honesty gate needed). nil-safe.
+    static func daysToCover(shortInterest: Double?, avgVolume: Double?) -> Double? {
+        guard let si = shortInterest, si.isFinite, si > 0,
+              let v = avgVolume, v.isFinite, v > 0 else { return nil }
+        let d = si / v
+        return d.isFinite ? d : nil
+    }
+
+    /// A duration like "3.4d" (a day count, not a "×" multiple). nil → em dash.
+    static func daysLabel(_ v: Double?) -> String {
+        guard let v, v.isFinite else { return "—" }
+        return String(format: "%.1fd", v)
     }
 
     /// Abbreviated share COUNT: 24.6B / 890M / 12.5K / 950. No `$` — this is a

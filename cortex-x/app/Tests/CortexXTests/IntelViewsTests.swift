@@ -282,6 +282,40 @@ final class IntelViewsTests: XCTestCase {
         XCTAssertNil(CompanyStats.floatShares(floatUSD: 2.6e12, lastPrice: 0))
     }
 
+    func testShortInterestHelpersNilSafeAndHonest() {
+        // Short % of float = short interest ÷ float shares.
+        let p = try? XCTUnwrap(CompanyStats.shortPctFloat(shortInterest: 1.8e9, floatShares: 1.0e10))
+        XCTAssertEqual(p ?? .nan, 0.18, accuracy: 1e-9)
+        XCTAssertNil(CompanyStats.shortPctFloat(shortInterest: nil, floatShares: 1.0e10)) // no data → nil (—)
+        XCTAssertNil(CompanyStats.shortPctFloat(shortInterest: 1.8e9, floatShares: 0))
+        // Days-to-cover = short interest ÷ avg volume.
+        let d = try? XCTUnwrap(CompanyStats.daysToCover(shortInterest: 3.0e8, avgVolume: 1.0e8))
+        XCTAssertEqual(d ?? .nan, 3.0, accuracy: 1e-9)
+        XCTAssertNil(CompanyStats.daysToCover(shortInterest: 3.0e8, avgVolume: nil))
+        XCTAssertEqual(CompanyStats.daysLabel(3.4), "3.4d")
+        XCTAssertEqual(CompanyStats.daysLabel(nil), "—")
+        // As-of note discloses the settlement date / bi-monthly cadence — never live.
+        XCTAssertTrue(CompanyStats.shortAsOfNote("2026-07-15").contains("2026-07-15"))
+        XCTAssertTrue(CompanyStats.shortAsOfNote("2026-07-15").lowercased().contains("bi-monthly"))
+        XCTAssertTrue(CompanyStats.shortAsOfNote(nil).lowercased().contains("finra"))
+    }
+
+    func testFundamentalsShortFieldsDecodeAbsentAsNil() throws {
+        // Back-compat: an old payload without the short fields decodes to nil,
+        // so the STATISTICS short cells honestly render "—".
+        let json = #"{"revenue":4.0e11,"period":"FY","fiscal_year":"2026"}"#
+        let f = try JSONDecoder().decode(Fundamentals.self, from: Data(json.utf8))
+        XCTAssertNil(f.short_interest)
+        XCTAssertNil(f.short_interest_date)
+        XCTAssertNil(f.avg_daily_volume)
+        // And a populated payload round-trips.
+        let json2 = #"{"period":"FY","fiscal_year":"2026","short_interest":1.8e9,"short_interest_date":"2026-07-15","avg_daily_volume":5.0e7}"#
+        let f2 = try JSONDecoder().decode(Fundamentals.self, from: Data(json2.utf8))
+        XCTAssertEqual(f2.short_interest, 1.8e9)
+        XCTAssertEqual(f2.short_interest_date, "2026-07-15")
+        XCTAssertEqual(f2.avg_daily_volume, 5.0e7)
+    }
+
     func testFlowColumnWalkableFirstOrdering() {
         // Walkable rows (with a ticker → can pivot the board) lead, then alpha.
         let rels = [

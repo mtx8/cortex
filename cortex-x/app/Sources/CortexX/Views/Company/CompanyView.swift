@@ -545,6 +545,11 @@ struct CompanyView: View {
                                     note: "equity ÷ shares")
                 }
             }
+            // Short % of float reuses the derived float-share estimate, so it
+            // inherits the float estimate's honesty gate; days-to-cover does not.
+            let shortPct = derivedOK
+                ? CompanyStats.shortPctFloat(shortInterest: f?.short_interest, floatShares: fShares) : nil
+            let dtc = CompanyStats.daysToCover(shortInterest: f?.short_interest, avgVolume: f?.avg_daily_volume)
             statGroup("share statistics") {
                 CompanyStatCell(label: CompanyStats.sharesLabel,
                                 value: CompanyStats.abbrevCount(f?.shares_outstanding), note: CompanyStats.sharesNote)
@@ -555,6 +560,16 @@ struct CompanyView: View {
                                 value: derivedOK ? CompanyFormat.pct(fPct) : "—", note: CompanyStats.floatPctNote)
                 CompanyStatCell(label: CompanyStats.floatUsdLabel,
                                 value: CompanyFormat.abbrevMoney(f?.public_float_usd), note: CompanyStats.floatUsdNote)
+                // Short interest (FINRA, bi-monthly) — renders "—" honestly until
+                // the FINRA short-interest fetch is wired.
+                CompanyStatCell(label: CompanyStats.shortPctFloatLabel,
+                                value: derivedOK ? CompanyFormat.pct(shortPct) : "—",
+                                note: CompanyStats.shortAsOfNote(f?.short_interest_date))
+                CompanyStatCell(label: CompanyStats.daysToCoverLabel,
+                                value: CompanyStats.daysLabel(dtc),
+                                note: f?.short_interest == nil
+                                    ? CompanyStats.daysToCoverNote
+                                    : CompanyStats.shortAsOfNote(f?.short_interest_date))
             }
         }
     }
