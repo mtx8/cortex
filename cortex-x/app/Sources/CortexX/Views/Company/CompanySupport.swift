@@ -60,6 +60,40 @@ enum CompanyStats {
         return pct.isFinite ? pct : nil
     }
 
+    // Derived valuation ratios — computed ONLY from figures we actually hold
+    // (price + reported fundamentals), never fabricated. Each is nil unless every
+    // input is finite and positive, so a missing metric renders "—".
+
+    /// Price / earnings = last price ÷ EPS (trailing). nil for zero/negative EPS.
+    static func peRatio(lastPrice: Double?, eps: Double?) -> Double? {
+        guard let px = lastPrice, px.isFinite, px > 0,
+              let e = eps, e.isFinite, e > 0 else { return nil }
+        let r = px / e
+        return r.isFinite ? r : nil
+    }
+
+    /// A market-cap ratio (P/S over revenue, P/B over equity). nil-safe.
+    static func capRatio(_ cap: Double?, over denom: Double?) -> Double? {
+        guard let c = cap, c.isFinite, c > 0,
+              let d = denom, d.isFinite, d > 0 else { return nil }
+        let r = c / d
+        return r.isFinite ? r : nil
+    }
+
+    /// Book value per share = shareholder equity ÷ shares outstanding.
+    static func bookValuePerShare(equity: Double?, shares: Double?) -> Double? {
+        guard let eq = equity, eq.isFinite,
+              let s = shares, s.isFinite, s > 0 else { return nil }
+        let bv = eq / s
+        return bv.isFinite ? bv : nil
+    }
+
+    /// A plain ratio like "28.4×" (nil → em dash).
+    static func ratioLabel(_ v: Double?) -> String {
+        guard let v, v.isFinite else { return "—" }
+        return String(format: "%.1f×", v)
+    }
+
     /// Abbreviated share COUNT: 24.6B / 890M / 12.5K / 950. No `$` — this is a
     /// count, never money. nil / non-finite → em dash (never 0). Mirrors the
     /// abbrevMoney thresholds so the two read consistently side by side.
@@ -112,6 +146,37 @@ enum CompanyTab: String, CaseIterable, Identifiable {
             tabs.append(.supplyChain)
         }
         return tabs
+    }
+}
+
+// MARK: - Company tab button (underline nav)
+
+/// One tab in the company board's underline nav. Active = bone label over a 2px
+/// ember rule; inactive = dim, brightening to bone on hover. No pill, no fill —
+/// the professional terminal grammar.
+struct CompanyTabButton: View {
+    let title: String
+    let active: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Text(title.uppercased())
+                    .font(.system(size: 11, weight: .semibold))
+                    .tracking(1.3)
+                    .foregroundStyle(active ? Theme.bone : (hovering ? Theme.bone : Theme.dim))
+                    .lineLimit(1)
+                    .fixedSize()
+                Rectangle()
+                    .fill(active ? Theme.ember : Color.clear)
+                    .frame(height: 2)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
     }
 }
 

@@ -282,6 +282,24 @@ final class IntelViewsTests: XCTestCase {
         XCTAssertNil(CompanyStats.floatShares(floatUSD: 2.6e12, lastPrice: 0))
     }
 
+    func testValuationRatiosDerivedHonestlyNilSafe() {
+        // P/E = price ÷ EPS; nil for zero/negative EPS (never a fabricated ratio).
+        XCTAssertEqual(try XCTUnwrap(CompanyStats.peRatio(lastPrice: 200, eps: 8)), 25, accuracy: 1e-9)
+        XCTAssertNil(CompanyStats.peRatio(lastPrice: 200, eps: 0))
+        XCTAssertNil(CompanyStats.peRatio(lastPrice: 200, eps: -3))
+        XCTAssertNil(CompanyStats.peRatio(lastPrice: nil, eps: 8))
+        // cap ratios (P/S over revenue, P/B over equity).
+        XCTAssertEqual(try XCTUnwrap(CompanyStats.capRatio(4.0e12, over: 4.0e11)), 10, accuracy: 1e-9)
+        XCTAssertNil(CompanyStats.capRatio(4.0e12, over: 0))
+        XCTAssertNil(CompanyStats.capRatio(nil, over: 4.0e11))
+        // book value / share = equity ÷ shares.
+        XCTAssertEqual(try XCTUnwrap(CompanyStats.bookValuePerShare(equity: 7.0e10, shares: 1.4e10)), 5, accuracy: 1e-9)
+        XCTAssertNil(CompanyStats.bookValuePerShare(equity: 7.0e10, shares: 0))
+        // ratio label formats with a × and dims on nil.
+        XCTAssertEqual(CompanyStats.ratioLabel(28.4), "28.4×")
+        XCTAssertEqual(CompanyStats.ratioLabel(nil), "—")
+    }
+
     func testFloatPctIsBoundedAndNilSafe() {
         // Float shares 11.8B of 15.1B outstanding ≈ 78% — always < 1 for a real
         // company (float is a subset of outstanding).

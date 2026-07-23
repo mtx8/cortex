@@ -7,14 +7,13 @@ struct TopBar: View {
 
     var body: some View {
         HStack(spacing: 16) {
-            // Fixed brand slot → the search field's left edge never shifts, and
-            // hairline seams give the search its own command bay (terminal grammar).
-            brand.frame(width: 86, alignment: .leading)
-            Divider().frame(height: 16).overlay(Theme.line)
+            // No wordmark — the global symbol search leads the top-left (the app
+            // is identified by its window/dock icon). A hairline seam separates it
+            // from the account vitals.
             SymbolSearchField()
             Divider().frame(height: 16).overlay(Theme.line)
             // Isolated leaf: a ~12 Hz account mark re-lays-out only these three
-            // cells, not the brand / search / broker badge / connection.
+            // cells, not the search / broker badge / connection.
             AccountVitals()
             Spacer()
             if model.risk.kill_switch {
@@ -40,18 +39,11 @@ struct TopBar: View {
             brokerBadge
             connection
         }
-        .padding(.horizontal, 16)
+        // Leading inset clears the macOS traffic-light buttons (hidden title bar),
+        // so the search sits cleanly in the top-left instead of under them.
+        .padding(.leading, 78)
+        .padding(.trailing, 16)
         .padding(.vertical, 8)
-    }
-
-    // Single clean wordmark — the gimmicky double-X is gone; ember is reserved
-    // for active/hover state, so the mark stays all-bone.
-    private var brand: some View {
-        Text("CORTEX")
-            .font(.system(size: 13, weight: .bold))
-            .tracking(2.0)
-            .foregroundStyle(Theme.bone)
-            .fixedSize()
     }
 
 

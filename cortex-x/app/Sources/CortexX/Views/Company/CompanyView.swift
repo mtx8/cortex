@@ -131,19 +131,18 @@ struct CompanyView: View {
 
     // MARK: Tab bar + content router
 
+    /// Bloomberg/Yahoo-style underline nav: uppercase letterspaced labels, bone
+    /// when active over a 2px ember underline, dim otherwise — no pills, no fills.
     private func tabBar(_ tabs: [CompanyTab], active: CompanyTab) -> some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 22) {
             ForEach(tabs) { t in
-                DeckSegment(title: t.title, isOn: active == t) {
+                CompanyTabButton(title: t.title, active: active == t) {
                     withAnimation(DeckMotion.ease()) { tab = t }
                 }
-                .fixedSize()
             }
             Spacer(minLength: 0)
         }
-        .padding(3)
-        .padding(.horizontal, 13)
-        .padding(.vertical, 5)
+        .padding(.horizontal, 16)
     }
 
     @ViewBuilder
@@ -343,44 +342,60 @@ struct CompanyView: View {
         }
     }
 
+    /// A labeled sub-group of stat cells in a 3-col panel — the professional
+    /// terminal grammar (INCOME / MARGINS / BALANCE SHEET rather than one flat grid).
+    private func statGroup<Content: View>(
+        _ title: String, @ViewBuilder _ content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            SectionLabel(text: title)
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: 10, alignment: .leading), count: 3),
+                alignment: .leading, spacing: 14
+            ) {
+                content()
+            }
+            .padding(12)
+            .panel()
+        }
+    }
+
     @ViewBuilder
     private func fundamentalsSection(_ p: CompanyProfile) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                SectionLabel(text: "fundamentals")
-                if let f = p.fundamentals {
+        if let f = p.fundamentals {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 8) {
+                    SectionLabel(text: "financials")
                     Text("\(f.period) · FY\(f.fiscal_year)")
                         .font(.system(size: 10))
                         .monospacedDigit()
                         .foregroundStyle(Theme.dim)
+                    Spacer(minLength: 0)
+                }
+                statGroup("income statement") {
+                    CompanyStatCell(label: "revenue", value: CompanyFormat.abbrevMoney(f.revenue), note: "reported")
+                    CompanyStatCell(label: "rev yoy", value: CompanyFormat.pct(f.revenue_yoy, signed: true),
+                                    note: "year over year", tint: f.revenue_yoy.map { Theme.pnlColor($0) })
+                    CompanyStatCell(label: "net income", value: CompanyFormat.abbrevMoney(f.net_income), note: "bottom line")
+                    CompanyStatCell(label: "eps", value: CompanyFormat.plain(f.eps), note: "per share")
+                    CompanyStatCell(label: "op cash flow", value: CompanyFormat.abbrevMoney(f.ocf), note: "cash from ops")
+                }
+                statGroup("margins") {
+                    CompanyStatCell(label: "gross margin", value: CompanyFormat.pct(f.gross_margin), note: "of revenue")
+                    CompanyStatCell(label: "op margin", value: CompanyFormat.pct(f.op_margin), note: "of revenue")
+                    CompanyStatCell(label: "net margin", value: CompanyFormat.pct(f.net_margin), note: "of revenue")
+                }
+                statGroup("balance sheet") {
+                    CompanyStatCell(label: "assets", value: CompanyFormat.abbrevMoney(f.assets), note: "total")
+                    CompanyStatCell(label: "liabilities", value: CompanyFormat.abbrevMoney(f.liabilities), note: "total")
+                    CompanyStatCell(label: "equity", value: CompanyFormat.abbrevMoney(f.equity), note: "shareholder")
+                    CompanyStatCell(label: "cash", value: CompanyFormat.abbrevMoney(f.cash), note: "& equivalents")
                 }
             }
-            if let f = p.fundamentals {
-                LazyVGrid(
-                    columns: Array(repeating: GridItem(.flexible(), spacing: 10, alignment: .leading), count: 3),
-                    alignment: .leading, spacing: 12
-                ) {
-                    metric("revenue", CompanyFormat.abbrevMoney(f.revenue))
-                    metric("rev yoy", CompanyFormat.pct(f.revenue_yoy, signed: true),
-                           tint: f.revenue_yoy.map { Theme.pnlColor($0) })
-                    metric("gross margin", CompanyFormat.pct(f.gross_margin))
-                    metric("op margin", CompanyFormat.pct(f.op_margin))
-                    metric("net margin", CompanyFormat.pct(f.net_margin))
-                    metric("eps", CompanyFormat.plain(f.eps))
-                    metric("net income", CompanyFormat.abbrevMoney(f.net_income))
-                    metric("op cash flow", CompanyFormat.abbrevMoney(f.ocf))
-                    metric("cash", CompanyFormat.abbrevMoney(f.cash))
-                    metric("assets", CompanyFormat.abbrevMoney(f.assets))
-                    metric("liabilities", CompanyFormat.abbrevMoney(f.liabilities))
-                    metric("equity", CompanyFormat.abbrevMoney(f.equity))
-                }
-                .padding(12)
-                .panel()
-            } else {
-                Text("no fundamentals available")
-                    .font(.system(size: 10))
-                    .foregroundStyle(Theme.dim)
-            }
+        } else {
+            Text("no fundamentals available")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.dim)
         }
     }
 
@@ -406,50 +421,41 @@ struct CompanyView: View {
     @ViewBuilder
     private func statisticsSection(_ p: CompanyProfile) -> some View {
         let f = p.fundamentals
-        if f?.shares_outstanding != nil || f?.public_float_usd != nil {
-            let px = model.lastPrice(p.symbol)
-            let cap = CompanyStats.marketCap(shares: f?.shares_outstanding, lastPrice: px)
-            // Float on the SHARE axis so it reads correctly BELOW shares out.
-            let fShares = CompanyStats.floatShares(floatUSD: f?.public_float_usd, lastPrice: px)
-            let fPct = CompanyStats.floatPct(floatShares: fShares, sharesOutstanding: f?.shares_outstanding)
-            // Honesty gate: if the derived float exceeds ~102% of shares out, the
-            // stale-price estimate has broken down — suppress the derived cells
-            // (show —) and keep only the exact reported dollar figure.
-            let derivedOK = (fPct ?? 0) <= 1.02
-            VStack(alignment: .leading, spacing: 8) {
-                SectionLabel(text: "statistics")
-                LazyVGrid(
-                    columns: Array(repeating: GridItem(.flexible(), spacing: 10, alignment: .leading), count: 3),
-                    alignment: .leading, spacing: 12
-                ) {
-                    CompanyStatCell(
-                        label: CompanyStats.marketCapLabel,
-                        value: CompanyFormat.abbrevMoney(cap),
-                        note: CompanyStats.marketCapNote
-                    )
-                    CompanyStatCell(
-                        label: CompanyStats.sharesLabel,
-                        value: CompanyStats.abbrevCount(f?.shares_outstanding),
-                        note: CompanyStats.sharesNote
-                    )
-                    CompanyStatCell(
-                        label: CompanyStats.floatSharesLabel,
-                        value: derivedOK ? "≈ " + CompanyStats.abbrevCount(fShares) : "—",
-                        note: CompanyStats.floatSharesNote
-                    )
-                    CompanyStatCell(
-                        label: CompanyStats.floatPctLabel,
-                        value: derivedOK ? CompanyFormat.pct(fPct) : "—",
-                        note: CompanyStats.floatPctNote
-                    )
-                    CompanyStatCell(
-                        label: CompanyStats.floatUsdLabel,
-                        value: CompanyFormat.abbrevMoney(f?.public_float_usd),
-                        note: CompanyStats.floatUsdNote
-                    )
+        let px = model.lastPrice(p.symbol)
+        let cap = CompanyStats.marketCap(shares: f?.shares_outstanding, lastPrice: px)
+        // Float on the SHARE axis so it reads correctly BELOW shares out.
+        let fShares = CompanyStats.floatShares(floatUSD: f?.public_float_usd, lastPrice: px)
+        let fPct = CompanyStats.floatPct(floatShares: fShares, sharesOutstanding: f?.shares_outstanding)
+        // Honesty gate: if the derived float exceeds ~102% of shares out, the
+        // stale-price estimate has broken down — suppress the derived cells (—).
+        let derivedOK = (fPct ?? 0) <= 1.02
+        VStack(alignment: .leading, spacing: 16) {
+            // Valuation — derived ONLY from price + reported fundamentals.
+            if let f {
+                statGroup("valuation") {
+                    CompanyStatCell(label: CompanyStats.marketCapLabel,
+                                    value: CompanyFormat.abbrevMoney(cap), note: CompanyStats.marketCapNote)
+                    CompanyStatCell(label: "p/e", value: CompanyStats.ratioLabel(
+                        CompanyStats.peRatio(lastPrice: px, eps: f.eps)), note: "price ÷ eps")
+                    CompanyStatCell(label: "p/s", value: CompanyStats.ratioLabel(
+                        CompanyStats.capRatio(cap, over: f.revenue)), note: "cap ÷ revenue")
+                    CompanyStatCell(label: "p/b", value: CompanyStats.ratioLabel(
+                        CompanyStats.capRatio(cap, over: f.equity)), note: "cap ÷ equity")
+                    CompanyStatCell(label: "book / share", value: CompanyFormat.abbrevMoney(
+                        CompanyStats.bookValuePerShare(equity: f.equity, shares: f.shares_outstanding)),
+                                    note: "equity ÷ shares")
                 }
-                .padding(12)
-                .panel()
+            }
+            statGroup("share statistics") {
+                CompanyStatCell(label: CompanyStats.sharesLabel,
+                                value: CompanyStats.abbrevCount(f?.shares_outstanding), note: CompanyStats.sharesNote)
+                CompanyStatCell(label: CompanyStats.floatSharesLabel,
+                                value: derivedOK ? "≈ " + CompanyStats.abbrevCount(fShares) : "—",
+                                note: CompanyStats.floatSharesNote)
+                CompanyStatCell(label: CompanyStats.floatPctLabel,
+                                value: derivedOK ? CompanyFormat.pct(fPct) : "—", note: CompanyStats.floatPctNote)
+                CompanyStatCell(label: CompanyStats.floatUsdLabel,
+                                value: CompanyFormat.abbrevMoney(f?.public_float_usd), note: CompanyStats.floatUsdNote)
             }
         }
     }
