@@ -920,6 +920,15 @@ struct ScanRow: Codable, Equatable, Identifiable {
     var regime: RegimeState?
     var flags: [String]
     var last_close: Double
+    /// Curated sector ("Technology", …), or nil when uncurated. Additive wire
+    /// field (old engines omit it → nil → the SECTOR column shows "—").
+    var sector: String? = nil
+    /// Fundamentals for the market-cap / float columns; nil until a fundamentals
+    /// cache warms them, so those columns honestly render "—".
+    var shares_outstanding: Double? = nil
+    var public_float_usd: Double? = nil
+    /// FINRA short interest (shares); nil until wired → SHORT%FLT renders "—".
+    var short_interest: Double? = nil
     var id: String { symbol }
 }
 

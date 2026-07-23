@@ -838,6 +838,21 @@ pub struct ScanRow {
     /// "breakout setup", "oversold bounce", "vol expansion".
     pub flags: Vec<String>,
     pub last_close: f64,
+    /// Curated GICS-ish sector ("Technology", …), zero-network from the curated
+    /// universe; `None` when uncurated. Additive/serde-default.
+    #[serde(default)]
+    pub sector: Option<String>,
+    /// Cover-page shares outstanding (dei) — the market-cap numerator (× live
+    /// price, client-side). `None` until the fundamentals cache warms it.
+    #[serde(default)]
+    pub shares_outstanding: Option<f64>,
+    /// Public float (USD, 10-K cover). `None` until fundamentals warm it.
+    #[serde(default)]
+    pub public_float_usd: Option<f64>,
+    /// FINRA short interest (shares, bi-monthly) — `None` until a short-interest
+    /// fetch is wired; the UI renders "—" and never styles it as live.
+    #[serde(default)]
+    pub short_interest: Option<f64>,
 }
 
 /// One SCANNER alert: a flag that TRANSITIONED ON for `symbol` on this scan

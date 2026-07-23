@@ -1142,6 +1142,7 @@ mod tests {
             regime: None,
             flags: vec![],
             last_close: 100.0,
+            sector: None, shares_outstanding: None, public_float_usd: None, short_interest: None,
         };
         EngineEvent::Scan(ScanBoard {
             rows: vec![

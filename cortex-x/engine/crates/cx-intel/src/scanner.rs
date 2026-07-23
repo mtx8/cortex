@@ -372,6 +372,11 @@ pub fn scan_with(
                 ranks.meanrev[i],
                 ranks.vol_state[i],
             );
+            // Sector from the curated universe (zero-network) — computed before
+            // the literal moves `r.symbol`.
+            let sector = crate::splc_data::curated(&r.symbol)
+                .map(|c| c.sector)
+                .filter(|s: &String| !s.is_empty());
             ScanRow {
                 asset_class: if r.symbol.contains('-') {
                     "crypto".into()
@@ -396,6 +401,12 @@ pub fn scan_with(
                 regime: r.regime,
                 flags: r.flags,
                 last_close: r.last_close,
+                // Sector real now; the rest warm from fundamentals / FINRA later
+                // and stay None (the UI renders "—", never a fabricated number).
+                sector,
+                shares_outstanding: None,
+                public_float_usd: None,
+                short_interest: None,
             }
         })
         .collect();
@@ -1325,6 +1336,7 @@ mod tests {
             regime: None,
             flags: flags.iter().map(|f| f.to_string()).collect(),
             last_close: 100.0,
+            sector: None, shares_outstanding: None, public_float_usd: None, short_interest: None,
         }
     }
 
