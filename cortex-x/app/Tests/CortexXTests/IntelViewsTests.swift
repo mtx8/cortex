@@ -282,6 +282,23 @@ final class IntelViewsTests: XCTestCase {
         XCTAssertNil(CompanyStats.floatShares(floatUSD: 2.6e12, lastPrice: 0))
     }
 
+    func testFlowColumnWalkableFirstOrdering() {
+        // Walkable rows (with a ticker → can pivot the board) lead, then alpha.
+        let rels = [
+            Relation(symbol: nil, name: "Zeta Private", via: "x"),
+            Relation(symbol: "AMD", name: "Advanced Micro", via: "y"),
+            Relation(symbol: nil, name: "Acme Private", via: "z"),
+            Relation(symbol: "TSM", name: "TSMC", via: "w"),
+        ]
+        let ordered = FlowColumn.walkableFirst(rels)
+        XCTAssertEqual(ordered.map(\.name), ["Advanced Micro", "TSMC", "Acme Private", "Zeta Private"])
+        // Walkable block first, non-walkable block second; each block alphabetical.
+        XCTAssertNotNil(ordered[0].symbol)
+        XCTAssertNotNil(ordered[1].symbol)
+        XCTAssertNil(ordered[2].symbol)
+        XCTAssertNil(ordered[3].symbol)
+    }
+
     func testValuationRatiosDerivedHonestlyNilSafe() {
         // P/E = price ÷ EPS; nil for zero/negative EPS (never a fabricated ratio).
         XCTAssertEqual(try XCTUnwrap(CompanyStats.peRatio(lastPrice: 200, eps: 8)), 25, accuracy: 1e-9)

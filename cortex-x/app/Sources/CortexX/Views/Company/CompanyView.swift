@@ -147,19 +147,26 @@ struct CompanyView: View {
 
     @ViewBuilder
     private func tabContent(_ p: CompanyProfile, _ active: CompanyTab) -> some View {
-        ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 18) {
-                switch active {
-                case .overview: overviewTab(p)
-                case .financials:
-                    fundamentalsSection(p)
-                    filingsSection(p)
-                case .statistics: statisticsSection(p)
-                case .supplyChain: supplyChainTab(p)
+        if active == .supplyChain {
+            // Full-bleed: the supply-chain flow owns the whole board width + its
+            // own scroll (a GeometryReader inside a vertical ScrollView collapses).
+            supplyChainTab(p)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        } else {
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 18) {
+                    switch active {
+                    case .overview: overviewTab(p)
+                    case .financials:
+                        fundamentalsSection(p)
+                        filingsSection(p)
+                    case .statistics: statisticsSection(p)
+                    case .supplyChain: EmptyView() // handled above
+                    }
                 }
+                .frame(maxWidth: 980, alignment: .leading)
+                .padding(16)
             }
-            .frame(maxWidth: 980, alignment: .leading)
-            .padding(16)
         }
     }
 
@@ -208,50 +215,142 @@ struct CompanyView: View {
 
     // MARK: Supply-chain tab (suppliers / customers / competitors, collapsible)
 
+    // MARK: Supply chain — full-width SUPPLIERS → HUB → CUSTOMERS flow
+
     @ViewBuilder
     private func supplyChainTab(_ p: CompanyProfile) -> some View {
         GeometryReader { geo in
             ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 18) {
-                    if geo.size.width >= 720 {
-                        HStack(alignment: .top, spacing: 18) {
-                            CollapsibleSection("suppliers", count: p.suppliers.count) {
-                                relationList(p.suppliers)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .topLeading)
-                            CollapsibleSection("customers", count: p.customers.count) {
-                                relationList(p.customers)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .topLeading)
-                        }
-                    } else {
-                        CollapsibleSection("suppliers", count: p.suppliers.count) {
-                            relationList(p.suppliers)
-                        }
-                        CollapsibleSection("customers", count: p.customers.count) {
-                            relationList(p.customers)
-                        }
-                    }
-                    CollapsibleSection("competitors", count: p.competitors.count, startsExpanded: false) {
-                        competitorsGrid(p.competitors)
-                    }
+                VStack(alignment: .leading, spacing: 20) {
+                    if geo.size.width >= 900 { flowRow(p) } else { stackedFlow(p) }
+                    Rectangle().fill(Theme.line).frame(height: Theme.hairline)
+                    competitorsRow(p)
                 }
+                .padding(16)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
         .frame(minHeight: 320)
     }
 
-    /// The relation card list (preserves the openCompany graph-walk).
-    @ViewBuilder
-    private func relationList(_ relations: [Relation]) -> some View {
-        if relations.isEmpty {
-            Text("none curated").font(.system(size: 10)).foregroundStyle(Theme.dim)
-        } else {
-            LazyVStack(spacing: 8) {
-                ForEach(relations) { relation in
-                    RelationCard(relation: relation) { symbol in model.openCompany(symbol) }
+    /// Wide: suppliers (flex) → gutter → HUB (fixed 300) → gutter → customers (flex).
+    private func flowRow(_ p: CompanyProfile) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            FlowColumn(title: "suppliers", direction: "upstream · inputs",
+                       count: p.suppliers.count, relations: p.suppliers) { model.openCompany($0) }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+            flowGutter(.horizontal)
+            companyHub(p).frame(width: 300)
+            flowGutter(.horizontal)
+            FlowColumn(title: "customers", direction: "downstream · demand",
+                       count: p.customers.count, relations: p.customers) { model.openCompany($0) }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+
+    /// Narrow: the same flow rotated — suppliers ↓ hub ↓ customers.
+    private func stackedFlow(_ p: CompanyProfile) -> some View {
+        VStack(spacing: 0) {
+            FlowColumn(title: "suppliers", direction: "upstream · inputs",
+                       count: p.suppliers.count, relations: p.suppliers) { model.openCompany($0) }
+            flowGutter(.vertical)
+            companyHub(p).frame(maxWidth: .infinity)
+            flowGutter(.vertical)
+            FlowColumn(title: "customers", direction: "downstream · demand",
+                       count: p.customers.count, relations: p.customers) { model.openCompany($0) }
+        }
+    }
+
+    private enum FlowAxis { case horizontal, vertical }
+
+    /// The directional connector: an ember arrow (the ONE accent, carrying the
+    /// "flow" semantic) over a neutral hairline. Inputs read left→right / top→down.
+    private func flowGutter(_ axis: FlowAxis) -> some View {
+        Group {
+            if axis == .horizontal {
+                VStack(spacing: 6) {
+                    Image(systemName: "arrow.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(Theme.ember)
+                        .padding(.top, 24)
+                    Rectangle().fill(Theme.line).frame(width: Theme.hairline, height: 40)
+                }
+                .frame(width: 44)
+            } else {
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(Theme.ember)
+                    .padding(.vertical, 10)
+            }
+        }
+    }
+
+    /// The center company node: relationship counts, key vitals, and what it
+    /// makes — the pivot the two wings flow into.
+    private func companyHub(_ p: CompanyProfile) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                hubStat("\(p.suppliers.count)", "suppliers")
+                Image(systemName: "arrow.right").font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Theme.dim)
+                hubStat("\(p.customers.count)", "customers")
+                Spacer(minLength: 0)
+                Text(p.symbol)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(Theme.dim)
+            }
+            if let f = p.fundamentals {
+                HStack(spacing: 16) {
+                    if f.revenue != nil { metric("revenue", CompanyFormat.abbrevMoney(f.revenue)) }
+                    metric("rev yoy", CompanyFormat.pct(f.revenue_yoy, signed: true),
+                           tint: f.revenue_yoy.map { Theme.pnlColor($0) })
+                    let cap = CompanyStats.marketCap(shares: f.shares_outstanding, lastPrice: model.lastPrice(p.symbol))
+                    if cap != nil { metric("market cap", CompanyFormat.abbrevMoney(cap)) }
                 }
             }
+            Rectangle().fill(Theme.line).frame(height: Theme.hairline)
+            SectionLabel(text: "what it makes")
+            if p.segments.isEmpty {
+                Text("no segments curated").font(.system(size: 10)).foregroundStyle(Theme.dim)
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(p.segments) { seg in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(seg.name).font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Theme.bone).lineLimit(1)
+                            Text(seg.note).font(.system(size: 10)).foregroundStyle(Theme.dim)
+                                .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+            Text("graph: \(p.graph_source)").font(.system(size: 9)).foregroundStyle(Theme.dim)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(Theme.panel)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.cornerRadius))
+        // Neutral hairline — the accent stays on the flow arrows (one accent/element).
+        .overlay(RoundedRectangle(cornerRadius: Theme.cornerRadius)
+            .strokeBorder(Theme.line, lineWidth: Theme.hairline))
+    }
+
+    private func hubStat(_ value: String, _ label: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value).numeric(size: 15, weight: .semibold).foregroundStyle(Theme.bone)
+            Text(label.uppercased()).font(.system(size: 8, weight: .semibold))
+                .tracking(1.0).foregroundStyle(Theme.dim)
+        }
+    }
+
+    private func competitorsRow(_ p: CompanyProfile) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                SectionLabel(text: "competitors")
+                Text("\(p.competitors.count)").numeric(size: 10).foregroundStyle(Theme.dim)
+                Spacer(minLength: 0)
+            }
+            competitorsGrid(p.competitors)
         }
     }
 
@@ -536,56 +635,6 @@ struct CompanyView: View {
         .lineLimit(1)
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
-    }
-}
-
-// MARK: - Relation card
-
-private struct RelationCard: View {
-    let relation: Relation
-    let open: (String) -> Void
-    @State private var hovering = false
-
-    var body: some View {
-        if let symbol = relation.symbol {
-            Button {
-                open(symbol)
-            } label: {
-                content(clickable: true)
-            }
-            .buttonStyle(.plain)
-            .onHover { hovering = $0 }
-            .animation(DeckMotion.ease(), value: hovering)
-        } else {
-            content(clickable: false)
-        }
-    }
-
-    private func content(clickable: Bool) -> some View {
-        HStack(alignment: .top, spacing: 8) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(relation.name)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Theme.bone)
-                    .lineLimit(1)
-                Text(relation.via)
-                    .font(.system(size: 11))
-                    .foregroundStyle(Theme.dim)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: 0)
-            if clickable {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(hovering ? Theme.ember : Theme.dim)
-                    .padding(.top, 3)
-            }
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .panel(highlighted: clickable && hovering)
     }
 }
 

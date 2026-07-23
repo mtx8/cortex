@@ -182,53 +182,113 @@ struct CompanyTabButton: View {
 
 // MARK: - Collapsible section (supply-chain expand/collapse)
 
-/// A section whose body expands/collapses under the single sanctioned easing:
-/// a header (rotating chevron + label + count) over a revealed body. Ember only
-/// on hover; a hairline under the header is the only chrome — no pills, no
-/// shadows. Used by the SUPPLY CHAIN tab.
-struct CollapsibleSection<Content: View>: View {
+/// One wing of the supply-chain flow — SUPPLIERS (upstream) or CUSTOMERS
+/// (downstream): a labeled header with count + a directional stamp over a stack
+/// of relationship cards. Walkable rows (with a ticker) sort first, then
+/// alphabetical — a presentation order, not a fabricated ranking.
+struct FlowColumn: View {
     let title: String
+    let direction: String
     let count: Int
-    @ViewBuilder let content: () -> Content
-
-    @State private var expanded: Bool
-    @State private var hovering = false
-
-    init(_ title: String, count: Int, startsExpanded: Bool = true,
-         @ViewBuilder content: @escaping () -> Content) {
-        self.title = title
-        self.count = count
-        self.content = content
-        _expanded = State(initialValue: startsExpanded)
-    }
+    let relations: [Relation]
+    let open: (String) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Button {
-                withAnimation(DeckMotion.ease()) { expanded.toggle() }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(hovering ? Theme.ember : Theme.dim)
-                        .rotationEffect(.degrees(expanded ? 90 : 0))
-                    SectionLabel(text: title)
-                    Text("\(count)")
-                        .numeric(size: 10)
-                        .foregroundStyle(Theme.dim)
-                    Spacer(minLength: 0)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                SectionLabel(text: title)
+                Text("\(count)").numeric(size: 10).foregroundStyle(Theme.dim)
+                Spacer(minLength: 0)
+            }
+            Text(direction.uppercased())
+                .font(.system(size: 9, weight: .semibold)).tracking(1.4)
+                .foregroundStyle(Theme.dim).lineLimit(1)
+            Rectangle().fill(Theme.line).frame(height: Theme.hairline)
+            if relations.isEmpty {
+                Text("none curated").font(.system(size: 10)).foregroundStyle(Theme.dim)
+            } else {
+                LazyVStack(spacing: 8) {
+                    ForEach(Self.walkableFirst(relations)) { RelationCard(relation: $0, open: open) }
                 }
-                .contentShape(Rectangle())
+            }
+        }
+    }
+
+    /// Rows that can pivot the board (have a ticker) lead, then alphabetical.
+    static func walkableFirst(_ r: [Relation]) -> [Relation] {
+        r.sorted {
+            switch ($0.symbol != nil, $1.symbol != nil) {
+            case (true, false): return true
+            case (false, true): return false
+            default: return $0.name < $1.name
+            }
+        }
+    }
+}
+
+// MARK: - Relation card (the supply-chain flow atom + graph-walk pivot)
+
+/// One supplier/customer: name (+ ticker chip when walkable) over the `via` edge
+/// descriptor. When it carries a ticker the whole card is a button that pivots
+/// the board onto that company (openCompany) — the SPLC re-center. Hover raises
+/// the panel + turns the chevron ember. No fabricated metrics — name/via/ticker
+/// are exactly the data we hold.
+struct RelationCard: View {
+    let relation: Relation
+    let open: (String) -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        if let symbol = relation.symbol {
+            Button {
+                open(symbol)
+            } label: {
+                content(clickable: true)
             }
             .buttonStyle(.plain)
             .onHover { hovering = $0 }
-            Rectangle().fill(Theme.line).frame(height: Theme.hairline).padding(.top, 8)
-            if expanded {
-                content()
-                    .padding(.top, 10)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+            .animation(DeckMotion.ease(), value: hovering)
+        } else {
+            content(clickable: false)
+        }
+    }
+
+    private func content(clickable: Bool) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(relation.name)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Theme.bone)
+                        .lineLimit(1)
+                    if let sym = relation.symbol {
+                        Text(sym)
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Theme.dim)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .overlay(RoundedRectangle(cornerRadius: Theme.chipRadius)
+                                .strokeBorder(Theme.line, lineWidth: Theme.hairline))
+                    }
+                }
+                Text(relation.via)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Theme.dim)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            if clickable {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(hovering ? Theme.ember : Theme.dim)
+                    .padding(.top, 3)
             }
         }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .panel(highlighted: clickable && hovering)
     }
 }
 
