@@ -982,6 +982,7 @@ private struct ChartFrame {
         drawRSIPane(ctx)
         drawMACDPane(ctx)
         drawAI(ctx)
+        drawPriorClose(ctx)
         drawLastPrice(ctx)
         drawDrawings(ctx)
         drawCrosshair(ctx)
@@ -1407,22 +1408,64 @@ private struct ChartFrame {
         }
     }
 
+    /// Is this an equity in an extended-hours session (last bar outside RTH)?
+    /// The gate for the TradingView-style pre/post markers — crypto (24/7) never
+    /// qualifies, so its overnight bars are never mislabeled "EXT".
+    private var inExtendedHours: Bool {
+        guard !symbol.contains("-"), let last = bars.last else { return false }
+        return ChartMath.isExtendedHours(last.ts_open_ms)
+    }
+
+    /// The prior REGULAR-session close in the loaded bars — the reference the
+    /// pre/post-market move is read against (only meaningful during ext hours).
+    private var priorRthClose: Double? {
+        bars.last(where: { !ChartMath.isExtendedHours($0.ts_open_ms) })?.close
+    }
+
     private func drawLastPrice(_ ctx: GraphicsContext) {
         guard let last = bars.last else { return }
         let y = yPrice(last.close)
         guard y > mainRect.minY + 2, y < mainRect.maxY - 2 else { return }
+        // During an equity pre/post session the live price reads EMBER + "EXT" so
+        // the operator sees at a glance it's an extended-hours print (TradingView).
+        let ext = inExtendedHours
         var p = Path()
         let yy = y.rounded() + 0.5
         p.move(to: CGPoint(x: 0, y: yy))
         p.addLine(to: CGPoint(x: plotWidth, y: yy))
         ctx.stroke(
-            p, with: .color(Theme.dim.opacity(0.3)),
+            p, with: .color(ext ? Theme.ember.opacity(0.5) : Theme.dim.opacity(0.3)),
             style: StrokeStyle(lineWidth: 1, dash: [2, 3])
         )
         drawTag(
-            ctx, text: ChartMath.formatPrice(last.close),
+            ctx, text: ext ? ChartMath.formatPrice(last.close) + " EXT" : ChartMath.formatPrice(last.close),
             center: CGPoint(x: axisX + (size.width - axisX) / 2, y: yy),
-            background: Theme.panelHi
+            background: ext ? Theme.ember.opacity(0.18) : Theme.panelHi,
+            textColor: ext ? Theme.ember : Theme.bone
+        )
+    }
+
+    /// The prior regular-session close as a dashed reference line + right-axis tag,
+    /// shown only during an equity pre/post session — so the extended-hours move
+    /// is legible against yesterday's close (TradingView pre/post behavior).
+    private func drawPriorClose(_ ctx: GraphicsContext) {
+        guard inExtendedHours, let close = priorRthClose else { return }
+        let y = yPrice(close)
+        guard y > mainRect.minY + 2, y < mainRect.maxY - 2 else { return }
+        let yy = y.rounded() + 0.5
+        var p = Path()
+        p.move(to: CGPoint(x: 0, y: yy))
+        p.addLine(to: CGPoint(x: plotWidth, y: yy))
+        ctx.stroke(p, with: .color(Theme.dim.opacity(0.55)), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+        // Left-edge label keeps the axis clear for the last-price tag.
+        ctx.draw(
+            Text("PREV CLOSE").font(.system(size: 8, weight: .semibold)).foregroundStyle(Theme.dim),
+            at: CGPoint(x: 6, y: yy - 8), anchor: .bottomLeading
+        )
+        drawTag(
+            ctx, text: ChartMath.formatPrice(close),
+            center: CGPoint(x: axisX + (size.width - axisX) / 2, y: yy),
+            background: Theme.panel, textColor: Theme.dim
         )
     }
 
