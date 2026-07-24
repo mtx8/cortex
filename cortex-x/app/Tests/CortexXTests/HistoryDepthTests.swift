@@ -124,6 +124,77 @@ final class HistoryDepthTests: XCTestCase {
 
     /// A model whose AAPL D1 series starts at `oldestBarMs`, seeded through
     /// a history frame — exactly how on-demand backfills land.
+    // MARK: - ensureIntervalData (intraday backfill request)
+
+    func testEnsureIntervalDataRequestsThinInterval() {
+        // Equity intraday opens empty (no live feed) → a request must go out.
+        let model = AppModel()
+        XCTAssertTrue(model.ensureIntervalData("TSLA", .m5, nowMs: nowMs))
+    }
+
+    func testEnsureIntervalDataSkipsWhenPopulated() {
+        let model = AppModel()
+        let bars = (0..<40).map { mBar(interval: .m5, tsOpenMs: nowMs - Int64($0) * 300_000) }
+        model.apply(.history(HistorySlice(
+            symbol: "TSLA", interval: .m5, bars: bars, source: "t", ts_ms: nowMs
+        )))
+        XCTAssertFalse(model.ensureIntervalData("TSLA", .m5, nowMs: nowMs))
+    }
+
+    func testEnsureIntervalDataStopsAfterAMissButIsPerInterval() {
+        let model = AppModel()
+        // Engine answered empty for TSLA m5 → that (symbol,interval) is missed.
+        model.apply(.history(HistorySlice(
+            symbol: "TSLA", interval: .m5, bars: [], source: "t", ts_ms: nowMs
+        )))
+        XCTAssertFalse(model.ensureIntervalData("TSLA", .m5, nowMs: nowMs))
+        // A DIFFERENT interval for the same symbol is still eligible — a 1s miss
+        // must never block 5m/15m.
+        XCTAssertTrue(model.ensureIntervalData("TSLA", .m15, nowMs: nowMs))
+    }
+
+    func testEnsureIntervalDataRateLimits() {
+        let model = AppModel()
+        XCTAssertTrue(model.ensureIntervalData("TSLA", .m5, nowMs: nowMs))
+        // Inside the cooldown, a second switch to the same interval is a no-op.
+        XCTAssertFalse(model.ensureIntervalData("TSLA", .m5, nowMs: nowMs + 10_000))
+        // Cooldown elapsed: eligible again.
+        XCTAssertTrue(model.ensureIntervalData("TSLA", .m5, nowMs: nowMs + 40_000))
+    }
+
+    func testSelectSymbolWithNoDataLandsOnD1() {
+        let model = AppModel()
+        model.selectedInterval = .m5 // operator was on an intraday interval
+        model.selectSymbol("ZZZZ")   // unknown ticker, no bars on any interval
+        XCTAssertEqual(model.selectedSymbol, "ZZZZ")
+        // The view lands on D1 explicitly (the deep-backfill target), not left
+        // stranded on an empty intraday interval.
+        XCTAssertEqual(model.selectedInterval, .d1)
+    }
+
+    func testLateHistoryForAnotherIntervalDoesNotYankSelection() {
+        let model = AppModel()
+        model.selectSymbol("TSLA")     // no data → lands on d1
+        model.selectedInterval = .m15  // operator then switches to 15m
+        // A late 5m response (an earlier request) arrives populated.
+        let m5 = (0..<40).map { mBar(interval: .m5, tsOpenMs: nowMs - Int64($0) * 300_000) }
+        model.apply(.history(HistorySlice(
+            symbol: "TSLA", interval: .m5, bars: m5, source: "t", ts_ms: nowMs
+        )))
+        // Not yanked to 5m — the operator's explicit 15m pick stands.
+        XCTAssertEqual(model.selectedInterval, .m15)
+        // …and the 5m data is still merged (available when they switch back).
+        XCTAssertEqual(model.bars("TSLA", .m5).count, 40)
+    }
+
+    private func mBar(interval: Interval, tsOpenMs: Int64) -> Bar {
+        Bar(
+            symbol: "TSLA", interval: interval, ts_open_ms: tsOpenMs,
+            open: 378, high: 380, low: 377, close: 379,
+            volume: 10_000, trade_count: 50, vwap: 379, complete: true
+        )
+    }
+
     private func seededModel(oldestBarMs: Int64) -> AppModel {
         let model = AppModel()
         model.apply(.history(HistorySlice(

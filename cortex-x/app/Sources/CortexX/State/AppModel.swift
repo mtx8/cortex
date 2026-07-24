@@ -152,10 +152,17 @@ final class AppModel {
     /// `.disabled` re-renders), corrupting id-keyed answer routing.
     private var askSeq = 0
 
-    /// Symbols whose on-demand history came back empty (dead ticker or
-    /// failed backfill). Without this, ensureSymbolData re-fires a fresh
-    /// engine request — and a fresh Yahoo egress — on every list switch.
+    /// (symbol|interval) pairs whose on-demand history came back empty (dead
+    /// ticker, failed backfill, or an interval with no REST source like 1s).
+    /// Keyed per-interval so a 1s miss never blocks a D1/5m request for the same
+    /// symbol. Without this, the ensure* paths re-fire a fresh engine request —
+    /// and a fresh Yahoo egress — on every switch.
     private(set) var historyMisses: Set<String> = []
+
+    /// Miss-set / cooldown key: one entry per (symbol, interval).
+    static func historyMissKey(_ symbol: String, _ interval: Interval) -> String {
+        "\(symbol)|\(interval.rawValue)"
+    }
 
     private let client: EngineClient
     private let maxBars = 3_000
@@ -482,9 +489,34 @@ final class AppModel {
             if let (interval, count) = densest, count >= 30 {
                 selectedInterval = interval
             } else {
-                send(.getHistory(symbol: symbol))
+                // No data on any interval — land on D1 explicitly (the deep
+                // backfill target) so the arriving slice renders in place. The
+                // .history handler no longer auto-switches, so the intended
+                // interval must be set here, not inferred from what arrives.
+                selectedInterval = .d1
+                send(.getHistory(symbol: symbol, interval: .d1))
             }
         }
+    }
+
+    /// Request history for the interval the operator switched to when the client
+    /// holds too few bars for it. This is what lets EQUITY intraday charts
+    /// (1m/5m/15m/1h) fill from Yahoo when no live feed produces them. Per-
+    /// (symbol, interval) miss + cooldown tracking stops re-requesting an
+    /// interval the engine cannot fill (e.g. 1s) or spamming on rapid switches.
+    @discardableResult
+    func ensureIntervalData(
+        _ symbol: String, _ interval: Interval,
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> Bool {
+        let symbol = symbol.uppercased()
+        guard bars(symbol, interval).count < 30 else { return false }
+        let key = Self.historyMissKey(symbol, interval)
+        guard !historyMisses.contains(key),
+              nowMs - (lastHistoryMs[key] ?? 0) >= Self.resyncCooldownMs else { return false }
+        lastHistoryMs[key] = nowMs
+        send(.getHistory(symbol: symbol, interval: interval))
+        return true
     }
 
     /// Pane-local history path for the multi-chart grid: request on-demand
@@ -495,8 +527,8 @@ final class AppModel {
     func ensureSymbolData(_ symbol: String) -> Bool {
         let symbol = symbol.uppercased()
         let hasBars = bars[symbol]?.values.contains { !$0.isEmpty } ?? false
-        guard !hasBars, !historyMisses.contains(symbol) else { return false }
-        send(.getHistory(symbol: symbol))
+        guard !hasBars, !historyMisses.contains(Self.historyMissKey(symbol, .d1)) else { return false }
+        send(.getHistory(symbol: symbol, interval: .d1))
         return true
     }
 
@@ -550,7 +582,7 @@ final class AppModel {
             // Universe/searched symbols ride outside the watchlist sync —
             // fetch their D1 history directly.
             lastHistoryMs[symbol] = nowMs
-            send(.getHistory(symbol: symbol))
+            send(.getHistory(symbol: symbol, interval: .d1))
             issued = true
         }
         return issued
@@ -789,20 +821,22 @@ final class AppModel {
             filingsLoading = false
         case .history(let slice):
             guard !slice.bars.isEmpty else {
-                // The engine answered "no data" (unresolvable ticker or a
-                // failed backfill). Remember the miss so the on-demand path
-                // stops re-requesting — and re-hitting Yahoo — forever.
-                historyMisses.insert(slice.symbol)
+                // The engine answered "no data" (unresolvable ticker, failed
+                // backfill, or an interval with no REST source). Remember the
+                // miss PER interval so the on-demand path stops re-requesting —
+                // and re-hitting Yahoo — while other intervals stay eligible.
+                historyMisses.insert(Self.historyMissKey(slice.symbol, slice.interval))
                 break
             }
-            historyMisses.remove(slice.symbol)
+            historyMisses.remove(Self.historyMissKey(slice.symbol, slice.interval))
             bars[slice.symbol, default: [:]][slice.interval] =
                 slice.bars.sorted { $0.ts_open_ms < $1.ts_open_ms }
-            // If the operator is waiting on this exact chart, switch to the
-            // interval the history arrived on.
-            if selectedSymbol == slice.symbol, bars(slice.symbol, selectedInterval).count < 30 {
-                selectedInterval = slice.interval
-            }
+            // No auto-switch: the requester (selectSymbol / setInterval) already
+            // set selectedInterval to the interval it is waiting on, so the
+            // merge above renders in place. Adopting whatever arrives would yank
+            // the operator off their current pick when an earlier-requested
+            // interval's response lands late (rapid interval switches), and let a
+            // fixed grid pane's fetch flip the global interval.
             if sessionOpen[slice.symbol] == nil {
                 sessionOpen[slice.symbol] = slice.bars.last?.close
             }

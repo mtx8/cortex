@@ -121,6 +121,63 @@ pub async fn backfill_symbol_d1(egress: &Egress, store: &BarStore, symbol: &str)
     store.recent(&symbol, Interval::D1, 1_300)
 }
 
+/// On-demand backfill for ONE symbol at ONE interval via the Yahoo v8 chart
+/// endpoint (daily OR intraday — same schema, same allowlisted keyless host).
+/// This is what gives EQUITY charts intraday history: without a live feed
+/// (e.g. cboe down) equities only ever had D1, so 1m/5m/15m/1h opened blank.
+/// Fetches only when the interval is thin, so a live feed that already fills
+/// intraday is never re-hit. S1 has no REST source (Yahoo's finest is 1m) — it
+/// returns whatever the tick aggregator has produced.
+pub async fn backfill_symbol_interval(
+    egress: &Egress,
+    store: &BarStore,
+    symbol: &str,
+    interval: Interval,
+) -> Vec<Bar> {
+    // D1 keeps its dedicated deep-history path (5y, MIN_BARS threshold).
+    if interval == Interval::D1 {
+        return backfill_symbol_d1(egress, store, symbol).await;
+    }
+    let symbol = symbol.trim().to_uppercase();
+    let cap = 1_500;
+    if let Some((range, yint)) = yahoo_range_interval(interval) {
+        // A chart needs a few dozen bars to be worth anything; below that, fetch.
+        if store.recent(&symbol, interval, 40).len() < 40 {
+            let url = format!(
+                "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={range}&interval={yint}"
+            );
+            match egress.get_text(&url).await {
+                Ok(raw) => {
+                    for bar in parse_yahoo(&symbol, interval, &raw, cap) {
+                        store.push(bar);
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "cx_intel::regimes",
+                    symbol = %symbol, interval = interval.label(), error = %e,
+                    "on-demand intraday backfill failed"
+                ),
+            }
+        }
+    }
+    store.recent(&symbol, interval, cap)
+}
+
+/// Yahoo v8 chart (range, interval) params for a bar interval. `None` for S1 —
+/// Yahoo's finest granularity is 1m, so seconds bars come only from the live
+/// tick aggregator. Ranges stay within Yahoo's per-granularity limits
+/// (1m ≤ 7d, 5m/15m ≤ 60d, 60m ≤ 730d).
+fn yahoo_range_interval(interval: Interval) -> Option<(&'static str, &'static str)> {
+    match interval {
+        Interval::S1 => None,
+        Interval::M1 => Some(("7d", "1m")),
+        Interval::M5 => Some(("1mo", "5m")),
+        Interval::M15 => Some(("1mo", "15m")),
+        Interval::H1 => Some(("3mo", "60m")),
+        Interval::D1 => Some(("5y", "1d")),
+    }
+}
+
 /// Backfill D1 history for any symbol short of `MIN_BARS`, via the Yahoo v8
 /// chart endpoint (same shape cx-md's equity backfill uses; query1 host is
 /// allowlisted). Failures degrade to a skipped symbol, never a crash.
@@ -149,11 +206,17 @@ async fn ensure_d1_history(egress: &Egress, store: &BarStore, symbols: &[String]
     }
 }
 
-/// Yahoo v8 chart JSON -> complete D1 bars (local copy of the cx-md parse
-/// approach; cx-intel deliberately does not depend on cx-md). Null slots and
-/// the in-progress current-day row are skipped; malformed payloads yield an
-/// empty vec, never a panic.
+/// Yahoo v8 chart JSON -> complete D1 bars (back-compat wrapper).
 pub(crate) fn parse_yahoo_d1(symbol: &str, raw: &str, max: usize) -> Vec<Bar> {
+    parse_yahoo(symbol, Interval::D1, raw, max)
+}
+
+/// Yahoo v8 chart JSON -> complete bars at ANY interval (local copy of the
+/// cx-md parse approach; cx-intel deliberately does not depend on cx-md). Null
+/// slots and the in-progress current bucket are skipped; malformed payloads
+/// yield an empty vec, never a panic. The endpoint serves both daily
+/// (`interval=1d`) and intraday (`1m/5m/15m/60m`) with the same schema.
+pub(crate) fn parse_yahoo(symbol: &str, interval: Interval, raw: &str, max: usize) -> Vec<Bar> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
         return Vec::new();
     };
@@ -185,10 +248,10 @@ pub(crate) fn parse_yahoo_d1(symbol: &str, raw: &str, max: usize) -> Vec<Bar> {
         return Vec::new();
     };
 
-    // Yahoo returns the in-progress session as the last row; a moving live
-    // close would flip threshold states intraday and reset days_in_state.
-    // Classify only on complete sessions: drop anything in today's bucket.
-    let today_bucket = bucket_start(now_ms(), Interval::D1.ms());
+    // Yahoo returns the in-progress bucket as the last row; a moving live close
+    // would flip threshold states and reset days_in_state. Drop anything in the
+    // current forming bucket for this interval — only complete bars are kept.
+    let forming_bucket = bucket_start(now_ms(), interval.ms());
     let mut bars: Vec<Bar> = Vec::new();
     for i in 0..ts.len() {
         let (Some(t), Some(o), Some(h), Some(l), Some(c)) = (
@@ -203,13 +266,26 @@ pub(crate) fn parse_yahoo_d1(symbol: &str, raw: &str, max: usize) -> Vec<Bar> {
         if ![o, h, l, c].iter().all(|x| x.is_finite() && *x > 0.0) || h < l {
             continue;
         }
-        let ts_open_ms = bucket_start(t * 1000, Interval::D1.ms());
-        if ts_open_ms >= today_bucket {
+        // D1 floors to the UTC day; INTRADAY keeps Yahoo's true opens. RTH
+        // hourlies are 09:30-anchored, so flooring H1 would alias the 09:30 RTH
+        // bar into the 09:00 pre-market bucket — destroying the pre-market bar in
+        // the SHARED store and shifting every hourly 30 min early. (Mirrors
+        // cx-md::equity::parse_yahoo_chart; cx-intel keeps its own copy.)
+        let ts_open_ms = if interval == Interval::D1 {
+            bucket_start(t * 1000, interval.ms())
+        } else {
+            t * 1000
+        };
+        // D1 ONLY: drop today's in-progress session — a moving close flips
+        // regime thresholds intraday and resets days_in_state. Intraday keeps its
+        // latest bar: the live aggregator overwrites the forming one, and a
+        // delayed chart wants the current candle.
+        if interval == Interval::D1 && ts_open_ms >= forming_bucket {
             continue;
         }
         bars.push(Bar {
             symbol: symbol.to_string(),
-            interval: Interval::D1,
+            interval,
             ts_open_ms,
             open: o,
             high: h,
@@ -756,6 +832,85 @@ mod tests {
         assert!(bars.iter().all(|b| b.ts_open_ms < today_bucket));
         assert!(bars.iter().all(|b| b.complete));
         assert_eq!(bars[1].close, 105.0);
+    }
+
+    #[test]
+    fn yahoo_intraday_parses_at_the_given_interval_and_buckets_correctly() {
+        // Same v8 chart schema, 5-minute bars. Bars must carry the M5 interval
+        // and bucket to M5 boundaries — this is what fills equity intraday.
+        let m5 = Interval::M5.ms() / 1000; // 300s
+        let base = bucket_start(now_ms(), Interval::M5.ms()) - 10 * Interval::M5.ms();
+        let (t0, t1) = (base / 1000, base / 1000 + m5);
+        let raw = format!(
+            r#"{{"chart":{{"result":[{{"timestamp":[{t0},{t1}],
+                "indicators":{{"quote":[{{
+                    "open":[378.0,379.0],"high":[379.5,380.0],
+                    "low":[377.5,378.5],"close":[379.0,379.8],
+                    "volume":[12000,9000]}}]}}}}]}}}}"#
+        );
+        let bars = parse_yahoo("TSLA", Interval::M5, &raw, 100);
+        assert_eq!(bars.len(), 2);
+        assert!(bars.iter().all(|b| b.interval == Interval::M5 && b.complete));
+        // Timestamps land on M5 buckets, ascending.
+        assert_eq!(bars[0].ts_open_ms % Interval::M5.ms(), 0);
+        assert!(bars[0].ts_open_ms < bars[1].ts_open_ms);
+        assert_eq!(bars[1].close, 379.8);
+    }
+
+    #[test]
+    fn yahoo_h1_keeps_true_930_open_not_floored_to_the_hour() {
+        // Regression: RTH hourlies are 09:30-anchored (13:30 UTC). Flooring H1 to
+        // the UTC hour (13:00) shifts every bar 30 min early AND aliases the 09:30
+        // RTH bar onto the 09:00 pre-market bucket — destroying it in the SHARED
+        // store. Intraday must keep Yahoo's true opens; only D1 floors.
+        let rth_open_s: i64 = 1_751_463_000; // 13:30:00 UTC = 09:30 ET
+        let prev_s = rth_open_s - 3_600; // 12:30 UTC (08:30 ET), also :30-anchored
+        let raw = format!(
+            r#"{{"chart":{{"result":[{{"timestamp":[{prev_s},{rth_open_s}],
+                "indicators":{{"quote":[{{
+                    "open":[100.0,101.0],"high":[101.0,102.0],
+                    "low":[99.0,100.0],"close":[100.5,101.5],
+                    "volume":[500,600]}}]}}}}]}}}}"#
+        );
+        let bars = parse_yahoo("TSLA", Interval::H1, &raw, 100);
+        assert_eq!(bars.len(), 2, "both hourlies kept — neither aliased away");
+        // True open preserved, NOT floored to the UTC hour.
+        assert_eq!(bars[1].ts_open_ms, rth_open_s * 1000);
+        assert_ne!(
+            bars[1].ts_open_ms,
+            bucket_start(rth_open_s * 1000, Interval::H1.ms()),
+            "must not floor the 09:30 open onto the 09:00 bucket"
+        );
+        // Distinct buckets — no collision/overwrite in the store.
+        assert_ne!(bars[0].ts_open_ms, bars[1].ts_open_ms);
+    }
+
+    #[test]
+    fn yahoo_d1_still_floors_to_utc_midnight() {
+        // The D1 path must keep flooring (regime classification keys on UTC days).
+        let noon_s: i64 = 1_751_461_200 + 43_200; // some intraday D1 timestamp
+        let raw = format!(
+            r#"{{"chart":{{"result":[{{"timestamp":[{noon_s}],
+                "indicators":{{"quote":[{{
+                    "open":[100.0],"high":[101.0],"low":[99.0],"close":[100.5],
+                    "volume":[500]}}]}}}}]}}}}"#
+        );
+        // Use a far-past timestamp so it's a complete session (not today).
+        let bars = parse_yahoo("TSLA", Interval::D1, &raw, 100);
+        if let Some(b) = bars.first() {
+            assert_eq!(b.ts_open_ms, bucket_start(noon_s * 1000, Interval::D1.ms()));
+        }
+    }
+
+    #[test]
+    fn yahoo_range_interval_covers_intraday_and_omits_seconds() {
+        // 1s has no REST source; every other interval maps to a Yahoo param.
+        assert_eq!(yahoo_range_interval(Interval::S1), None);
+        assert_eq!(yahoo_range_interval(Interval::M1), Some(("7d", "1m")));
+        assert_eq!(yahoo_range_interval(Interval::M5), Some(("1mo", "5m")));
+        assert_eq!(yahoo_range_interval(Interval::M15), Some(("1mo", "15m")));
+        assert_eq!(yahoo_range_interval(Interval::H1), Some(("3mo", "60m")));
+        assert_eq!(yahoo_range_interval(Interval::D1), Some(("5y", "1d")));
     }
 
     #[test]

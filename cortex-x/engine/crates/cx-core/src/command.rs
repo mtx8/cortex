@@ -4,7 +4,12 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::{BrokerConfig, Secret};
-use crate::types::{AutonomyLevel, OrderType, Side};
+use crate::types::{AutonomyLevel, Interval, OrderType, Side};
+
+/// Default history interval for an old client that omits the field (wire compat).
+fn default_history_interval() -> Interval {
+    Interval::D1
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -75,10 +80,15 @@ pub enum Command {
         form_filter: String,
         text: String,
     },
-    /// Fetch daily history for any symbol (searched tickers outside the
-    /// configured feed set). Answered via `EngineEvent::History`.
+    /// Fetch history for a symbol at a given interval (D1 for daily; 1m/5m/15m/1h
+    /// intraday, which is how equities get intraday bars without a live feed).
+    /// Answered via `EngineEvent::History`.
     GetHistory {
         symbol: String,
+        /// WIRE COMPAT: additive `#[serde(default)]` field — an old client that
+        /// omits it requests D1, exactly as before.
+        #[serde(default = "default_history_interval")]
+        interval: Interval,
     },
     /// Start streaming LEVEL 2 market depth (and the Time & Sales tape) for the
     /// symbol the client is actively viewing. The engine streams depth for at
@@ -181,6 +191,23 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_history_interval_is_additive_and_defaults_to_d1() {
+        // An old client omits `interval` — the frame must still decode as a D1
+        // request, exactly as before.
+        let legacy = r#"{"cmd":"get_history","symbol":"TSLA"}"#;
+        assert_eq!(
+            serde_json::from_str::<Command>(legacy).unwrap(),
+            Command::GetHistory { symbol: "TSLA".into(), interval: Interval::D1 }
+        );
+        // A new client requests an intraday interval explicitly (snake_case wire).
+        let intraday = r#"{"cmd":"get_history","symbol":"TSLA","interval":"m5"}"#;
+        assert_eq!(
+            serde_json::from_str::<Command>(intraday).unwrap(),
+            Command::GetHistory { symbol: "TSLA".into(), interval: Interval::M5 }
+        );
+    }
 
     #[test]
     fn place_order_stop_px_is_additive_and_optional() {

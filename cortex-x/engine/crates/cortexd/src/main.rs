@@ -250,20 +250,25 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 cx_intel::serve_filings(Arc::clone(&bus), query, form_filter, text);
             }
-            Command::GetHistory { symbol } => {
+            Command::GetHistory { symbol, interval } => {
                 let bus = Arc::clone(&bus);
                 let store = Arc::clone(&store);
                 tokio::spawn(async move {
                     let egress = cx_core::egress::Egress::new();
-                    let bars =
-                        cx_intel::regimes::backfill_symbol_d1(&egress, &store, &symbol).await;
+                    // Interval-aware: D1 deep-history OR intraday (1m/5m/15m/1h)
+                    // backfill via the same keyless Yahoo chart endpoint — this
+                    // is how equities get intraday bars when no live feed does.
+                    let bars = cx_intel::regimes::backfill_symbol_interval(
+                        &egress, &store, &symbol, interval,
+                    )
+                    .await;
                     // Always answer — an empty slice tells the client the
                     // lookup found nothing rather than leaving it waiting.
                     bus.publish(cx_core::EngineEvent::History(cx_core::events::HistorySlice {
                         symbol: symbol.trim().to_uppercase(),
-                        interval: cx_core::types::Interval::D1,
+                        interval,
                         bars,
-                        source: "yahoo D1 (delayed, on demand)".into(),
+                        source: format!("yahoo {} (delayed, on demand)", interval.label()),
                         ts_ms: cx_core::time::now_ms(),
                     }));
                 });

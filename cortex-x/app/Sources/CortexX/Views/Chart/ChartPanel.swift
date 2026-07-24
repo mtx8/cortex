@@ -107,6 +107,9 @@ struct ChartPanel: View {
         } else {
             model.selectedInterval = interval
         }
+        // Equities have no live intraday feed — warm the newly-selected interval
+        // from Yahoo so the chart fills instead of opening blank.
+        model.ensureIntervalData(displaySymbol, interval)
     }
 
     /// Restored fixed panes may point at symbols with no bars at all

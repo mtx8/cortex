@@ -1253,7 +1253,7 @@ enum Command {
     case getOptionsChain(underlying: String, expiry: String?)
     case runSimulation
     case getCompany(symbol: String)
-    case getHistory(symbol: String)
+    case getHistory(symbol: String, interval: Interval)
     case getFilings(query: String, formFilter: String, text: String)
     /// Subscribe / unsubscribe Level 2 depth + tape for a symbol. The engine
     /// streams depth for ONE actively-viewed symbol at a time to bound
@@ -1309,8 +1309,8 @@ enum Command {
             obj = ["cmd": "run_simulation"]
         case let .getCompany(symbol):
             obj = ["cmd": "get_company", "symbol": symbol]
-        case let .getHistory(symbol):
-            obj = ["cmd": "get_history", "symbol": symbol]
+        case let .getHistory(symbol, interval):
+            obj = ["cmd": "get_history", "symbol": symbol, "interval": interval.rawValue]
         case let .getFilings(query, formFilter, text):
             // form_filter + text are always present (empty string when unused)
             // so the wire shape matches the contract exactly.
