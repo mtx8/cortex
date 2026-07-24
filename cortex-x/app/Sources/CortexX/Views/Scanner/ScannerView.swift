@@ -461,7 +461,6 @@ struct ScannerView: View {
     @AppStorage(ScanPrefs.showAIPicks) private var showAIPicks = false
     // Configurable, drag-reorderable DETAILS columns (persisted).
     @AppStorage(ScanPrefs.columns) private var columnLayout = ScanColumnLayout.detailsDefault
-    @State private var draggingColumn: ScanColumn?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -537,6 +536,10 @@ struct ScannerView: View {
             }
             searchField
             detailsToggle
+            // Column add/remove/reorder — details view only, and here in the
+            // fixed pane header so it is always visible (never scrolled off the
+            // right edge of the grid like the old in-header affordance).
+            if showDetails { columnsMenu }
             aiToggle
             alertsToggle
         }
@@ -834,7 +837,9 @@ struct ScannerView: View {
                 }
                 HStack(spacing: 10) {
                     Button {
-                        filters.append(ScanFilter())
+                        // Starts DISABLED — configuring/enabling it activates it,
+                        // so adding a row never surprise-culls half the board.
+                        filters.append(ScanFilter(enabled: false))
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "plus")
@@ -926,7 +931,8 @@ struct ScannerView: View {
     }
 
     private func saveScreen() {
-        guard screens.save(name: screenName, preset: preset, filters: filters, sort: sort) != nil
+        guard screens.save(name: screenName, preset: preset, filters: filters,
+                           sort: sort, summarySort: summarySort) != nil
         else { return }
         screenName = ""
     }
@@ -935,6 +941,7 @@ struct ScannerView: View {
         preset = screen.preset
         filters = screen.filters
         sort = screen.sort
+        summarySort = screen.summarySort
         if !screen.filters.isEmpty { filtersOpen = true }
     }
 
@@ -961,7 +968,8 @@ struct ScannerView: View {
         let active = preset == p
         return Button {
             preset = p
-            sort = nil // fall back to the preset's own ordering
+            sort = nil // fall back to the preset's own ordering…
+            summarySort = nil // …in BOTH table modes, symmetrically
         } label: {
             Text(p.title.uppercased())
                 .font(.system(size: 10, weight: .semibold))
@@ -1196,8 +1204,11 @@ struct ScannerView: View {
             ForEach(columnLayout.shown, id: \.self) { col in
                 headerCell(col)
             }
-            Spacer(minLength: 4)
-            columnsMenu
+            // Reserve the trailing slot the row's actions menu occupies so the
+            // header rule spans the full row width. The add/remove/reorder menu
+            // now lives in the always-visible pane header (see columnsMenu),
+            // never off-screen at the right edge of the horizontal scroll.
+            Spacer(minLength: ScanCol.trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -1205,8 +1216,9 @@ struct ScannerView: View {
         .deckRowRule(1)
     }
 
-    /// A header cell that BOTH sorts (tap) and drag-reorders its column (drag
-    /// past threshold). The dragged column dims; a drop reorders the layout.
+    /// A header cell that sorts its column on tap. Reordering lives in the
+    /// columns menu (move left/right) — a plain tap NEVER competes with a drag
+    /// gesture, which on macOS turned every sort click into a stray drag-start.
     private func headerCell(_ col: ScanColumn) -> some View {
         let active = sort?.column == col
         return Button {
@@ -1231,43 +1243,39 @@ struct ScannerView: View {
         }
         .buttonStyle(.plain)
         .disabled(!col.sortable)
-        .opacity(draggingColumn == col ? 0.35 : 1)
-        .draggable(col) {
-            draggingColumn = col
-            return Text(col.title.uppercased())
-                .font(.system(size: 9, weight: .semibold))
-                .tracking(1.0)
-                .foregroundStyle(Theme.ember)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .overlay(RoundedRectangle(cornerRadius: Theme.chipRadius)
-                    .strokeBorder(Theme.ember, lineWidth: Theme.hairline))
-        }
-        .dropDestination(for: ScanColumn.self) { items, _ in
-            draggingColumn = nil
-            guard let moved = items.first, moved != col else { return false }
-            withAnimation(DeckMotion.ease()) {
-                columnLayout = columnLayout.moving(moved, before: col).reconciled()
-            }
-            return true
-        }
         .animation(DeckMotion.ease(), value: active)
     }
 
-    /// Add / remove columns (checkmark = shown); the trailing header affordance.
+    /// Add / remove / reorder columns. Lives in the always-visible pane header
+    /// (only in details view) so it is never scrolled off the right edge. Each
+    /// shown column reorders via move left/right (reliable — no drag gesture to
+    /// fight the sort tap) and can be hidden; hidden columns add from a submenu.
     private var columnsMenu: some View {
         Menu {
-            ForEach(ScanColumn.allCases, id: \.self) { col in
-                Button {
-                    columnLayout = columnLayout.toggling(col).reconciled()
-                } label: {
-                    if columnLayout.visible.contains(col) {
-                        Label(col.title, systemImage: "checkmark")
-                    } else {
-                        Text(col.title)
+            ForEach(columnLayout.shown, id: \.self) { col in
+                Menu(col.title) {
+                    Button("move left") { moveColumn(col, by: -1) }
+                        .disabled(!canMoveColumn(col, by: -1))
+                    Button("move right") { moveColumn(col, by: 1) }
+                        .disabled(!canMoveColumn(col, by: 1))
+                    if col != .symbol {
+                        Divider()
+                        Button("hide", role: .destructive) {
+                            columnLayout = columnLayout.toggling(col).reconciled()
+                        }
                     }
                 }
-                .disabled(col == .symbol)
+            }
+            let hidden = ScanColumn.allCases.filter { !columnLayout.visible.contains($0) }
+            if !hidden.isEmpty {
+                Divider()
+                Menu("add column") {
+                    ForEach(hidden, id: \.self) { col in
+                        Button(col.title) {
+                            columnLayout = columnLayout.toggling(col).reconciled()
+                        }
+                    }
+                }
             }
             Divider()
             Button("reset columns") { columnLayout = .detailsDefault }
@@ -1275,13 +1283,39 @@ struct ScannerView: View {
             Image(systemName: "slider.horizontal.3")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(Theme.dim)
-                .frame(width: ScanCol.trailing, height: 16)
+                .frame(width: 20, height: 16)
                 .contentShape(Rectangle())
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .help("add / remove columns")
+        .fixedSize()
+        .help("add / remove / reorder columns")
+    }
+
+    /// Whether `col` can shift one slot `by` (-1 left / +1 right) among the
+    /// SHOWN columns without falling off either end.
+    private func canMoveColumn(_ col: ScanColumn, by delta: Int) -> Bool {
+        let shown = columnLayout.shown
+        guard let i = shown.firstIndex(of: col) else { return false }
+        let j = i + delta
+        return j >= 0 && j < shown.count
+    }
+
+    /// Swap `col` with its adjacent SHOWN neighbor in that direction (hidden
+    /// columns keep their slots; only the two visible ones exchange order).
+    private func moveColumn(_ col: ScanColumn, by delta: Int) {
+        let shown = columnLayout.shown
+        guard let i = shown.firstIndex(of: col) else { return }
+        let j = i + delta
+        guard j >= 0, j < shown.count else { return }
+        let neighbor = shown[j]
+        var order = columnLayout.order
+        guard let a = order.firstIndex(of: col), let b = order.firstIndex(of: neighbor) else { return }
+        order.swapAt(a, b)
+        withAnimation(DeckMotion.ease()) {
+            columnLayout = ScanColumnLayout(order: order, visible: columnLayout.visible).reconciled()
+        }
     }
 }
 
@@ -1311,24 +1345,25 @@ private struct ScanRowView: View {
     @State private var hovering = false
 
     var body: some View {
-        Button(action: openChart) {
-            HStack(spacing: ScanCol.gap) {
-                ForEach(columns, id: \.self) { col in cell(col) }
-                ScanRowActionsMenu(
-                    symbol: row.symbol, headline: headline, aiDisabled: aiDisabled,
-                    visible: hovering || selected,
-                    openChart: openChart, explain: explain,
-                    openCompany: openCompany, openNews: openNews
-                )
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 25)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-            .background(hovering || selected ? Theme.panelHi : .clear)
-            .deckRowRule()
+        // The row-select tap is a SIBLING gesture on the container, NOT an outer
+        // Button — an outer Button would swallow clicks meant for the nested
+        // ScanRowActionsMenu (a Menu inside a Button never opens on macOS).
+        HStack(spacing: ScanCol.gap) {
+            ForEach(columns, id: \.self) { col in cell(col) }
+            ScanRowActionsMenu(
+                symbol: row.symbol, headline: headline, aiDisabled: aiDisabled,
+                visible: hovering || selected,
+                openChart: openChart, explain: explain,
+                openCompany: openCompany, openNews: openNews
+            )
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 12)
+        .frame(height: 25)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .background(hovering || selected ? Theme.panelHi : .clear)
+        .deckRowRule()
+        .onTapGesture(perform: openChart)
         .onHover { hovering = $0 }
         .animation(DeckMotion.ease(), value: hovering)
     }
@@ -1529,43 +1564,44 @@ private struct ScanSummaryRowView: View {
     @State private var hovering = false
 
     var body: some View {
-        Button(action: openChart) {
-            HStack(spacing: ScanSummaryCol.gap) {
-                Text(row.symbol)
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(Theme.bone)
-                    .lineLimit(1)
-                    .frame(width: ScanSummaryCol.symbol, alignment: .leading)
-                Text(price.flatMap { $0.isFinite ? Fmt.price($0) : nil } ?? "—")
-                    .numeric(size: 11)
-                    .foregroundStyle(price.flatMap { $0.isFinite ? Theme.bone : nil } ?? Theme.dim)
-                    .lineLimit(1)
-                    .frame(width: ScanSummaryCol.price, alignment: .trailing)
-                Text(change.flatMap { $0.isFinite ? Fmt.signedPct($0) : nil } ?? "—")
-                    .numeric(size: 11)
-                    .foregroundStyle(change.flatMap { $0.isFinite ? Theme.pnlColor($0) : nil } ?? Theme.dim)
-                    .lineLimit(1)
-                    .frame(width: ScanSummaryCol.change, alignment: .trailing)
-                ScanCompositeCell(composite: row.composite)
-                    .frame(width: ScanSummaryCol.composite, alignment: .trailing)
-                ScanVerdictLabel(verdict: verdict)
-                    .frame(width: ScanSummaryCol.setup, alignment: .leading)
-                flagCell
-                ScanRowActionsMenu(
-                    symbol: row.symbol, headline: headline, aiDisabled: aiDisabled,
-                    visible: hovering || selected,
-                    openChart: openChart, explain: explain,
-                    openCompany: openCompany, openNews: openNews
-                )
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 28)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-            .background(hovering || selected ? Theme.panelHi : .clear)
-            .deckRowRule()
+        // Row-select tap is a SIBLING gesture, not an outer Button, so the
+        // nested ScanRowActionsMenu actually opens (a Menu inside a Button is
+        // dead on macOS).
+        HStack(spacing: ScanSummaryCol.gap) {
+            Text(row.symbol)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(Theme.bone)
+                .lineLimit(1)
+                .frame(width: ScanSummaryCol.symbol, alignment: .leading)
+            Text(price.flatMap { $0.isFinite ? Fmt.price($0) : nil } ?? "—")
+                .numeric(size: 11)
+                .foregroundStyle(price.flatMap { $0.isFinite ? Theme.bone : nil } ?? Theme.dim)
+                .lineLimit(1)
+                .frame(width: ScanSummaryCol.price, alignment: .trailing)
+            Text(change.flatMap { $0.isFinite ? Fmt.signedPct($0) : nil } ?? "—")
+                .numeric(size: 11)
+                .foregroundStyle(change.flatMap { $0.isFinite ? Theme.pnlColor($0) : nil } ?? Theme.dim)
+                .lineLimit(1)
+                .frame(width: ScanSummaryCol.change, alignment: .trailing)
+            ScanCompositeCell(composite: row.composite)
+                .frame(width: ScanSummaryCol.composite, alignment: .trailing)
+            ScanVerdictLabel(verdict: verdict)
+                .frame(width: ScanSummaryCol.setup, alignment: .leading)
+            flagCell
+            ScanRowActionsMenu(
+                symbol: row.symbol, headline: headline, aiDisabled: aiDisabled,
+                visible: hovering || selected,
+                openChart: openChart, explain: explain,
+                openCompany: openCompany, openNews: openNews
+            )
         }
-        .buttonStyle(.plain)
+        .padding(.horizontal, 12)
+        .frame(height: 28)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .background(hovering || selected ? Theme.panelHi : .clear)
+        .deckRowRule()
+        .onTapGesture(perform: openChart)
         .onHover { hovering = $0 }
         .animation(DeckMotion.ease(), value: hovering)
     }
@@ -1625,9 +1661,19 @@ private struct ScanFilterRowView: View {
 
     var body: some View {
         HStack(spacing: 6) {
+            // Enable toggle: an active filter culls rows; a draft one doesn't.
+            Button { filter.enabled.toggle() } label: {
+                Image(systemName: filter.enabled ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 11))
+                    .foregroundStyle(filter.enabled ? Theme.ember : Theme.dim)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(filter.enabled ? "filter active — click to pause" : "filter paused — click to apply")
             Menu {
                 ForEach(ScanFilter.fields, id: \.self) { column in
-                    Button(column.title) { filter.column = column }
+                    Button(column.title) { filter.column = column; filter.enabled = true }
                 }
             } label: {
                 chipLabel(filter.column.title, width: 72)
@@ -1638,7 +1684,7 @@ private struct ScanFilterRowView: View {
             .help("field")
             Menu {
                 ForEach(ScanFilter.Op.allCases, id: \.self) { op in
-                    Button(op.title) { filter.op = op }
+                    Button(op.title) { filter.op = op; filter.enabled = true }
                 }
             } label: {
                 chipLabel(filter.op.title, width: 30)
@@ -1648,6 +1694,7 @@ private struct ScanFilterRowView: View {
             .fixedSize()
             .help("operator")
             TextField("value", value: $filter.value, format: .number)
+                .onChange(of: filter.value) { _, _ in filter.enabled = true }
                 .textFieldStyle(.plain)
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(Theme.bone)
@@ -1672,6 +1719,8 @@ private struct ScanFilterRowView: View {
             .help("remove filter")
             Spacer()
         }
+        // Dim a paused row (opacity keeps the enable toggle clickable).
+        .opacity(filter.enabled ? 1 : 0.55)
     }
 
     private func chipLabel(_ text: String, width: CGFloat) -> some View {

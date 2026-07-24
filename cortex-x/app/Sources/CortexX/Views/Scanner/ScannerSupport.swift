@@ -26,12 +26,29 @@ struct ScanFilter: Codable, Equatable, Identifiable {
     var column: ScanColumn
     var op: Op
     var value: Double
+    /// A freshly ADDED filter starts disabled so it can't silently drop half the
+    /// board before it's configured; quick-filter chips create it enabled.
+    var enabled: Bool
 
-    init(id: UUID = UUID(), column: ScanColumn = .composite, op: Op = .gte, value: Double = 50) {
+    init(id: UUID = UUID(), column: ScanColumn = .composite, op: Op = .gte,
+         value: Double = 50, enabled: Bool = true) {
         self.id = id
         self.column = column
         self.op = op
         self.value = value
+        self.enabled = enabled
+    }
+
+    // Custom decode so screens saved before `enabled` existed still load (a
+    // missing key defaults to enabled rather than throwing away the whole blob).
+    enum CodingKeys: String, CodingKey { case id, column, op, value, enabled }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        column = try c.decode(ScanColumn.self, forKey: .column)
+        op = try c.decode(Op.self, forKey: .op)
+        value = try c.decode(Double.self, forKey: .value)
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
     }
 
     /// The columns the builder may pick — numeric readings only.
@@ -48,11 +65,12 @@ struct ScanFilter: Codable, Equatable, Identifiable {
         }
     }
 
-    /// AND-combination: a row survives only when every filter matches.
-    /// No filters = identity.
+    /// AND-combination: a row survives only when every ENABLED filter matches.
+    /// No enabled filters = identity (a disabled/draft row never culls rows).
     static func apply(_ filters: [ScanFilter], to rows: [ScanRow]) -> [ScanRow] {
-        guard !filters.isEmpty else { return rows }
-        return rows.filter { row in filters.allSatisfy { $0.matches(row) } }
+        let active = filters.filter(\.enabled)
+        guard !active.isEmpty else { return rows }
+        return rows.filter { row in active.allSatisfy { $0.matches(row) } }
     }
 }
 
@@ -66,16 +84,20 @@ struct SavedScreen: Codable, Equatable, Identifiable {
     var preset: ScanPreset
     var filters: [ScanFilter]
     var sort: ScanSort?
+    /// The summary-table sort (nil = the preset's own ordering). Optional, so
+    /// screens saved before this field existed decode with summarySort = nil.
+    var summarySort: ScanSummary.Sort?
 
     init(
         id: UUID = UUID(), name: String, preset: ScanPreset,
-        filters: [ScanFilter], sort: ScanSort?
+        filters: [ScanFilter], sort: ScanSort?, summarySort: ScanSummary.Sort? = nil
     ) {
         self.id = id
         self.name = name
         self.preset = preset
         self.filters = filters
         self.sort = sort
+        self.summarySort = summarySort
     }
 }
 
@@ -100,7 +122,8 @@ final class ScreenStore {
     /// An existing screen with the same name (case-insensitive) is replaced
     /// in place — names stay unique.
     @discardableResult
-    func save(name: String, preset: ScanPreset, filters: [ScanFilter], sort: ScanSort?) -> SavedScreen? {
+    func save(name: String, preset: ScanPreset, filters: [ScanFilter], sort: ScanSort?,
+              summarySort: ScanSummary.Sort? = nil) -> SavedScreen? {
         let name = name.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return nil }
         if let i = screens.firstIndex(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }) {
@@ -108,10 +131,12 @@ final class ScreenStore {
             screens[i].preset = preset
             screens[i].filters = filters
             screens[i].sort = sort
+            screens[i].summarySort = summarySort
             persist()
             return screens[i]
         }
-        let screen = SavedScreen(name: name, preset: preset, filters: filters, sort: sort)
+        let screen = SavedScreen(name: name, preset: preset, filters: filters,
+                                 sort: sort, summarySort: summarySort)
         screens.append(screen)
         persist()
         return screen

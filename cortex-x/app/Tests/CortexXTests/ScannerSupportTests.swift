@@ -102,6 +102,44 @@ final class ScannerSupportTests: XCTestCase {
         XCTAssertEqual(back, filters)
     }
 
+    func testDisabledFilterNeverCullsRows() {
+        // The reported bug: ADD FILTER inserted a live composite>=50 row that
+        // dropped half the board before configuration. A disabled filter must
+        // be inert — identity, exactly like having no filters.
+        let rows = [
+            row("HI", composite: 80, momentum: 90),
+            row("LO", composite: 10, momentum: 10),
+        ]
+        let draft = ScanFilter(column: .composite, op: .gte, value: 50, enabled: false)
+        XCTAssertEqual(ScanFilter.apply([draft], to: rows).map(\.symbol), ["HI", "LO"])
+        // Once enabled it culls; a disabled filter mixed with an enabled one
+        // contributes nothing.
+        let live = ScanFilter(column: .composite, op: .gte, value: 50, enabled: true)
+        XCTAssertEqual(ScanFilter.apply([live, draft], to: rows).map(\.symbol), ["HI"])
+    }
+
+    func testFilterDecodesLegacyJSONWithoutEnabledAsEnabled() throws {
+        // Screens saved before `enabled` existed must still load — a missing key
+        // defaults to enabled, not a decode failure that drops the whole blob.
+        let legacy = #"{"id":"\#(UUID().uuidString)","column":"rsi","op":"lte","value":30}"#
+        let f = try JSONDecoder().decode(ScanFilter.self, from: Data(legacy.utf8))
+        XCTAssertTrue(f.enabled)
+        XCTAssertEqual(f.column, .rsi)
+        XCTAssertEqual(f.value, 30)
+    }
+
+    func testSavedScreenRoundTripsSummarySort() {
+        let (defaults, store) = makeStore()
+        let ss = ScanSummary.Sort(column: .change, ascending: false)
+        store.save(name: "movers", preset: .all, filters: [], sort: nil, summarySort: ss)
+        // Persists through a fresh store (reload from the same defaults).
+        let reloaded = ScreenStore(defaults: defaults).screens
+        XCTAssertEqual(reloaded.count, 1)
+        XCTAssertEqual(reloaded[0].summarySort, ss)
+        // Legacy screens (no summarySort key) still decode with nil.
+        XCTAssertNil(SavedScreen(name: "x", preset: .all, filters: [], sort: nil).summarySort)
+    }
+
     // MARK: - Saved screens
 
     private static let suiteName = "cortexx.tests.scanner.screens"
