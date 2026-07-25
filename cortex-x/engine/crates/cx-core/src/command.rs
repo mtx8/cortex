@@ -148,6 +148,24 @@ pub enum Command {
         /// reaches this.
         max_live_daily_loss: f64,
     },
+    /// Stop the engine process gracefully.
+    ///
+    /// Exists for ONE operator workflow: the engine is deliberately left running
+    /// when the app window quits, so a freshly-installed app build can find an
+    /// engine from a previous build still holding the port. Without this the
+    /// operator has to hunt a pid in Activity Monitor to get onto the new
+    /// engine. The app sends this ONLY on explicit, confirmed operator action
+    /// (see the out-of-date-engine banner) — never automatically.
+    ///
+    /// This is NOT the kill switch and must never be treated as one. The kill
+    /// switch ([`Command::SetKillSwitch`]) halts TRADING while the engine keeps
+    /// running, reporting, and reconciling. This ends the process: nothing is
+    /// managed, monitored, or reconciled afterwards. It is audited as a critical
+    /// thought before the process exits so the reason survives in the log.
+    Shutdown {
+        /// Operator-supplied reason. Audited; never optional.
+        reason: String,
+    },
 }
 
 impl Command {
@@ -191,6 +209,23 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_decodes_from_the_client_wire_shape() {
+        // Exact frame the app's `Command.shutdown` encoder produces.
+        let raw = r#"{"cmd":"shutdown","reason":"stale engine"}"#;
+        assert_eq!(
+            serde_json::from_str::<Command>(raw).unwrap(),
+            Command::Shutdown { reason: "stale engine".into() }
+        );
+    }
+
+    #[test]
+    fn shutdown_requires_a_reason() {
+        // The reason is audited, so it must never be optional: a frame without
+        // one is refused rather than silently exiting the engine unexplained.
+        assert!(serde_json::from_str::<Command>(r#"{"cmd":"shutdown"}"#).is_err());
+    }
 
     #[test]
     fn get_history_interval_is_additive_and_defaults_to_d1() {

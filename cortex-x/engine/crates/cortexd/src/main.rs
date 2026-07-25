@@ -258,7 +258,10 @@ async fn main() -> anyhow::Result<()> {
                     // Interval-aware: D1 deep-history OR intraday (1m/5m/15m/1h)
                     // backfill via the same keyless Yahoo chart endpoint — this
                     // is how equities get intraday bars when no live feed does.
-                    let bars = cx_intel::regimes::backfill_symbol_interval(
+                    // `source` comes BACK from the backfill: it reports what
+                    // actually happened (fetched / already stored / no REST
+                    // source / fetch failed) instead of asserting "yahoo".
+                    let (bars, source) = cx_intel::regimes::backfill_symbol_interval(
                         &egress, &store, &symbol, interval,
                     )
                     .await;
@@ -268,10 +271,38 @@ async fn main() -> anyhow::Result<()> {
                         symbol: symbol.trim().to_uppercase(),
                         interval,
                         bars,
-                        source: format!("yahoo {} (delayed, on demand)", interval.label()),
+                        source,
                         ts_ms: cx_core::time::now_ms(),
                     }));
                 });
+            }
+            // Graceful process exit on explicit operator action (the app's
+            // out-of-date-engine banner). Audited BEFORE exiting so the reason
+            // is in the log, and given a moment to reach connected clients —
+            // the bus publish is in-memory, so an immediate exit would race the
+            // per-client writer tasks and lose the record on the wire.
+            //
+            // Deliberately NOT the kill switch: that halts trading and keeps the
+            // engine alive. This ends supervision entirely, so it is never
+            // automatic and never inferred.
+            Command::Shutdown { reason } => {
+                tracing::warn!(target: "cortexd", reason = %reason, "shutdown requested by operator");
+                bus.publish(cx_core::EngineEvent::Thought(cx_core::events::AgentThought {
+                    agent: "cortexd".into(),
+                    squadron: "engine".into(),
+                    severity: cx_core::types::Severity::Critical,
+                    text: format!(
+                        "engine shutting down on operator request: {reason}. \
+                         Trading, monitoring and position reconciliation stop now."
+                    ),
+                    tags: vec!["engine".into(), "shutdown".into()],
+                    confidence: 1.0,
+                    symbol: None,
+                    ts_ms: cx_core::time::now_ms(),
+                }));
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                tracing::warn!(target: "cortexd", "exiting");
+                std::process::exit(0);
             }
             // Runtime broker (re)configuration from Settings. Validated through
             // the SAME gates as disk config, then the sink is rebuilt and

@@ -60,8 +60,28 @@ async fn websocket_gateway_full_protocol() {
     let hello = next_json(&mut ws).await;
     assert_eq!(hello["type"], "hello");
     assert_eq!(hello["app"], "cortex-x");
-    assert_eq!(hello["protocol"], 1);
+    assert_eq!(hello["protocol"], cx_server::PROTOCOL_VERSION);
     assert!(hello["ts_ms"].as_i64().expect("ts_ms") > 0);
+
+    // The engine declares what it understands. This is load-bearing, not
+    // decoration: cortexd outlives app builds (it keeps trading after the
+    // window closes), so a new app regularly meets an old engine that ACCEPTS
+    // its commands — serde ignores unknown fields — and answers them wrongly
+    // but plausibly. `history_interval` is the name that told the app an
+    // intraday chart request would be answered with daily bars.
+    let caps: Vec<&str> = hello["capabilities"]
+        .as_array()
+        .expect("capabilities present")
+        .iter()
+        .map(|c| c.as_str().expect("capability is a string"))
+        .collect();
+    for required in ["history_interval", "shutdown"] {
+        assert!(
+            caps.contains(&required),
+            "hello must declare `{required}`; the app checks for it by this exact name"
+        );
+    }
+    assert_eq!(hello["engine_version"], env!("CARGO_PKG_VERSION"));
 
     let snapshot = next_json(&mut ws).await;
     assert_eq!(snapshot["type"], "snapshot");

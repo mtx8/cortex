@@ -55,6 +55,10 @@ struct ChartPanel: View {
                 signals: signals,
                 thoughts: thoughts,
                 feeds: feeds,
+                // Weekly rides on the d1 series, so its availability is d1's.
+                unavailableReason: model.historyReason(
+                    symbol, weeklyMode ? .d1 : displayInterval
+                ),
                 interaction: interaction,
                 drawingStore: drawingStore
             )

@@ -47,6 +47,38 @@ const OUT_QUEUE: usize = 1024;
 /// profile. Keep this consistent with the source's D1 cap in `cortexd`.
 const CONNECT_SNAPSHOT_BARS: u32 = 1_300;
 
+/// Wire-protocol generation. Bumped only for a BREAKING change to the frame
+/// shapes; additive fields and new commands ride [`CAPABILITIES`] instead.
+///
+/// 2 — `hello` gained `capabilities` + `engine_version`.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// Features THIS engine build understands, announced in `hello`.
+///
+/// Why capabilities and not a version number: the engine is intentionally
+/// long-lived (it keeps trading after the window closes), so an operator can
+/// easily run a freshly-built app against a cortexd started days earlier. A
+/// stale engine still ACCEPTS newer commands — serde ignores unknown fields —
+/// and answers them wrongly but plausibly. That produced a silent, invisible
+/// regression: a `get_history` for a 5-minute interval came back as daily bars,
+/// the app filed them under `d1`, and the intraday chart waited forever. The
+/// app now checks for the name it needs and reports an out-of-date engine
+/// instead of waiting on data that will never arrive.
+///
+/// Names are permanent once shipped. Add, never rename or remove.
+pub const CAPABILITIES: &[&str] = &[
+    // `Command::GetHistory` honours the `interval` field (intraday backfill).
+    // Absent in engines built before 2026-07-24, which silently answered d1.
+    "history_interval",
+    // `Command::Shutdown` exits the process gracefully, so the app can hand
+    // over to a newer bundled engine without the operator killing a pid.
+    "shutdown",
+    // `Command::SubscribeDepth` / `UnsubscribeDepth`.
+    "depth_subscribe",
+    // `Command::SetBrokerConfig` reconfigures the order sink at runtime.
+    "broker_config",
+];
+
 /// Provider of the connect/sync state snapshot. Implementations must be cheap
 /// and non-blocking: this is called inline on client tasks.
 pub trait SnapshotSource: Send + Sync + 'static {
@@ -177,7 +209,15 @@ async fn handle_client(
     let hello = serde_json::json!({
         "type": "hello",
         "app": "cortex-x",
-        "protocol": 1,
+        "protocol": PROTOCOL_VERSION,
+        // Feature declaration, not a version comparison. A cortexd process can
+        // outlive several app builds (it is deliberately left running when the
+        // window quits), so the app cannot infer what the ENGINE understands
+        // from its own build. It reads these names instead and refuses to wait
+        // on a capability the running engine does not have. Additive only:
+        // never rename or remove a published name.
+        "capabilities": CAPABILITIES,
+        "engine_version": env!("CARGO_PKG_VERSION"),
         "ts_ms": now_ms(),
     })
     .to_string();

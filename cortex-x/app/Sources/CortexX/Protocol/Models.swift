@@ -1149,8 +1149,19 @@ struct EngineSnapshot: Codable {
 
 // MARK: - Inbound frame (server -> client), tag field "type"
 
-enum ServerFrame {
-    case hello(protocolVersion: Int)
+/// `Sendable` is load-bearing, not decoration: `EngineClient` decodes frames
+/// OFF the main actor (the deep-sync snapshot is multi-MB and used to freeze the
+/// window while it parsed) and hands the finished frame back to the main actor to
+/// apply. Every payload is an immutable-by-convention value type — structs and
+/// enums of String/numeric/collection members, no reference storage anywhere — so
+/// crossing that boundary copies rather than shares. If a future payload gains a
+/// class or a closure this conformance stops compiling, which is exactly the
+/// warning we want before a frame is parsed on a background thread.
+enum ServerFrame: Sendable {
+    /// Engine handshake. `capabilities` is the engine's own declaration of what
+    /// it understands (protocol 2+); an older engine sends none, which is itself
+    /// the signal that it predates the features named in `EngineCapability`.
+    case hello(protocolVersion: Int, capabilities: Set<String>, engineVersion: String)
     case snapshot(EngineSnapshot)
     case tick(Tick)
     case bar(Bar)
@@ -1184,59 +1195,155 @@ enum ServerFrame {
     case error(detail: String)
     case unknown(type: String)
 
+    /// Parse one server frame. Tokenises the JSON exactly ONCE.
+    ///
+    /// This used to `decode(Probe.self)` first — a complete parse of the document
+    /// just to read the `"type"` tag — and then parse the whole thing AGAIN for
+    /// the payload. Harmless for a tick; brutal for the deep-sync snapshot, which
+    /// carries 3 000 bars for every watchlist AND universe symbol: measured at
+    /// 49 ms probe + 266 ms payload on a 14.8 MB snapshot and 92 + 512 ms on a
+    /// 27 MB one. The probe pass was pure waste. Reading the tag from the SAME
+    /// keyed container the payload is decoded out of removes it.
     static func decode(_ data: Data) throws -> ServerFrame {
-        struct Probe: Codable { var type: String }
-        let dec = JSONDecoder()
-        let type = try dec.decode(Probe.self, from: data).type
-        switch type {
-        case "hello":
-            struct Hello: Codable { var `protocol`: Int? }
-            let h = try dec.decode(Hello.self, from: data)
-            return .hello(protocolVersion: h.protocol ?? 1)
-        case "snapshot":
-            struct Wrap: Codable { var data: EngineSnapshot }
-            return .snapshot(try dec.decode(Wrap.self, from: data).data)
-        case "tick": return .tick(try dec.decode(Tick.self, from: data))
-        case "bar": return .bar(try dec.decode(Bar.self, from: data))
-        case "book_top": return .bookTop(try dec.decode(BookTop.self, from: data))
-        case "depth": return .depth(try dec.decode(BookDepth.self, from: data))
-        case "tape": return .tape(try dec.decode(TapePrint.self, from: data))
-        case "flow": return .flow(try dec.decode(FlowRead.self, from: data))
-        case "order_intent": return .orderIntent(try dec.decode(OrderIntent.self, from: data))
-        case "order_update": return .orderUpdate(try dec.decode(OrderUpdate.self, from: data))
-        case "fill": return .fill(try dec.decode(Fill.self, from: data))
-        case "position": return .position(try dec.decode(Position.self, from: data))
-        case "account": return .account(try dec.decode(AccountSnapshot.self, from: data))
-        case "risk": return .risk(try dec.decode(RiskStatus.self, from: data))
-        case "thought": return .thought(try dec.decode(AgentThought.self, from: data))
-        case "signal": return .signal(try dec.decode(StrategySignal.self, from: data))
-        case "macro": return .macro(try dec.decode(MacroSnapshot.self, from: data))
-        case "feed_status": return .feedStatus(try dec.decode(FeedStatus.self, from: data))
-        case "broker_status": return .brokerStatus(try dec.decode(BrokerStatus.self, from: data))
-        case "caution": return .caution(try dec.decode(CautionUpdate.self, from: data))
-        case "options_chain": return .optionsChain(try dec.decode(OptionsChain.self, from: data))
-        case "sim": return .sim(try dec.decode(SimReport.self, from: data))
-        case "ai_answer": return .aiAnswer(try dec.decode(AiAnswer.self, from: data))
-        case "company": return .company(try dec.decode(CompanyProfile.self, from: data))
-        case "regime_map": return .regimeMap(try dec.decode(RegimeBoard.self, from: data))
-        case "geo": return .geo(try dec.decode(GeoPulse.self, from: data))
-        case "scan": return .scan(try dec.decode(ScanBoard.self, from: data))
-        case "news": return .news(try dec.decode(NewsBoard.self, from: data))
-        case "history": return .history(try dec.decode(HistorySlice.self, from: data))
-        case "filings": return .filings(try dec.decode(FilingsReport.self, from: data))
-        case "gap":
-            struct Gap: Codable { var dropped: Int }
-            return .gap(dropped: try dec.decode(Gap.self, from: data).dropped)
-        case "error":
-            struct Err: Codable { var detail: String }
-            return .error(detail: try dec.decode(Err.self, from: data).detail)
-        default:
-            return .unknown(type: type)
+        try JSONDecoder().decode(Envelope.self, from: data).frame
+    }
+
+    /// Single-pass decoder for the internally-tagged wire union. `init(from:)`
+    /// reads `type` and then decodes the payload from the same `Decoder`, so
+    /// JSONDecoder walks the document once instead of twice.
+    ///
+    /// Deliberately NOT backed by a shared static `JSONDecoder`: after the
+    /// off-main-actor change in `EngineClient` a frame can be decoded on the
+    /// cooperative pool while a test decodes on another thread, and Foundation
+    /// does not document `JSONDecoder` as safe for concurrent use. Allocating one
+    /// costs nanoseconds against a multi-megabyte parse — the double parse was
+    /// the whole cost, and that is what is gone.
+    private struct Envelope: Decodable {
+        let frame: ServerFrame
+
+        /// Only the keys read at THIS level: the tag, the snapshot wrapper, and
+        /// the two scalar-payload frames. Every other case decodes the same
+        /// top-level object into its payload type, exactly as the old
+        /// `dec.decode(T.self, from: data)` did — the extra `type` key is ignored
+        /// by the payload's own CodingKeys.
+        private enum Key: String, CodingKey {
+            case type, data, dropped, detail, capabilities
+            // `protocol` is a Swift keyword; the wire name is spelled out here.
+            case protocolVersion = "protocol"
+            case engineVersion = "engine_version"
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: Key.self)
+            // Non-optional, as before: a frame with no `type` is not a frame.
+            let type = try c.decode(String.self, forKey: .type)
+            switch type {
+            case "hello":
+                // All three are optional on the wire: a pre-capabilities engine
+                // sends the tag and little else, and that ABSENCE is exactly how
+                // the app detects a stale engine — it must decode, never fail.
+                let version = try c.decodeIfPresent(Int.self, forKey: .protocolVersion)
+                let caps = try c.decodeIfPresent([String].self, forKey: .capabilities)
+                let engineVersion = try c.decodeIfPresent(String.self, forKey: .engineVersion)
+                frame = .hello(
+                    protocolVersion: version ?? 1,
+                    capabilities: Set(caps ?? []),
+                    engineVersion: engineVersion ?? ""
+                )
+            case "snapshot": frame = .snapshot(try c.decode(EngineSnapshot.self, forKey: .data))
+            case "tick": frame = .tick(try Tick(from: decoder))
+            case "bar": frame = .bar(try Bar(from: decoder))
+            case "book_top": frame = .bookTop(try BookTop(from: decoder))
+            case "depth": frame = .depth(try BookDepth(from: decoder))
+            case "tape": frame = .tape(try TapePrint(from: decoder))
+            case "flow": frame = .flow(try FlowRead(from: decoder))
+            case "order_intent": frame = .orderIntent(try OrderIntent(from: decoder))
+            case "order_update": frame = .orderUpdate(try OrderUpdate(from: decoder))
+            case "fill": frame = .fill(try Fill(from: decoder))
+            case "position": frame = .position(try Position(from: decoder))
+            case "account": frame = .account(try AccountSnapshot(from: decoder))
+            case "risk": frame = .risk(try RiskStatus(from: decoder))
+            case "thought": frame = .thought(try AgentThought(from: decoder))
+            case "signal": frame = .signal(try StrategySignal(from: decoder))
+            case "macro": frame = .macro(try MacroSnapshot(from: decoder))
+            case "feed_status": frame = .feedStatus(try FeedStatus(from: decoder))
+            case "broker_status": frame = .brokerStatus(try BrokerStatus(from: decoder))
+            case "caution": frame = .caution(try CautionUpdate(from: decoder))
+            case "options_chain": frame = .optionsChain(try OptionsChain(from: decoder))
+            case "sim": frame = .sim(try SimReport(from: decoder))
+            case "ai_answer": frame = .aiAnswer(try AiAnswer(from: decoder))
+            case "company": frame = .company(try CompanyProfile(from: decoder))
+            case "regime_map": frame = .regimeMap(try RegimeBoard(from: decoder))
+            case "geo": frame = .geo(try GeoPulse(from: decoder))
+            case "scan": frame = .scan(try ScanBoard(from: decoder))
+            case "news": frame = .news(try NewsBoard(from: decoder))
+            case "history": frame = .history(try HistorySlice(from: decoder))
+            case "filings": frame = .filings(try FilingsReport(from: decoder))
+            case "gap": frame = .gap(dropped: try c.decode(Int.self, forKey: .dropped))
+            case "error": frame = .error(detail: try c.decode(String.self, forKey: .detail))
+            default:
+                frame = .unknown(type: type)
+            }
         }
     }
 }
 
 // MARK: - Outbound commands (client -> server), tag field "cmd"
+
+/// Engine features the app relies on, matching `cx_server::CAPABILITIES` by
+/// name. The engine is deliberately long-lived — it keeps trading after the
+/// window closes — so a newly-installed app build routinely meets a cortexd
+/// started days earlier. A stale engine still ACCEPTS newer commands (serde
+/// ignores unknown fields) and answers them plausibly but wrongly, which is how
+/// an intraday `get_history` came back as daily bars and left the chart waiting
+/// on data that would never arrive. The app checks the name it needs and tells
+/// the operator the engine is out of date instead.
+enum EngineCapability {
+    /// `get_history` honours `interval` (equity intraday backfill). Missing in
+    /// engines built before 2026-07-24, which silently answered `d1` instead.
+    static let historyInterval = "history_interval"
+    /// `shutdown` exits the engine gracefully so the app can hand over to its
+    /// newer bundled engine without the operator hunting a pid.
+    static let shutdown = "shutdown"
+
+    /// Capabilities this app build cannot work correctly without.
+    static let required: [String] = [historyInterval]
+}
+
+/// The ranges the engine's own types impose on `set_broker_config`. Named here,
+/// next to the encoder that enforces them, so the SETTINGS gate can refuse an
+/// out-of-range value against the SAME numbers instead of a second hard-coded
+/// copy that can drift from the wire contract.
+enum BrokerConfigLimits {
+    /// cx-core declares `ibkr_port: u16`, and port 0 is not connectable.
+    static let portRange = 1...65_535
+    /// cx-core declares `ibkr_client_id: i32`; IBKR client ids are non-negative.
+    static let clientIdRange = 0...Int(Int32.max)
+}
+
+/// A command that must NOT be put on the wire as-is.
+///
+/// `cx_core::Command` is an internally-tagged serde enum, so ONE field that does
+/// not fit its Rust type fails deserialization of the ENTIRE frame: the engine
+/// answers `{"type":"error","detail":"bad command"}` and nothing is applied. An
+/// IBKR port of 70000 (a stray digit in a free-text field) therefore discarded
+/// the whole broker reconfiguration — host, account, route, every live limit —
+/// while the app had already persisted the draft and cleared its "unsaved
+/// changes" marker, so the operator read it as applied. Refusing locally, with
+/// the offending value named, turns that silent loss into a visible failure via
+/// `EngineClient.onSendFailure`.
+enum CommandEncodingError: LocalizedError, Equatable {
+    case fieldOutOfRange(field: String, value: Int, allowed: ClosedRange<Int>)
+
+    var detail: String {
+        switch self {
+        case let .fieldOutOfRange(field, value, allowed):
+            "\(field) \(value) is out of range — must be \(allowed.lowerBound)-\(allowed.upperBound)"
+        }
+    }
+
+    var errorDescription: String? { detail }
+}
 
 enum Command {
     case placeOrder(
@@ -1275,6 +1382,39 @@ enum Command {
         maxLiveOrderNotional: Double, maxLivePositionNotional: Double,
         maxLiveDailyLoss: Double
     )
+    /// Stop the engine process gracefully so a newer bundled engine can take
+    /// over. NOT the kill switch: this ends trading, monitoring AND position
+    /// reconciliation. Sent only on explicit, confirmed operator action.
+    case shutdown(reason: String)
+
+    /// Operator-facing name for this action, used when a command fails to reach
+    /// the engine. Says what the operator TRIED to do, not the wire tag — the
+    /// point is that they learn "Engage Kill Switch did not go out", not
+    /// "set_kill_switch failed".
+    var operatorLabel: String {
+        switch self {
+        case let .placeOrder(symbol, side, qty, _, _, _):
+            "\(side.rawValue) \(qty.formatted(.number.precision(.fractionLength(0...4)))) \(symbol)"
+        case let .cancelOrder(orderId): "cancel order #\(orderId)"
+        case let .setKillSwitch(engaged, _):
+            engaged ? "engage kill switch" : "disengage kill switch"
+        case let .setAutonomy(level): "set autonomy \(level.rawValue)"
+        case let .setStrategyEnabled(strategy, enabled):
+            "\(enabled ? "enable" : "disable") strategy \(strategy)"
+        case .flattenAll: "flatten all positions"
+        case .askAi: "ask CORTEX"
+        case .sync: "resync"
+        case let .getOptionsChain(underlying, _): "load \(underlying) option chain"
+        case .runSimulation: "run simulation"
+        case let .getCompany(symbol): "load \(symbol) company profile"
+        case let .getHistory(symbol, interval): "load \(symbol) \(interval.label) history"
+        case .getFilings: "search filings"
+        case let .subscribeDepth(symbol): "subscribe \(symbol) depth"
+        case let .unsubscribeDepth(symbol): "unsubscribe \(symbol) depth"
+        case .setBrokerConfig: "apply broker configuration"
+        case .shutdown: "restart engine"
+        }
+    }
 
     func encoded() throws -> Data {
         var obj: [String: Any]
@@ -1318,6 +1458,8 @@ enum Command {
                 "cmd": "get_filings", "query": query,
                 "form_filter": formFilter, "text": text,
             ]
+        case let .shutdown(reason):
+            obj = ["cmd": "shutdown", "reason": reason]
         case let .subscribeDepth(symbol):
             obj = ["cmd": "subscribe_depth", "symbol": symbol]
         case let .unsubscribeDepth(symbol):
@@ -1326,6 +1468,25 @@ enum Command {
             mode, ibkrHost, ibkrPort, ibkrClientId, ibkrAccount, ibkrRoute,
             allowLive, maxOrder, maxPosition, maxDailyLoss
         ):
+            // The two integers are the only fields whose Swift type is WIDER
+            // than the engine's (`Int` here vs `u16` / `i32` there). Because
+            // `cx_core::Command` is internally tagged, an out-of-range value
+            // does not lose just that field — serde rejects the whole frame and
+            // the entire broker reconfiguration evaporates with only a generic
+            // "bad command" on the wire. Refuse before sending so the operator
+            // is told which number to fix (see CommandEncodingError).
+            guard BrokerConfigLimits.portRange.contains(ibkrPort) else {
+                throw CommandEncodingError.fieldOutOfRange(
+                    field: "IBKR port", value: ibkrPort,
+                    allowed: BrokerConfigLimits.portRange
+                )
+            }
+            guard BrokerConfigLimits.clientIdRange.contains(ibkrClientId) else {
+                throw CommandEncodingError.fieldOutOfRange(
+                    field: "IBKR client id", value: ibkrClientId,
+                    allowed: BrokerConfigLimits.clientIdRange
+                )
+            }
             // Every field is always present so the wire shape matches the
             // engine's `[broker]` contract exactly (serde snake_case, 1:1).
             obj = [

@@ -8,6 +8,19 @@ import Foundation
 enum EngineBootstrap {
     private static var launched = false
 
+    /// Re-arm the launcher so the next failed connection spawns the bundled
+    /// engine again.
+    ///
+    /// `launched` exists to stop the retry loop spawning a second engine on every
+    /// failed connect. But it also meant the app could spawn an engine exactly
+    /// once per app run — so after asking an out-of-date engine to shut down, the
+    /// app would sit disconnected forever with the bundled engine never started.
+    /// The restart path clears the latch first.
+    @MainActor
+    static func prepareForRelaunch() {
+        launched = false
+    }
+
     /// Called when the client has failed to connect for a few seconds.
     @MainActor
     static func launchBundledEngineIfNeeded() {

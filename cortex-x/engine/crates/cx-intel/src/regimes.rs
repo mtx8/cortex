@@ -133,34 +133,56 @@ pub async fn backfill_symbol_interval(
     store: &BarStore,
     symbol: &str,
     interval: Interval,
-) -> Vec<Bar> {
+) -> (Vec<Bar>, String) {
     // D1 keeps its dedicated deep-history path (5y, MIN_BARS threshold).
     if interval == Interval::D1 {
-        return backfill_symbol_d1(egress, store, symbol).await;
+        let bars = backfill_symbol_d1(egress, store, symbol).await;
+        return (bars, "yahoo 1d (delayed)".into());
     }
     let symbol = symbol.trim().to_uppercase();
     let cap = 1_500;
-    if let Some((range, yint)) = yahoo_range_interval(interval) {
-        // A chart needs a few dozen bars to be worth anything; below that, fetch.
-        if store.recent(&symbol, interval, 40).len() < 40 {
-            let url = format!(
-                "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={range}&interval={yint}"
-            );
-            match egress.get_text(&url).await {
-                Ok(raw) => {
-                    for bar in parse_yahoo(&symbol, interval, &raw, cap) {
-                        store.push(bar);
-                    }
-                }
-                Err(e) => tracing::warn!(
-                    target: "cx_intel::regimes",
-                    symbol = %symbol, interval = interval.label(), error = %e,
-                    "on-demand intraday backfill failed"
-                ),
-            }
-        }
+    // Provenance is reported, not assumed. The answer used to be labelled
+    // "yahoo <interval>" unconditionally, which was false whenever no fetch
+    // happened — most visibly for S1, where Yahoo has no source at all and every
+    // bar comes from the live tick aggregator. This app's whole discipline is
+    // that a displayed number never claims an origin it does not have.
+    let Some((range, yint)) = yahoo_range_interval(interval) else {
+        return (
+            store.recent(&symbol, interval, cap),
+            format!("live tick aggregate ({} has no REST source)", interval.label()),
+        );
+    };
+    // A chart needs a few dozen bars to be worth anything; below that, fetch.
+    if store.recent(&symbol, interval, 40).len() >= 40 {
+        return (
+            store.recent(&symbol, interval, cap),
+            format!("stored {} bars (already sufficient)", interval.label()),
+        );
     }
-    store.recent(&symbol, interval, cap)
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range={range}&interval={yint}"
+    );
+    let source = match egress.get_text(&url).await {
+        Ok(raw) => {
+            let bars = parse_yahoo(&symbol, interval, &raw, cap);
+            let fetched = bars.len();
+            for bar in bars {
+                store.push(bar);
+            }
+            format!("yahoo {} (delayed, {fetched} bars on demand)", interval.label())
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "cx_intel::regimes",
+                symbol = %symbol, interval = interval.label(), error = %e,
+                "on-demand intraday backfill failed"
+            );
+            // Say the fetch failed. A silent fallback to whatever the store held
+            // is exactly how a stale or synthetic series passes for fresh data.
+            format!("backfill FAILED ({e}); showing stored bars only")
+        }
+    };
+    (store.recent(&symbol, interval, cap), source)
 }
 
 /// Yahoo v8 chart (range, interval) params for a bar interval. `None` for S1 —
@@ -294,7 +316,26 @@ pub(crate) fn parse_yahoo(symbol: &str, interval: Interval, raw: &str, max: usiz
             volume: volume.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0),
             trade_count: 0,
             vwap: c,
-            complete: true,
+            // Honest completeness, matching cx-md's parser. These bars land in the
+            // SAME shared BarStore, and consumers gate on `complete` (scanner
+            // completeness, regime classification, indicator warmup) — so if one
+            // producer asserted `true` for a still-forming bucket while the other
+            // told the truth, the flag would mean different things depending on
+            // which path happened to write the bar last.
+            //
+            // Decided WITHOUT bucket arithmetic, because there is no single grid
+            // to floor `now` onto here: intraday rows keep Yahoo's true opens
+            // (RTH hourlies are :30-anchored, not UTC-hour floored) and cx-intel
+            // deliberately does not depend on cx-md, which owns that grid.
+            //
+            // Two exact rules instead. Yahoo returns rows ascending, so any row
+            // with a row after it is definitionally closed. Only the LAST row can
+            // still be forming, and it is forming precisely while `now` lies
+            // inside [open, open + interval) — true whatever the anchor. D1 rows
+            // at or past the forming bucket are dropped above, so this only ever
+            // demotes an intraday in-progress bar.
+            complete: i + 1 < ts.len()
+                || ts_open_ms.saturating_add(interval.ms()) <= now_ms(),
         });
     }
     let start = bars.len().saturating_sub(max);
