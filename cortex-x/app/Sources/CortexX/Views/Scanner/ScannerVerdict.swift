@@ -235,20 +235,28 @@ enum ScanSummary {
 
     /// nil-last numeric sort shared by the value columns. nil AND non-finite
     /// readings both sink to the bottom in either direction.
+    ///
+    /// Decorate-sort-undecorate (the premarket-gap pattern): the key is read
+    /// ONCE per row, never from inside the comparator. `price` / `change` are
+    /// AppModel reads — `sessionChangePct` walks the D1 series doing Eastern +
+    /// UTC day-key math per bar — and evaluating them per comparison cost
+    /// ~2·n·log₂n model round-trips per sort (≈430 for a 40-row board instead of
+    /// 40), re-run on every market flush.
     private static func numeric(
         _ rows: [ScanRow], _ ascending: Bool, key: (ScanRow) -> Double?
     ) -> [ScanRow] {
-        func finite(_ row: ScanRow) -> Double? {
-            guard let v = key(row), v.isFinite else { return nil }
-            return v
+        let keyed = rows.map { row -> (row: ScanRow, k: Double?) in
+            guard let v = key(row), v.isFinite else { return (row, nil) }
+            return (row, v)
         }
-        return rows.sorted { a, b in
-            switch (finite(a), finite(b)) {
+        return keyed.sorted { a, b in
+            switch (a.k, b.k) {
             case let (x?, y?): return x == y ? false : (ascending ? x < y : x > y)
             case (_?, nil): return true
             default: return false
             }
         }
+        .map(\.row)
     }
 }
 

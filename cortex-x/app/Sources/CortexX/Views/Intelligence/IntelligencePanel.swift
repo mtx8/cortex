@@ -78,7 +78,7 @@ private struct CopilotSection: View {
                 .defaultScrollAnchor(.bottom)
                 .onChange(of: model.copilot) {
                     guard let last = model.copilot.last else { return }
-                    withAnimation(.easeOut(duration: 0.2)) {
+                    withAnimation(DeckMotion.ease()) {
                         proxy.scrollTo(last.id, anchor: .bottom)
                     }
                 }
@@ -212,7 +212,7 @@ private struct PendingDots: View {
                     .frame(width: 4, height: 4)
                     .opacity(pulsing ? 1 : 0.25)
                     .animation(
-                        .easeInOut(duration: 0.5)
+                        DeckMotion.ease(0.5)
                             .repeatForever(autoreverses: true)
                             .delay(Double(index) * 0.16),
                         value: pulsing
@@ -349,7 +349,7 @@ private struct ThoughtRow: View {
         }
         .background(rowBackground)
         .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-        .animation(.easeOut(duration: 0.15), value: hovering)
+        .animation(DeckMotion.ease(0.15), value: hovering)
         .onHover { hovering = $0 }
     }
 }
@@ -423,6 +423,21 @@ private struct SignalsSection: View {
     }
 }
 
+/// Glyph grammar for a fused strategy signal's direction. Kept separate (and
+/// internal) so it is testable: `direction` can be EXACTLY 0 with a real
+/// conviction — two opposing strategies of equal blend weight cancel in
+/// `fusion.rs` while conviction stays non-zero — and that is a FLAT call, not a
+/// long. The old two-way branch let 0 fall into the up triangle, so the row drew
+/// an upward arrow it then coloured neutral: the shape and the colour disagreed
+/// and the operator read a faded long where the engine published no direction.
+enum SignalGlyph {
+    static func direction(_ d: Double) -> String {
+        if d > 0 { return "arrowtriangle.up.fill" }
+        if d < 0 { return "arrowtriangle.down.fill" }
+        return "minus"
+    }
+}
+
 private struct SignalRow: View {
     let signal: StrategySignal
     let now: Date
@@ -444,9 +459,7 @@ private struct SignalRow: View {
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(Theme.bone)
                 .lineLimit(1)
-            Image(systemName: signal.direction < 0
-                ? "arrowtriangle.down.fill"
-                : "arrowtriangle.up.fill")
+            Image(systemName: SignalGlyph.direction(signal.direction))
                 .font(.system(size: 7))
                 .foregroundStyle(directionColor)
             ZStack(alignment: .leading) {
@@ -466,7 +479,7 @@ private struct SignalRow: View {
         .padding(.vertical, 4)
         .background(hovering ? Theme.panelHi : .clear)
         .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-        .animation(.easeOut(duration: 0.15), value: hovering)
+        .animation(DeckMotion.ease(0.15), value: hovering)
         .onHover { hovering = $0 }
         .help(signal.rationale)
     }

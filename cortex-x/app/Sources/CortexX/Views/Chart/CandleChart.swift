@@ -31,6 +31,13 @@ struct CandleChart: View {
     let signals: [StrategySignal]
     let thoughts: [AgentThought]
     let feeds: [FeedStatus]
+    /// Why this series cannot be shown, when the cause is actually known (an
+    /// out-of-date engine, a request the engine never answered, an interval it
+    /// has no source for). nil means bars may still legitimately be on the way.
+    /// Without this the chart said "waiting for market data" for conditions that
+    /// would never resolve — the operator had no way to tell a slow load from a
+    /// dead one.
+    var unavailableReason: String? = nil
     let interaction: ChartInteraction
     let drawingStore: DrawingStore
 
@@ -60,7 +67,8 @@ struct CandleChart: View {
                 chartBody(
                     ChartFrame(
                         symbol: symbol, bars: bars, interval: interval,
-                        barSpanMs: barSpanMs, signals: signals, thoughts: thoughts,
+                        barSpanMs: barSpanMs, weekly: weekly,
+                        signals: signals, thoughts: thoughts,
                         drawings: drawingStore.drawings(for: symbol),
                         size: geo.size, interaction: interaction,
                         // Equity intraday only, and only while the ext toggle
@@ -285,11 +293,35 @@ struct CandleChart: View {
 
     @ViewBuilder
     private var emptyState: some View {
-        if showsNoIntradayDataNotice {
+        if let unavailableReason {
+            // A known cause outranks both other states: it is the only one that
+            // tells the operator whether waiting will ever help.
+            unavailableState(unavailableReason)
+        } else if showsNoIntradayDataNotice {
             noIntradayDataState
         } else {
             waitingState
         }
+    }
+
+    /// Named cause for an empty series. Ember dot + bone text, per the warning
+    /// convention — never a coloured alert block.
+    private func unavailableState(_ reason: String) -> some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(Theme.ember)
+                    .frame(width: 5, height: 5)
+                Text("no \(interval.label) bars for \(symbol)")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.bone)
+            }
+            Text(reason)
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.dim)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// Equity intraday with no bars is a feed limitation, not a load stall:
@@ -695,10 +727,15 @@ private struct ChartFrame {
     /// Equity intraday charts wash the background behind bars whose ET
     /// time-of-day sits outside 09:30-16:00 (pre/post-market).
     let shadeExtendedHours: Bool
+    /// View-level weekly aggregation is on (weekly bars ride `.d1`). Needed
+    /// here — not just for the wash — because the last-price EXT marker has to
+    /// share the equity-intraday gate, and `shadeExtendedHours` can't stand in
+    /// for it: that also folds in the operator's ext toggle.
+    let weekly: Bool
 
     init?(
         symbol: String, bars: [Bar], interval: Interval, barSpanMs: Int64,
-        signals: [StrategySignal], thoughts: [AgentThought],
+        weekly: Bool, signals: [StrategySignal], thoughts: [AgentThought],
         drawings: [Drawing], size: CGSize, interaction: ChartInteraction,
         shadeExtendedHours: Bool, indicatorCache: IndicatorCache
     ) {
@@ -707,6 +744,7 @@ private struct ChartFrame {
         self.bars = bars
         self.interval = interval
         self.barSpanMs = max(barSpanMs, 1)
+        self.weekly = weekly
         self.size = size
         self.showBB = interaction.showBollinger
         self.hoverPoint = interaction.isDragging ? nil : interaction.hover
@@ -1073,21 +1111,39 @@ private struct ChartFrame {
         // a DATE label so a data gap reads as a new session, not a jumping clock.
         let step = Int64(timeStep())
         let tz = ChartMath.exchangeTimeZone(for: symbol)
+        // On a window that spans more than one calendar year (5y / all, or any
+        // range straddling New Year) a bare "dd MMM" axis is ambiguous — five
+        // repetitions of "05 Jan" with no year meant only the crosshair could
+        // say which year a gridline was. So the FIRST label and every label
+        // that opens a new year carry the year, mirroring how `crossedDay`
+        // switches a clock label to a date at a session boundary.
+        var multiYear = false
+        if !range.isEmpty {
+            // `visibleRange` already clamps both bounds into `bars`.
+            let firstYear = ChartMath.yearKey(bars[range.lowerBound].ts_open_ms, tz: tz)
+            let lastYear = ChartMath.yearKey(bars[range.upperBound - 1].ts_open_ms, tz: tz)
+            multiYear = firstYear != lastYear
+        }
         var prevDayKey: Int?
+        var prevYear: Int?
         for i in range {
             guard (bars[i].ts_open_ms / interval.ms) % step == 0 else { continue }
             let xx = x(i).rounded() + 0.5
             guard xx > 2, xx < plotWidth - 2 else { continue }
             let dk = ChartMath.dayKey(bars[i].ts_open_ms, tz: tz)
             let crossedDay = prevDayKey != nil && dk != prevDayKey!
+            let year = dk / 10_000
+            let crossedYear = multiYear && (prevYear == nil || year != prevYear!)
             prevDayKey = dk
+            prevYear = year
             var p = Path()
             p.move(to: CGPoint(x: xx, y: 0))
             p.addLine(to: CGPoint(x: xx, y: paneBottom))
             ctx.stroke(p, with: .color(gridColor), lineWidth: 1)
             ctx.draw(
                 axisText(ChartMath.timeLabel(
-                    bars[i].ts_open_ms, interval: interval, tz: tz, showDate: crossedDay
+                    bars[i].ts_open_ms, interval: interval, tz: tz,
+                    showDate: crossedDay, showYear: crossedYear
                 )),
                 at: CGPoint(x: xx, y: paneBottom + timeAxisHeight / 2), anchor: .center
             )
@@ -1409,11 +1465,18 @@ private struct ChartFrame {
     }
 
     /// Is this an equity in an extended-hours session (last bar outside RTH)?
-    /// The gate for the TradingView-style pre/post markers — crypto (24/7) never
-    /// qualifies, so its overnight bars are never mislabeled "EXT".
+    /// The gate for the TradingView-style pre/post markers. Shares the
+    /// equity-INTRADAY predicate with the ext wash: a D1 bar is a whole RTH
+    /// session and a weekly bar a whole week, and both are stamped at UTC
+    /// midnight (= 19:00/20:00 ET, outside RTH), so classifying the bar-open
+    /// alone used to mark every equity daily/weekly chart "EXT" forever —
+    /// telling the operator an 11:00 ET print was a pre/after-hours one.
+    /// Crypto (24/7) still never qualifies.
     private var inExtendedHours: Bool {
-        guard !symbol.contains("-"), let last = bars.last else { return false }
-        return ChartMath.isExtendedHours(last.ts_open_ms)
+        ChartMath.showsExtendedHoursMarker(
+            symbol: symbol, interval: interval, weekly: weekly,
+            lastBarTsMs: bars.last?.ts_open_ms
+        )
     }
 
     /// The prior REGULAR-session close in the loaded bars — the reference the

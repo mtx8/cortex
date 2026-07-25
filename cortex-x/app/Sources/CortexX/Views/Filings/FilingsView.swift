@@ -21,6 +21,32 @@ private enum FilingsCol {
     // DESCRIPTION flexes to the leftover pane width.
 }
 
+// MARK: - Pane state (pure, testable)
+
+/// Which pane the FILINGS desk shows. Pure + testable because the failure case is
+/// the one that silently rots: the model's 20s watchdog only drops
+/// `filingsLoading` and leaves `filingsReport` nil, which used to fall straight
+/// through to the never-searched prompt — so a pull that FAILED told the operator
+/// to "search a ticker" seconds after they searched one, with their query still in
+/// the field and no reason anywhere.
+enum FilingsPane: Equatable {
+    /// A report is loaded.
+    case board
+    /// A pull is genuinely in flight.
+    case loading
+    /// We issued a pull and it terminated with nothing — a failure to disclose.
+    case unanswered
+    /// Nothing has been searched yet.
+    case prompt
+
+    static func resolve(hasReport: Bool, loading: Bool, requestedQuery: String?) -> FilingsPane {
+        if hasReport { return .board }
+        if loading { return .loading }
+        if let q = requestedQuery, !q.isEmpty { return .unanswered }
+        return .prompt
+    }
+}
+
 // MARK: - View
 
 struct FilingsView: View {
@@ -30,6 +56,10 @@ struct FilingsView: View {
     @State private var form: FilingFormFilter = .all
     @State private var range: FilingsDateRange = .all
     @State private var sort: FilingsSort = .default
+    /// The query this desk last dispatched a pull for, or nil when nothing has been
+    /// asked yet. The model records no per-request terminal outcome, so this is what
+    /// separates "the pull failed" from "the operator never searched".
+    @State private var requestedQuery: String?
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
@@ -42,11 +72,18 @@ struct FilingsView: View {
                 filterRow
                 Divider().overlay(Theme.line)
                 Group {
-                    if let report = model.filingsReport {
-                        board(report, now: context.date)
-                    } else if model.filingsLoading {
+                    switch FilingsPane.resolve(
+                        hasReport: model.filingsReport != nil,
+                        loading: model.filingsLoading,
+                        requestedQuery: requestedQuery
+                    ) {
+                    case .board:
+                        if let report = model.filingsReport { board(report, now: context.date) }
+                    case .loading:
                         loadingState
-                    } else {
+                    case .unanswered:
+                        unansweredState(requestedQuery ?? query)
+                    case .prompt:
                         emptyState
                     }
                 }
@@ -71,7 +108,7 @@ struct FilingsView: View {
             let seed = model.filingsQuery.isEmpty ? model.selectedSymbol : model.filingsQuery
             if AppModel.isEquity(seed) {
                 query = seed
-                model.requestFilings(query: seed, text: "")
+                pull(seed, text: "")
             }
         }
     }
@@ -81,7 +118,17 @@ struct FilingsView: View {
     private func submit() {
         let q = query.trimmingCharacters(in: .whitespaces)
         guard !q.isEmpty else { return }
-        model.requestFilings(query: q, text: fullText.trimmingCharacters(in: .whitespaces))
+        pull(q, text: fullText.trimmingCharacters(in: .whitespaces))
+    }
+
+    /// Dispatch an EDGAR pull and remember what it was for, so a pull that never
+    /// comes back can be named. Offline the engine's `send` is a no-op, so arming
+    /// the model's 20s spinner would burn 20 seconds before failing silently —
+    /// record the attempt and let the failure pane state the real reason instead.
+    private func pull(_ q: String, text: String) {
+        requestedQuery = q
+        guard model.engineReachable else { return }
+        model.requestFilings(query: q, text: text)
     }
 
     // MARK: Header
@@ -351,6 +398,55 @@ struct FilingsView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(Theme.dim)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// A pull we issued that resolved with no report: the engine never answered
+    /// inside the watchdog window (FILINGS is not a critical frame, so it can be
+    /// dropped under backpressure — or the engine predates FILINGS support), or the
+    /// app is offline and the command was never sent. Disclosed through the desk's
+    /// own honesty grammar — ember dot + bone text, never a coloured warning fill —
+    /// with a retry, because the operator's query is still sitting in the field.
+    private func unansweredState(_ q: String) -> some View {
+        let offline = !model.engineReachable
+        return VStack(spacing: 10) {
+            HStack(spacing: 6) {
+                Circle().fill(Theme.ember).frame(width: 4, height: 4)
+                Text(offline
+                    ? "engine \(model.connection.label) — no EDGAR pull was sent for \(q)"
+                    : "EDGAR pull for \(q) went unanswered")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.bone)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+            }
+            Text(offline
+                ? "filings come from the engine's EDGAR client — reconnect, then retry"
+                : "the engine did not answer in time — the request may have been dropped")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.dim)
+                .multilineTextAlignment(.center)
+            Button {
+                pull(q, text: fullText.trimmingCharacters(in: .whitespaces))
+            } label: {
+                Text("retry")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(Theme.ember)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Theme.emberTint)
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.chipRadius)
+                            .strokeBorder(Theme.ember.opacity(0.5), lineWidth: Theme.hairline)
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("re-run the EDGAR pull for \(q)")
+        }
+        .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 

@@ -342,6 +342,27 @@ enum ChartMath {
             && interval.ms < Interval.m5.ms
     }
 
+    /// Should the last-price line / right-axis tag be marked as an
+    /// extended-hours ("EXT") print? Only an equity INTRADAY bar can be one —
+    /// so this shares the `isEquityIntraday` gate with the ext shading instead
+    /// of classifying the bar-open on its own.
+    ///
+    /// A D1 bar is a whole regular session and a weekly bar a whole trading
+    /// week; neither is an extended-hours print. Worse, both are stamped at
+    /// UTC midnight (D1 buckets in cx-md, weekly at `weekFloor` = Monday 00:00
+    /// UTC), which is 19:00/20:00 ET — outside `rthMinutes`. Classifying them
+    /// with `isExtendedHours` alone therefore marked EVERY equity daily and
+    /// weekly chart "EXT" forever, telling the operator a mid-session print was
+    /// a pre/after-hours one. Crypto (24/7) has no extended session at all.
+    static func showsExtendedHoursMarker(
+        symbol: String, interval: Interval, weekly: Bool, lastBarTsMs: Int64?
+    ) -> Bool {
+        guard isEquityIntraday(symbol: symbol, interval: interval, weekly: weekly),
+            let ts = lastBarTsMs
+        else { return false }
+        return isExtendedHours(ts)
+    }
+
     // MARK: - Time & buckets
 
     /// One 7-day bar span in milliseconds — the view-level weekly bar width.
@@ -429,14 +450,34 @@ enum ChartMath {
         return (c.year ?? 0) * 10_000 + (c.month ?? 0) * 100 + (c.day ?? 0)
     }
 
+    /// Calendar year of `tsMs` in the given zone, taken off the same
+    /// day-boundary key the axis already uses — so the axis's "show the year"
+    /// switch can never disagree with its "show the date" switch about which
+    /// calendar day a gridline belongs to.
+    static func yearKey(_ tsMs: Int64, tz: TimeZone) -> Int {
+        dayKey(tsMs, tz: tz) / 10_000
+    }
+
     /// Axis label in the given zone: HH:mm intraday, dd MMM for daily bars OR at a
     /// day boundary (`showDate`) so a session change reads clearly. `tz` defaults
     /// to the device zone for callers that don't pass one.
+    ///
+    /// `showYear` appends a 2-digit year to a DATE label. It never promotes a
+    /// clock label to a date one — on the 5y / all presets every label is
+    /// already a date and read "05 Jan · 04 May · 01 Sep …" with no year
+    /// anywhere, so a gridline five years back was indistinguishable from this
+    /// year's; on intraday charts the axis must stay a clock.
     static func timeLabel(
-        _ tsMs: Int64, interval: Interval, tz: TimeZone = .current, showDate: Bool = false
+        _ tsMs: Int64, interval: Interval, tz: TimeZone = .current,
+        showDate: Bool = false, showYear: Bool = false
     ) -> String {
         let date = Date(timeIntervalSince1970: Double(tsMs) / 1000)
-        let f = (interval == .d1 || showDate) ? dayFormatter : clockFormatter
+        let f: DateFormatter
+        if interval == .d1 || showDate {
+            f = showYear ? dayYearFormatter : dayFormatter
+        } else {
+            f = clockFormatter
+        }
         f.timeZone = tz
         return f.string(from: date)
     }
@@ -451,6 +492,9 @@ enum ChartMath {
 
     private static let clockFormatter = makeFormatter("HH:mm")
     private static let dayFormatter = makeFormatter("dd MMM")
+    /// Multi-year windows only — two digits keeps the axis label narrow enough
+    /// that the 78px gridline spacing does not need to change.
+    private static let dayYearFormatter = makeFormatter("dd MMM yy")
     private static let readoutClockFormatter = makeFormatter("dd MMM HH:mm:ss")
     private static let readoutDayFormatter = makeFormatter("dd MMM yyyy")
 

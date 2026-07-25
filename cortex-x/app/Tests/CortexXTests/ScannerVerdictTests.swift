@@ -281,7 +281,10 @@ final class ScannerVerdictTests: XCTestCase {
         // Categorical / injected columns aren't row-key sortable.
         XCTAssertFalse(ScanColumn.sector.sortable)
         XCTAssertFalse(ScanColumn.news.sortable)
-        XCTAssertFalse(ScanColumn.change.sortable)
+        // CHG% IS sortable now: the details grid sorts it on the injected live
+        // session change, so the same header no longer behaves differently
+        // between the summary and details tables.
+        XCTAssertTrue(ScanColumn.change.sortable)
         XCTAssertTrue(ScanColumn.price.sortable)
     }
 

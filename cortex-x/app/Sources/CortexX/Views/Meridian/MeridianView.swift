@@ -42,6 +42,29 @@ enum MeridianSupport {
             }
             .map(\.element)
     }
+
+    /// GDELT tone readout: "+3.2" / "-1.8" / "—".
+    static func toneText(_ v: Double) -> String {
+        v.isFinite ? String(format: "%+.1f", v) : "—"
+    }
+
+    /// Tone colour. Sentiment is NOT money direction — green/red stay reserved for
+    /// P&L and price direction (Theme.swift:3) — so the +/- sign carries polarity
+    /// and the value reads bone, dim when zero/non-finite. This is verbatim what
+    /// NewsItemRow (NewsView.swift) and CompanyNewsRow (CompanySupport.swift) do
+    /// with the SAME `tone` field; MERIDIAN used to paint it green/red, so one
+    /// number was coloured two contradictory ways inside one app.
+    static func toneColor(_ v: Double) -> Color {
+        (v.isFinite && v != 0) ? Theme.bone : Theme.dim
+    }
+
+    /// 7-day force trend: "▲ 0.4" / "▼ 0.4" / "—". The glyph carries the sign, so
+    /// the caller can render it bone — a geopolitical intensity delta is not money
+    /// direction either, and the P&L palette must not leak onto it.
+    static func trendText(_ v: Double) -> String {
+        guard v.isFinite, v != 0 else { return "—" }
+        return v > 0 ? String(format: "▲ %.1f", v) : String(format: "▼ %.1f", abs(v))
+    }
 }
 
 // MARK: - View
@@ -209,13 +232,7 @@ private struct ForceGaugeRow: View {
     let gauge: ForceGauge
 
     private var trend: (text: String, color: Color) {
-        if gauge.trend_7d > 0 {
-            return (String(format: "▲ %.1f", gauge.trend_7d), Theme.up)
-        }
-        if gauge.trend_7d < 0 {
-            return (String(format: "▼ %.1f", abs(gauge.trend_7d)), Theme.down)
-        }
-        return ("—", Theme.dim)
+        (MeridianSupport.trendText(gauge.trend_7d), MeridianSupport.toneColor(gauge.trend_7d))
     }
 
     var body: some View {
@@ -424,11 +441,7 @@ private struct GeoEventRow: View {
     let now: Date
     @State private var hovering = false
 
-    private var toneColor: Color {
-        if event.tone > 0 { return Theme.up }
-        if event.tone < 0 { return Theme.down }
-        return Theme.dim
-    }
+    private var toneColor: Color { MeridianSupport.toneColor(event.tone) }
 
     var body: some View {
         Button {
@@ -446,7 +459,7 @@ private struct GeoEventRow: View {
                             RoundedRectangle(cornerRadius: Theme.chipRadius)
                                 .strokeBorder(Theme.line, lineWidth: Theme.hairline)
                         )
-                    Text(String(format: "%+.1f", event.tone))
+                    Text(MeridianSupport.toneText(event.tone))
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(toneColor)
                     Spacer(minLength: 4)

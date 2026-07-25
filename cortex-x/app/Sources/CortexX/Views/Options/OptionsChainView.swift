@@ -32,9 +32,26 @@ struct OptionsChainView: View {
                         Text("Loading chain for \(underlying)")
                             .font(.system(size: 12)).foregroundStyle(Theme.dim)
                     } else {
-                        Text("No chain loaded")
-                            .font(.system(size: 12)).foregroundStyle(Theme.dim)
-                        Button("Load \(underlying) Chain") {
+                        // A failed or unanswered request says so, and stays
+                        // retryable. The spinner used to just hang here forever.
+                        if let error = model.chainError {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(Theme.ember)
+                                    .frame(width: 5, height: 5)
+                                Text(error)
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(Theme.bone)
+                            }
+                        } else {
+                            Text("No chain loaded")
+                                .font(.system(size: 12)).foregroundStyle(Theme.dim)
+                        }
+                        Button(
+                            model.chainError == nil
+                                ? "Load \(underlying) Chain"
+                                : "Retry \(underlying) Chain"
+                        ) {
                             model.requestOptionsChain(underlying: underlying)
                         }
                         .buttonStyle(EmberButtonStyle())

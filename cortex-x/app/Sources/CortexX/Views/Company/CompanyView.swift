@@ -27,6 +27,19 @@ enum CompanyFormat {
         return sign + "$" + String(format: "%.0f", a)
     }
 
+    /// Per-share money ($4.32 / $23.60 / $0.87). NEVER route a share-scale figure
+    /// through `abbrevMoney`: its sub-$1,000 fallthrough formats with "%.0f", so a
+    /// real book value of $4.32 renders "$4" and $0.87 rounds to "$1" — a
+    /// materially wrong number for a cell sitting beside the P/B ratio. The
+    /// abbreviator is kept only above $1,000 so a BRK.A-scale book value ($400K+)
+    /// still fits its cell.
+    static func perShareMoney(_ v: Double?) -> String {
+        guard let v, v.isFinite else { return "—" }
+        let a = abs(v)
+        if a >= 1e3 { return abbrevMoney(v) }
+        return (v < 0 ? "-" : "") + "$" + String(format: "%.2f", a)
+    }
+
     /// Fraction (0.564) -> "56.4%". nil -> em dash.
     static func pct(_ fraction: Double?, signed: Bool = false) -> String {
         guard let f = fraction, f.isFinite else { return "—" }
@@ -42,6 +55,37 @@ enum CompanyFormat {
     /// Crypto / uncurated profiles: no graph, no segments — fundamentals-only layout.
     static func isMinimal(_ p: CompanyProfile) -> Bool {
         p.suppliers.isEmpty && p.customers.isEmpty && p.segments.isEmpty
+    }
+}
+
+/// Which pane the COMPANY board shows. Pure + testable because the failure case is
+/// the one that silently rots: the model's 20s watchdog only drops
+/// `companyLoading`, and `company` keeps whatever profile last arrived — so the old
+/// `companyLoading || company != nil` test kept the spinner up FOREVER for any
+/// operator who had ever loaded one company and then walked the graph to a company
+/// the engine never answered for. A stale profile is not a loading state.
+enum CompanyPane: Equatable {
+    /// A profile for the company being inspected.
+    case board
+    /// A request is genuinely in flight.
+    case loading
+    /// We asked and the request terminated with nothing — a failure to disclose.
+    case unanswered
+    /// Nothing has been asked for yet.
+    case prompt
+
+    static func resolve(
+        hasProfileForSymbol: Bool, loading: Bool, requestedSymbol: String?, symbol: String
+    ) -> CompanyPane {
+        if hasProfileForSymbol { return .board }
+        if loading { return .loading }
+        guard !symbol.isEmpty else { return .prompt }
+        // ONLY a request we actually issued for THIS company can have failed.
+        if requestedSymbol == symbol { return .unanswered }
+        // Symbol just changed: the view's `.task` dispatches the request on the very
+        // next runloop pass, so this is still a load — not a failure, and not an
+        // "asked for nothing" prompt.
+        return .loading
     }
 }
 
@@ -61,13 +105,28 @@ struct CompanyView: View {
         return c
     }
 
+    /// The company this view last dispatched an intelligence request for. The model
+    /// keeps no per-request terminal outcome (the watchdog just clears the spinner),
+    /// so remembering what we asked for is what lets the failure pane say "went
+    /// unanswered — retry" instead of an eternal spinner or a "nothing selected"
+    /// prompt for a company the operator explicitly navigated to.
+    @State private var requestedSymbol: String?
+
     var body: some View {
         Group {
-            if let profile {
-                board(profile)
-            } else if model.companyLoading || model.company != nil {
+            switch CompanyPane.resolve(
+                hasProfileForSymbol: profile != nil,
+                loading: model.companyLoading,
+                requestedSymbol: requestedSymbol,
+                symbol: model.companySymbol
+            ) {
+            case .board:
+                if let profile { board(profile) }
+            case .loading:
                 loadingState
-            } else {
+            case .unanswered:
+                unansweredState
+            case .prompt:
                 emptyState
             }
         }
@@ -77,9 +136,19 @@ struct CompanyView: View {
             if model.companySymbol.isEmpty {
                 model.companySymbol = model.selectedSymbol
             } else if profile == nil {
-                model.requestCompany(model.companySymbol)
+                request(model.companySymbol)
+            } else {
+                // Already resolved (graph-walk back to a loaded company): record the
+                // symbol so a later re-request can still fail loudly.
+                requestedSymbol = model.companySymbol
             }
         }
+    }
+
+    /// Issue the intelligence request and remember which company it was for.
+    private func request(_ symbol: String) {
+        requestedSymbol = symbol
+        model.requestCompany(symbol)
     }
 
     // MARK: States
@@ -104,6 +173,53 @@ struct CompanyView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(Theme.dim)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// The request terminated with nothing: either the engine never answered inside
+    /// the watchdog window (dropped under backpressure — COMPANY is not a critical
+    /// frame — or an older build without COMPANY support), or it answered for a
+    /// different company. Disclosed with an ember dot + bone text, never a coloured
+    /// warning fill, and always retryable — an operator must never be left staring
+    /// at a spinner that will not resolve.
+    private var unansweredState: some View {
+        VStack(spacing: 10) {
+            SectionLabel(text: "company")
+            HStack(spacing: 6) {
+                Circle().fill(Theme.ember).frame(width: 4, height: 4)
+                Text("intelligence request for \(model.companySymbol) went unanswered")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Theme.bone)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+            }
+            Text(model.engineReachable
+                ? "the engine did not answer in time — the frame may have been dropped"
+                : "engine \(model.connection.label) — the request was never sent")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.dim)
+                .multilineTextAlignment(.center)
+            Button {
+                request(model.companySymbol)
+            } label: {
+                Text("retry")
+                    .font(.system(size: 10, weight: .semibold))
+                    .tracking(0.6)
+                    .foregroundStyle(Theme.ember)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Theme.emberTint)
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.chipRadius)
+                            .strokeBorder(Theme.ember.opacity(0.5), lineWidth: Theme.hairline)
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("re-request \(model.companySymbol) intelligence")
+        }
+        .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
@@ -540,7 +656,7 @@ struct CompanyView: View {
                         CompanyStats.capRatio(cap, over: f.revenue)), note: "cap ÷ revenue")
                     CompanyStatCell(label: "p/b", value: CompanyStats.ratioLabel(
                         CompanyStats.capRatio(cap, over: f.equity)), note: "cap ÷ equity")
-                    CompanyStatCell(label: "book / share", value: CompanyFormat.abbrevMoney(
+                    CompanyStatCell(label: "book / share", value: CompanyFormat.perShareMoney(
                         CompanyStats.bookValuePerShare(equity: f.equity, shares: f.shares_outstanding)),
                                     note: "equity ÷ shares")
                 }

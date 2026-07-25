@@ -24,12 +24,79 @@ struct NewsBriefRef: Identifiable, Equatable {
     var id: String { requestId }
 }
 
+/// An `error` frame from the engine: it refused the last command, or could not
+/// parse it. Kept so the UI can say so — a rejected command used to be dropped
+/// on the floor, which made an out-of-date engine look like a broken control.
+struct EngineErrorNote: Equatable {
+    let detail: String
+    let at: Date
+}
+
+/// A command the app could not put on the wire. Surfaced, never swallowed: on a
+/// trading desk an undelivered `flatten_all` or kill switch that looks delivered
+/// is the most dangerous failure the client can have.
+struct UndeliveredCommand: Equatable {
+    /// Operator-facing name of the action, not the wire tag.
+    let label: String
+    let reason: String
+    let at: Date
+}
+
+/// The identity of one outstanding `get_filings` request.
+///
+/// The engine echoes only `query` back in its `FilingsReport`, which is not
+/// enough to tell the FILINGS desk's bare `onAppear` pull for AAPL apart from the
+/// operator's keyword search for the SAME entity. `text` is therefore part of the
+/// identity: it decides WHICH EDGAR endpoint answers (full-text vs submissions),
+/// and so which `source` the report carries back.
+struct FilingsRequestID: Equatable {
+    let seq: Int
+    let query: String
+    let formFilter: String
+    let text: String
+    /// A keyword request is answered by EDGAR full-text search; a bare one by
+    /// the submissions list.
+    var wantsFullText: Bool { !text.trimmingCharacters(in: .whitespaces).isEmpty }
+}
+
 @MainActor
 @Observable
 final class AppModel {
     // MARK: Connection
     private(set) var connection: ConnectionState = .disconnected
     private(set) var protocolVersion = 0
+    /// Features the connected engine declared in its `hello` (see
+    /// `EngineCapability`). Empty until a hello lands — and empty AFTER one from
+    /// an engine too old to declare any.
+    private(set) var engineCapabilities: Set<String> = []
+    /// The connected engine's crate version, for the out-of-date banner.
+    private(set) var engineVersion = ""
+    /// Capabilities this app build needs that the connected engine lacks.
+    ///
+    /// This is the difference between a diagnosable problem and a mystery. The
+    /// engine outlives app builds by design, so a fresh app regularly meets a
+    /// cortexd from a previous build. That engine accepts new commands (serde
+    /// ignores unknown fields) and answers them wrongly but plausibly, so the
+    /// symptom is a feature that silently does nothing. Non-empty here means the
+    /// operator sees a banner naming the problem instead.
+    var missingEngineCapabilities: [String] {
+        // The socket reaches `.connected` BEFORE the hello frame arrives, and
+        // capabilities are empty until it does. Judging in that window would
+        // flash "engine out of date" on every single connect — so nothing is
+        // claimed until the engine has actually introduced itself.
+        guard case .connected = connection, helloReceived else { return [] }
+        return EngineCapability.required.filter { !engineCapabilities.contains($0) }
+    }
+    /// Whether a `hello` has been seen on the CURRENT connection. Cleared on
+    /// every disconnect so a reconnect re-earns its verdict.
+    private(set) var helloReceived = false
+    /// True when the connected engine cannot serve this app build correctly.
+    var engineOutdated: Bool { !missingEngineCapabilities.isEmpty }
+    /// Last error frame the engine sent (rejected command, unparseable frame).
+    /// Surfaced rather than swallowed: an `error` frame is the engine saying it
+    /// refused what the app asked for, which is exactly the signal an operator
+    /// needs when a control appears to do nothing.
+    private(set) var lastEngineError: EngineErrorNote?
 
     // MARK: Market
     private(set) var symbols: [String] = []
@@ -39,8 +106,21 @@ final class AppModel {
     private(set) var bars: [String: [Interval: [Bar]]] = [:]
     private(set) var lastTick: [String: Tick] = [:]
     private(set) var bookTop: [String: BookTop] = [:]
-    /// Rolling 24h-style reference for % change: first close seen per symbol/day.
+    /// LAST-RESORT reference for % change: the first real session anchor seen
+    /// for a symbol on the current UTC day. Only consulted when the D1 series
+    /// cannot supply a true reference (see `sessionChangePct`) — it is a rolling
+    /// approximation, never the preferred answer.
     private(set) var sessionOpen: [String: Double] = [:]
+    /// The UTC day each `sessionOpen` entry was captured on, so the reference
+    /// ROLLS OVER.
+    ///
+    /// This used to be written only when the slot was nil, with no day logic
+    /// anywhere despite the doc comment claiming "per symbol/day". An app left
+    /// open for three days therefore reported the change since LAUNCH (e.g.
+    /// "+31.40%") styled exactly like a real session gap. Keying by day means a
+    /// stale reference is replaced the moment the first price of a new day
+    /// lands, instead of being kept for the life of the process.
+    private var sessionOpenDay: [String: Int] = [:]
 
     // MARK: Level 2 (depth ladder + time & sales)
     /// The order-book depth for the actively-subscribed symbol. nil until the
@@ -81,6 +161,23 @@ final class AppModel {
     private(set) var fills: [Fill] = []
 
     // MARK: Risk & agents
+    /// True when the engine has told us it DROPPED events (a `gap` frame) and
+    /// the rebuilding snapshot has not landed yet.
+    ///
+    /// `Position` and `Account` are not in the engine's critical set, so under
+    /// client lag they are dropped and counted instead of queued. A position
+    /// closed by a fill publishes its qty→0 event EXACTLY ONCE (the periodic
+    /// republish only re-emits symbols marked dirty by fresh marks), so a single
+    /// dropped frame leaves the pre-close quantity in `positions` — a phantom
+    /// open position with wrong gross/net exposure that the operator might try
+    /// to "flatten". The portfolio panes disclose this flag (ember dot + bone
+    /// text) for the seconds until the resync snapshot rebuilds state, so the
+    /// numbers are never silently wrong. Cleared by `applySnapshot`.
+    private(set) var staleAfterGap = false
+    /// Events the engine reported dropping since the last rebuilding snapshot.
+    /// Diagnostic: it says HOW much was lost, not merely that something was.
+    private(set) var droppedEventCount = 0
+
     private(set) var risk: RiskStatus = .empty
     private(set) var thoughts: [AgentThought] = []
     private(set) var signals: [StrategySignal] = []
@@ -103,6 +200,11 @@ final class AppModel {
     var centerMode: CenterMode = .chart
     private(set) var optionsChain: OptionsChain?
     private(set) var chainLoading = false
+    /// Why the last chain request produced nothing, for an honest empty state
+    /// instead of a spinner that stops with no explanation.
+    private(set) var chainError: String?
+    private var chainRequestSeq = 0
+    private var simRequestSeq = 0
     private(set) var simReport: SimReport?
     private(set) var simRunning = false
 
@@ -134,6 +236,24 @@ final class AppModel {
     /// active symbol when arriving via `openFilings`.
     private(set) var filingsQuery: String = ""
     private var filingsRequestSeq = 0
+    /// Every filings request sent and not yet accounted for, in send order.
+    ///
+    /// Acceptance and timeout used to disagree about WHICH request was current:
+    /// the watchdog keyed on `filingsRequestSeq` while the response guard
+    /// compared only the echoed query string. Two pulls for the same entity —
+    /// the desk's `onAppear` (no keywords) and the operator's keyword submit —
+    /// therefore both passed the guard, so the slower unfiltered submissions
+    /// answer silently replaced the keyword results the operator was reading,
+    /// with the spinner already down. This list gives both paths ONE identity.
+    private var outstandingFilings: [FilingsRequestID] = []
+
+    /// Whether a report came from EDGAR full-text search rather than the
+    /// submissions list. The engine's two source strings are the only
+    /// discriminator on the wire (`FilingsReport` carries no request id).
+    static func isFullTextReport(_ source: String) -> Bool {
+        source.contains("full-text")
+    }
+
     /// One-shot hint for NewsView: which tab to open on its next appear. Set by
     /// `openFilings` so the COMPANY board's "all filings" affordance lands on
     /// NEWS ▸ filings (filings now live as a tab inside the NEWS desk). NewsView
@@ -159,9 +279,116 @@ final class AppModel {
     /// and a fresh Yahoo egress — on every switch.
     private(set) var historyMisses: Set<String> = []
 
+    /// When each miss was recorded, so misses EXPIRE.
+    ///
+    /// A miss used to be permanent for the life of the connection: the only code
+    /// that cleared it was the arrival of a non-empty slice for the same key, and
+    /// the only code that could ask for one was gated on the miss itself. So a
+    /// single transient failure — an upstream hiccup, a symbol requested before
+    /// its listing, a weekend fetch that came back empty — locked that series out
+    /// until the app reconnected. Now the block is a cooldown, not a life
+    /// sentence.
+    private var historyMissMs: [String: Int64] = [:]
+
+    /// How long a miss suppresses re-requests. Long enough to stop the switch-
+    /// spam the miss set exists to prevent, short enough that a series which
+    /// starts working is picked up within the same session.
+    static let historyMissTtlMs: Int64 = 10 * 60_000
+
+    /// Whether a recorded miss still blocks a re-request. An expired miss is
+    /// dropped here so the state cannot accumulate stale keys forever.
+    private func historyMissBlocks(_ key: String, nowMs: Int64) -> Bool {
+        guard historyMisses.contains(key) else { return false }
+        guard let at = historyMissMs[key], nowMs - at < Self.historyMissTtlMs else {
+            historyMisses.remove(key)
+            historyMissMs[key] = nil
+            return false
+        }
+        return true
+    }
+
     /// Miss-set / cooldown key: one entry per (symbol, interval).
     static func historyMissKey(_ symbol: String, _ interval: Interval) -> String {
         "\(symbol)|\(interval.rawValue)"
+    }
+
+    /// In-flight `getHistory` requests: key -> when it was sent.
+    ///
+    /// Requests used to be fire-and-forget, and `.history` frames were filed
+    /// under whatever interval ARRIVED. Nothing connected an answer back to the
+    /// question, so an engine that answered a 5-minute request with daily bars
+    /// resolved the daily series, recorded no miss for 5-minute, and left the
+    /// chart on "waiting for market data" behind a 30s cooldown — forever, with
+    /// no error anywhere. Tracking the question makes a wrong or absent answer a
+    /// reportable event instead of silence.
+    private var pendingHistory: [String: Int64] = [:]
+
+    /// Why a (symbol, interval) series cannot be shown, when the reason is known.
+    /// Drives the chart's empty state so it states the cause instead of implying
+    /// data is still on its way.
+    private(set) var historyUnavailable: [String: String] = [:]
+
+    /// How long to wait for a `getHistory` answer before calling it unanswered.
+    /// Comfortably longer than a cold Yahoo backfill (a few seconds).
+    static let historyTimeoutSec: UInt64 = 20
+
+    /// The reason this series is unavailable, or nil while it may still arrive.
+    func historyReason(_ symbol: String, _ interval: Interval) -> String? {
+        historyUnavailable[Self.historyMissKey(symbol.uppercased(), interval)]
+    }
+
+    /// True while a request for this series is still outstanding — the chart may
+    /// legitimately show a loading state.
+    func historyPending(_ symbol: String, _ interval: Interval) -> Bool {
+        pendingHistory[Self.historyMissKey(symbol.uppercased(), interval)] != nil
+    }
+
+    /// Record an outgoing history request and arm its watchdog. Every
+    /// `getHistory` send goes through here so no request can be lost silently.
+    private func trackHistoryRequest(
+        _ symbol: String, _ interval: Interval,
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) {
+        let key = Self.historyMissKey(symbol, interval)
+        pendingHistory[key] = nowMs
+        historyUnavailable[key] = nil
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.historyTimeoutSec))
+            guard let self else { return }
+            // Still pending means this exact request was never answered. A newer
+            // request for the same series overwrites `pendingHistory[key]` with a
+            // later timestamp, so compare before declaring a timeout.
+            guard self.pendingHistory[key] == nowMs else { return }
+            self.pendingHistory[key] = nil
+            self.historyUnavailable[key] = self.engineOutdated
+                ? "engine is out of date — it cannot serve \(interval.label) bars"
+                : "engine did not answer the \(interval.label) history request"
+        }
+    }
+
+    /// Resolve the request an arriving `.history` frame answers, and diagnose the
+    /// case where the engine answered a DIFFERENT interval than any that was
+    /// asked for. An engine without `history_interval` answers every request with
+    /// daily bars; the requested intraday series would otherwise stay pending
+    /// until the watchdog fired, with the cooldown re-arming the same dead loop.
+    private func resolveHistoryRequest(_ slice: HistorySlice) {
+        let symbol = slice.symbol.uppercased()
+        let answered = Self.historyMissKey(symbol, slice.interval)
+        if pendingHistory.removeValue(forKey: answered) != nil {
+            historyUnavailable[answered] = nil
+            return // the answer matches the question — nothing to diagnose
+        }
+        // Unrequested interval: the engine substituted its own. Fail every
+        // outstanding request for this symbol now, naming the real cause, rather
+        // than letting each one time out separately.
+        let stranded = pendingHistory.keys.filter { $0.hasPrefix("\(symbol)|") }
+        guard !stranded.isEmpty else { return }
+        for key in stranded {
+            pendingHistory[key] = nil
+            historyUnavailable[key] = engineOutdated
+                ? "engine is out of date — it answered with \(slice.interval.label) bars"
+                : "engine has no bars at this interval (answered \(slice.interval.label))"
+        }
     }
 
     private let client: EngineClient
@@ -202,6 +429,7 @@ final class AppModel {
         // for HOW a frame mutates state).
         client.onFrame = { [weak self] frame in self?.receive(frame) }
         client.onStateChange = { [weak self] s in self?.handleStateChange(s) }
+        client.onSendFailure = { [weak self] cmd, why in self?.noteSendFailure(cmd, why) }
     }
 
     func handleStateChange(_ s: ConnectionState) {
@@ -210,6 +438,22 @@ final class AppModel {
         // by exact request id only, and a fresh connection knows nothing
         // about it — without this every ASK surface stays disabled forever.
         if s != .connected {
+            // Nothing is known about an engine we cannot reach: the next
+            // connection may well be a DIFFERENT engine (that is exactly what
+            // the restart path does), so its capabilities must be re-learned
+            // rather than inherited.
+            helloReceived = false
+            engineCapabilities = []
+            engineVersion = ""
+            // In-flight requests die with the socket. Their spinners must not
+            // outlive them: `simRunning` disables the FOUNDRY Run button and
+            // `chainLoading` hides the OPTIONS empty state, so a latched flag is
+            // a permanently dead section.
+            if chainLoading {
+                chainLoading = false
+                chainError = "connection lost before the chain arrived"
+            }
+            simRunning = false
             failPendingAsk("connection lost — ask again")
             // Drop the broker posture too: while the engine is unreachable we
             // cannot claim a live+connected broker, so fall back to the safe
@@ -234,7 +478,31 @@ final class AppModel {
 
     func start() { client.start() }
     func stop() { client.stop() }
-    func send(_ command: Command) { client.send(command) }
+    /// The single command exit. Returns whether the command reached the engine so
+    /// safety-critical callers can react instead of assuming success.
+    @discardableResult
+    func send(_ command: Command) -> Bool { client.send(command) }
+
+    /// A command that never reached the engine. Held so the UI can say so —
+    /// an operator who clicks "Engage Kill Switch" on a dropped link must not be
+    /// left believing trading is halted when the engine never heard it.
+    private(set) var undeliveredCommand: UndeliveredCommand?
+
+    /// True while commands can actually be delivered. Safety controls read this
+    /// so they never present themselves as armed when they are inert.
+    var engineReachable: Bool {
+        if case .connected = connection { return true }
+        return false
+    }
+
+    func clearUndeliveredCommand() { undeliveredCommand = nil }
+
+    /// Record a command the transport refused. Called from the client callback.
+    private func noteSendFailure(_ command: Command, _ reason: String) {
+        undeliveredCommand = UndeliveredCommand(
+            label: command.operatorLabel, reason: reason, at: Date()
+        )
+    }
 
     // MARK: Order placement
 
@@ -383,20 +651,81 @@ final class AppModel {
     /// Change % against the session reference. Equities read against the
     /// last RTH close of the PRIOR US/Eastern session when the D1 series
     /// carries one — so a pre-market print shows the real gap, not drift
-    /// from whatever tick this process saw first. Everything else (crypto,
-    /// equities with no D1 history yet) keeps the rolling `sessionOpen`
-    /// reference. `nowMs` is injected for tests.
+    /// from whatever tick this process saw first. 24/7 instruments (crypto)
+    /// read against the prior UTC day's D1 close, the reference every venue
+    /// quotes a 24h change against. Only when the D1 series can supply
+    /// neither does the rolling `sessionOpen` approximation apply.
+    /// `nowMs` is injected for tests.
     func sessionChangePct(
         _ symbol: String,
         nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
     ) -> Double? {
         guard let last = lastPrice(symbol) else { return nil }
-        if Self.isEquity(symbol),
-            let ref = Self.priorSessionClose(d1: bars(symbol, .d1), nowMs: nowMs) {
+        if let ref = Self.sessionReference(symbol, d1: bars(symbol, .d1), nowMs: nowMs) {
             return (last - ref) / ref * 100
         }
         guard let open = sessionOpen[symbol], open > 0 else { return nil }
         return (last - open) / open * 100
+    }
+
+    /// The true reference close for a symbol, from its D1 series, or nil when
+    /// the series cannot supply one. Equities key their session day off
+    /// US/Eastern (the RTH calendar); 24/7 instruments off UTC, which is where
+    /// their daily bars bucket and where the conventional 24h change is
+    /// measured from. Pure; the caller falls back when this is nil.
+    static func sessionReference(_ symbol: String, d1: [Bar], nowMs: Int64) -> Double? {
+        isEquity(symbol)
+            ? priorSessionClose(d1: d1, nowMs: nowMs)
+            : priorUtcDayClose(d1: d1, nowMs: nowMs)
+    }
+
+    /// The 24h reference for a continuously-traded instrument: the close of the
+    /// newest COMPLETE D1 bar belonging to a UTC day strictly before the current
+    /// one. Crypto has no session break, so "yesterday's UTC close" is the only
+    /// reference that means anything — and unlike the rolling `sessionOpen` it
+    /// does not depend on when this process happened to start. Skipping today's
+    /// row keeps a same-day D1 bar from collapsing the change to ~0%; requiring
+    /// `complete` keeps the still-forming daily bar out. Pure.
+    static func priorUtcDayClose(d1: [Bar], nowMs: Int64) -> Double? {
+        let today = ChartMath.utcDayKey(nowMs)
+        for bar in d1.reversed()
+        where ChartMath.utcDayKey(bar.ts_open_ms) < today
+            && bar.complete && bar.close.isFinite && bar.close > 0 {
+            return bar.close
+        }
+        return nil
+    }
+
+    /// A `sessionOpen` seed from a bar series: the OPEN of the oldest bar
+    /// belonging to the current UTC day (that day's own anchor), else the newest
+    /// close from a PRIOR day (yesterday's close). Never the newest close of
+    /// today's data — that is simply the current price, and seeding from it is
+    /// exactly why a freshly connected app reported "+0.00%" for every crypto
+    /// symbol no matter how far it had actually moved. Expects `series` sorted
+    /// oldest-first (both call sites sort). Pure.
+    static func sessionReferenceSeed(_ series: [Bar], nowMs: Int64) -> Double? {
+        let today = ChartMath.utcDayKey(nowMs)
+        for bar in series where ChartMath.utcDayKey(bar.ts_open_ms) == today {
+            if bar.open.isFinite, bar.open > 0 { return bar.open }
+        }
+        for bar in series.reversed() where ChartMath.utcDayKey(bar.ts_open_ms) < today {
+            if bar.close.isFinite, bar.close > 0 { return bar.close }
+        }
+        return nil
+    }
+
+    /// Record the rolling reference for `symbol`, keyed by UTC day so it cannot
+    /// outlive the day it describes. Writes when there is no reference yet OR
+    /// when the recorded one belongs to an earlier day; ignores non-finite and
+    /// non-positive prices (a zero reference would divide the change by zero).
+    private func noteSessionOpen(
+        _ symbol: String, _ price: Double?, nowMs: Int64
+    ) {
+        guard let price, price.isFinite, price > 0 else { return }
+        let day = ChartMath.utcDayKey(nowMs)
+        if sessionOpen[symbol] != nil, sessionOpenDay[symbol] == day { return }
+        sessionOpen[symbol] = price
+        sessionOpenDay[symbol] = day
     }
 
     /// The prior-session reference close: the newest D1 close whose session
@@ -425,16 +754,51 @@ final class AppModel {
     /// True for bare-ticker (equity) symbols, which have listed options.
     static func isEquity(_ symbol: String) -> Bool { !symbol.contains("-") }
 
+    /// How long a request may stay outstanding before its spinner is resolved as
+    /// a failure. Matches the company / filings watchdogs already in this file.
+    static let requestTimeoutSec: UInt64 = 20
+
+    /// Load an option chain.
+    ///
+    /// The spinner used to be set unconditionally and cleared ONLY by a matching
+    /// `optionsChain` frame. The engine answers a failed fetch with a warning
+    /// Thought and no chain, and an undelivered command produces nothing at all —
+    /// so OPTIONS spun forever with no way back. Now the flag is only raised if
+    /// the command actually went out, and a watchdog resolves it either way.
     func requestOptionsChain(underlying: String, expiry: String? = nil) {
         guard Self.isEquity(underlying) else { return }
         requestedChainUnderlying = underlying
+        guard send(.getOptionsChain(underlying: underlying, expiry: expiry)) else {
+            chainLoading = false // never claim a load that was never requested
+            return
+        }
         chainLoading = true
-        send(.getOptionsChain(underlying: underlying, expiry: expiry))
+        chainRequestSeq += 1
+        let seq = chainRequestSeq
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.requestTimeoutSec))
+            guard let self, self.chainRequestSeq == seq, self.chainLoading else { return }
+            self.chainLoading = false
+            self.chainError = "no option chain for \(underlying) — the engine did not answer"
+        }
     }
 
+    /// Run the simulation. Same latch as the chain: `simRunning` disables the Run
+    /// button, so a dropped command or a silent engine bricked FOUNDRY for the
+    /// rest of the session.
     func runSimulation() {
+        guard send(.runSimulation) else {
+            simRunning = false
+            return
+        }
         simRunning = true
-        send(.runSimulation)
+        simRequestSeq += 1
+        let seq = simRequestSeq
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.requestTimeoutSec))
+            guard let self, self.simRequestSeq == seq, self.simRunning else { return }
+            self.simRunning = false
+        }
     }
 
     /// Load the COMPANY intelligence card and switch to the company section.
@@ -467,10 +831,21 @@ final class AppModel {
         filingsLoading = true
         filingsRequestSeq += 1
         let seq = filingsRequestSeq
+        // Record the FULL identity, not just the seq: the response guard needs
+        // the same one, or a superseded answer can overwrite a newer one.
+        outstandingFilings.append(FilingsRequestID(
+            seq: seq, query: q, formFilter: formFilter, text: text
+        ))
         send(.getFilings(query: q, formFilter: formFilter, text: text))
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(20))
-            guard let self, self.filingsRequestSeq == seq, self.filingsLoading else { return }
+            guard let self else { return }
+            // Drop this request's identity whether or not it was the latest, so
+            // an answer that arrives after its own timeout can never be
+            // attributed to a later request — and the list stays bounded by the
+            // requests issued inside one timeout window.
+            self.outstandingFilings.removeAll { $0.seq == seq }
+            guard self.filingsRequestSeq == seq, self.filingsLoading else { return }
             self.filingsLoading = false
         }
     }
@@ -494,7 +869,7 @@ final class AppModel {
                 // .history handler no longer auto-switches, so the intended
                 // interval must be set here, not inferred from what arrives.
                 selectedInterval = .d1
-                send(.getHistory(symbol: symbol, interval: .d1))
+                sendHistoryRequest(symbol, .d1)
             }
         }
     }
@@ -512,11 +887,41 @@ final class AppModel {
         let symbol = symbol.uppercased()
         guard bars(symbol, interval).count < 30 else { return false }
         let key = Self.historyMissKey(symbol, interval)
-        guard !historyMisses.contains(key),
+        // An engine without `history_interval` answers ANY interval with daily
+        // bars, so asking is worse than useless: it burns an upstream fetch and
+        // then reads as a chart that never loads. Diagnose it immediately.
+        if interval != .d1, engineOutdated {
+            historyUnavailable[key] =
+                "engine is out of date — it cannot serve \(interval.label) bars"
+            return false
+        }
+        guard !historyMissBlocks(key, nowMs: nowMs),
               nowMs - (lastHistoryMs[key] ?? 0) >= Self.resyncCooldownMs else { return false }
         lastHistoryMs[key] = nowMs
-        send(.getHistory(symbol: symbol, interval: interval))
+        sendHistoryRequest(symbol, interval)
         return true
+    }
+
+    /// Send a `getHistory` and register it as in-flight. The ONLY way this
+    /// command leaves the app, so every request has a watchdog and every answer
+    /// can be matched back to its question.
+    private func sendHistoryRequest(_ symbol: String, _ interval: Interval) {
+        trackHistoryRequest(symbol, interval)
+        send(.getHistory(symbol: symbol, interval: interval))
+    }
+
+    // MARK: Engine lifecycle
+
+    /// Ask the engine to exit so the app's own bundled (newer) engine takes over.
+    ///
+    /// Explicit operator action only, from the out-of-date-engine banner. This is
+    /// NOT the kill switch: it stops trading, monitoring AND position
+    /// reconciliation until the replacement engine is up. The reconnect logic in
+    /// EngineClient does the rest — it retries, finds nothing listening, and
+    /// EngineBootstrap launches the bundled engine.
+    func restartEngine(reason: String = "operator restarted an out-of-date engine") {
+        send(.shutdown(reason: reason))
+        EngineBootstrap.prepareForRelaunch()
     }
 
     /// Pane-local history path for the multi-chart grid: request on-demand
@@ -524,11 +929,15 @@ final class AppModel {
     /// `selectedSymbol` or `selectedInterval` — fixed panes must never move
     /// the global selection. Returns whether a request actually went out.
     @discardableResult
-    func ensureSymbolData(_ symbol: String) -> Bool {
+    func ensureSymbolData(
+        _ symbol: String,
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> Bool {
         let symbol = symbol.uppercased()
         let hasBars = bars[symbol]?.values.contains { !$0.isEmpty } ?? false
-        guard !hasBars, !historyMisses.contains(Self.historyMissKey(symbol, .d1)) else { return false }
-        send(.getHistory(symbol: symbol, interval: .d1))
+        let key = Self.historyMissKey(symbol, .d1)
+        guard !hasBars, !historyMissBlocks(key, nowMs: nowMs) else { return false }
+        sendHistoryRequest(symbol, .d1)
         return true
     }
 
@@ -538,9 +947,11 @@ final class AppModel {
     /// daily backfill, and equity D1 bars never stream live — so charts stay
     /// short forever without a follow-up. One deep re-sync ~20s after each
     /// hello closes the gap. The token guards reconnects: each hello bumps
-    /// it, so only the latest connection's task fires. applySnapshot rebuilds
-    /// bars wholesale but never touches optionsChain/copilot/company state,
-    /// and it keeps the selected symbol whenever it is still listed.
+    /// it, so only the latest connection's task fires. applySnapshot MERGES the
+    /// bar store (only the series the snapshot carries are replaced, so this
+    /// automatic follow-up cannot destroy an on-demand intraday series), never
+    /// touches optionsChain/copilot/company state, and keeps the selected symbol
+    /// whenever it is still listed.
     private func scheduleFollowUpSync() {
         connectionToken += 1
         let token = connectionToken
@@ -582,7 +993,7 @@ final class AppModel {
             // Universe/searched symbols ride outside the watchlist sync —
             // fetch their D1 history directly.
             lastHistoryMs[symbol] = nowMs
-            send(.getHistory(symbol: symbol, interval: .d1))
+            sendHistoryRequest(symbol, .d1)
             issued = true
         }
         return issued
@@ -699,16 +1110,37 @@ final class AppModel {
 
     // MARK: Frame application
 
-    func apply(_ frame: ServerFrame) {
+    /// `nowMs` is injected so the time-based state a frame writes (currently the
+    /// history-miss expiry stamp) shares ONE clock with the `ensure*` paths that
+    /// read it. Stamping with the wall clock while those paths are given a test
+    /// clock silently disables the expiry.
+    func apply(
+        _ frame: ServerFrame,
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) {
         switch frame {
-        case .hello(let v):
+        case .hello(let v, let capabilities, let version):
             protocolVersion = v
+            engineCapabilities = capabilities
+            engineVersion = version
+            helloReceived = true
+            // A reconnect can land on a DIFFERENT engine than the one that
+            // stranded these requests (that is the whole point of the restart
+            // path), so clear the diagnoses and let the fresh engine be asked
+            // again rather than inheriting the old one's verdicts.
+            pendingHistory.removeAll()
+            historyUnavailable.removeAll()
+            historyMisses.removeAll()
+            historyMissMs.removeAll()
             scheduleFollowUpSync()
         case .snapshot(let snap):
-            applySnapshot(snap)
+            applySnapshot(snap, nowMs: nowMs)
         case .tick(let t):
             lastTick[t.symbol] = t
-            if sessionOpen[t.symbol] == nil { sessionOpen[t.symbol] = t.price }
+            // Last-resort reference only (the D1 series wins when it can answer),
+            // and day-keyed so it rolls over instead of reporting the change
+            // since this process started.
+            noteSessionOpen(t.symbol, t.price, nowMs: nowMs)
         case .bar(let bar):
             applyBar(bar)
         case .bookTop(let top):
@@ -779,6 +1211,7 @@ final class AppModel {
             if chain.underlying == requestedChainUnderlying {
                 optionsChain = chain
                 chainLoading = false
+                chainError = nil
             } else if optionsChain == nil {
                 optionsChain = chain
             }
@@ -809,48 +1242,71 @@ final class AppModel {
         case .news(let board):
             newsBoard = board
         case .filings(let report):
-            // Answered on demand, one tokio task per request with no ordering
-            // guarantee — a slow full-text pull for an earlier query can land
-            // AFTER a fast submissions pull for a newer one. Guard by the
-            // echoed query (the engine returns it verbatim; `filingsQuery`
-            // holds the latest request) so a superseded response can never
-            // overwrite the current entity or clear the spinner for a request
-            // still in flight. The watchdog handles the never-answered case.
-            guard report.query == filingsQuery else { break }
-            filingsReport = report
-            filingsLoading = false
+            applyFilings(report)
         case .history(let slice):
+            // Match the answer to the question BEFORE looking at its contents:
+            // a non-empty slice for an interval nobody asked for still leaves the
+            // requested series unresolved, and that is precisely the failure this
+            // diagnoses.
+            resolveHistoryRequest(slice)
             guard !slice.bars.isEmpty else {
                 // The engine answered "no data" (unresolvable ticker, failed
                 // backfill, or an interval with no REST source). Remember the
                 // miss PER interval so the on-demand path stops re-requesting —
                 // and re-hitting Yahoo — while other intervals stay eligible.
-                historyMisses.insert(Self.historyMissKey(slice.symbol, slice.interval))
+                // Time-stamped so the block EXPIRES (see historyMissTtlMs): a
+                // transient empty answer must not brick the series for the whole
+                // session.
+                let key = Self.historyMissKey(slice.symbol, slice.interval)
+                historyMisses.insert(key)
+                historyMissMs[key] = nowMs
                 break
             }
-            historyMisses.remove(Self.historyMissKey(slice.symbol, slice.interval))
-            bars[slice.symbol, default: [:]][slice.interval] =
-                slice.bars.sorted { $0.ts_open_ms < $1.ts_open_ms }
+            let key = Self.historyMissKey(slice.symbol, slice.interval)
+            historyMisses.remove(key)
+            historyMissMs[key] = nil
+            let sorted = slice.bars.sorted { $0.ts_open_ms < $1.ts_open_ms }
+            bars[slice.symbol, default: [:]][slice.interval] = sorted
             // No auto-switch: the requester (selectSymbol / setInterval) already
             // set selectedInterval to the interval it is waiting on, so the
             // merge above renders in place. Adopting whatever arrives would yank
             // the operator off their current pick when an earlier-requested
             // interval's response lands late (rapid interval switches), and let a
             // fixed grid pane's fetch flip the global interval.
-            if sessionOpen[slice.symbol] == nil {
-                sessionOpen[slice.symbol] = slice.bars.last?.close
-            }
-        case .gap, .error:
-            // Under client lag the engine drops non-critical events (the
-            // AiAnswer among them) and sends a gap frame instead — an
-            // in-flight ask can therefore never resolve. Fail it now.
+            // Seed the last-resort reference from a REAL anchor (today's open,
+            // else the prior day's close) — never from the newest close, which
+            // is just the current price.
+            noteSessionOpen(
+                slice.symbol, Self.sessionReferenceSeed(sorted, nowMs: nowMs), nowMs: nowMs
+            )
+        case .gap(let dropped):
+            // Under client lag the engine drops non-critical events and sends a
+            // gap frame instead. Two things are lost, and BOTH must be handled:
+            //
+            //  1. An in-flight ask can never resolve — AiAnswer is non-critical,
+            //     so its answer may be exactly what was dropped. Fail it now.
+            //  2. Position and Account are non-critical too, so the portfolio
+            //     view is now UNTRUSTED. See `staleAfterGap`: a dropped qty→0
+            //     Position frame is never republished, so the app would have kept
+            //     showing a phantom open position until the next reconnect. The
+            //     engine explicitly told us data was lost — resync rather than
+            //     keep rendering numbers we know may be wrong.
             failPendingAsk("answer lost — ask again")
+            noteGap(dropped: dropped, nowMs: nowMs)
+        case .error(let detail):
+            // The engine REFUSED a command (or could not parse it). This used to
+            // be folded into the gap case and discarded, so a rejected command
+            // was indistinguishable from a dead control. Keep it visible.
+            lastEngineError = EngineErrorNote(detail: detail, at: Date())
+            failPendingAsk("engine rejected the request — \(detail)")
         case .unknown:
             break
         }
     }
 
-    private func applySnapshot(_ snap: EngineSnapshot) {
+    /// `nowMs` rides in from `apply` so the session-reference seeding below
+    /// shares ONE clock with everything else a frame writes.
+    private func applySnapshot(_ snap: EngineSnapshot, nowMs: Int64) {
         symbols = snap.symbols
         if let u = snap.search_universe { searchUniverse = u }
         // Mid-session re-syncs (hello follow-up, ensureDepth) must never
@@ -871,7 +1327,23 @@ final class AppModel {
             }
             rebuilt[symbol] = m
         }
-        bars = rebuilt
+        // MERGE the bar store, never replace it. The snapshot is NOT a superset
+        // of what the client holds: it ships universe symbols D1-only and omits
+        // ad-hoc LOOKUP tickers entirely, even though `get_history` already
+        // wrote them into the engine's shared BarStore. Replacing wholesale
+        // therefore destroyed every on-demand series — an operator's 5m AAPL
+        // chart went empty the instant ANY later sync landed (the automatic
+        // hello follow-up ~20s in, or a range-preset `ensureDepth` on a
+        // completely different symbol), with no request in flight and the 30s
+        // `lastHistoryMs` cooldown blocking a refetch. Only the (symbol,
+        // interval) pairs the snapshot actually SUPPLIES are replaced. Empty
+        // series are skipped for the same reason a lean snapshot must not wipe a
+        // live broker posture: "absent from this payload" is not "gone".
+        for (symbol, byInterval) in rebuilt {
+            for (interval, series) in byInterval where !series.isEmpty {
+                bars[symbol, default: [:]][interval] = series
+            }
+        }
         // Rebuild positions WHOLESALE (like orders/thoughts): a position closed
         // while we were disconnected is absent from the reconnect snapshot and
         // must vanish — merging would leave phantom exposure that could drive a
@@ -899,11 +1371,82 @@ final class AppModel {
         if let g = snap.geo { geoPulse = g }
         if let s = snap.scan { applyScanBoard(s) }
         if let n = snap.news { newsBoard = n }
+        // Seed the last-resort reference from a real anchor, coarsest interval
+        // first: a D1 series answers with today's OPEN (or yesterday's close),
+        // which is what a change % actually means. Seeding from the newest
+        // intraday close — what this did before — anchored the reference to
+        // whatever price happened to be current at connect, so every crypto row
+        // read "+0.00%" on a fresh connect and then drifted for days.
         for (symbol, byInterval) in rebuilt {
-            if sessionOpen[symbol] == nil {
-                sessionOpen[symbol] = byInterval[.m1]?.last?.close ?? byInterval[.h1]?.last?.close
+            var seed: Double?
+            for interval in [Interval.d1, .h1, .m1] {
+                seed = Self.sessionReferenceSeed(byInterval[interval] ?? [], nowMs: nowMs)
+                if seed != nil { break }
             }
+            noteSessionOpen(symbol, seed, nowMs: nowMs)
         }
+        // This snapshot IS the rebuild a gap frame asked for: positions, account,
+        // orders and risk were just replaced wholesale, so the portfolio view is
+        // trustworthy again and the panels stop disclosing staleness.
+        staleAfterGap = false
+        droppedEventCount = 0
+    }
+
+    /// The engine dropped events under backpressure. Mark the portfolio view
+    /// untrusted and rebuild it from a fresh snapshot.
+    ///
+    /// Rate-limited on the same `lastResyncMs` cooldown as every other deep
+    /// sync: a lagging client receives gap frames in BURSTS, and answering each
+    /// one with a full snapshot request would deepen the very backpressure that
+    /// caused them. `lastResyncMs` is only stamped when the command actually
+    /// reached the engine, so a sync lost on a dying socket does not silence the
+    /// next gap. The flag stays raised either way — data was lost regardless of
+    /// whether we managed to ask for a rebuild.
+    private func noteGap(dropped: Int, nowMs: Int64) {
+        staleAfterGap = true
+        droppedEventCount += max(dropped, 0)
+        guard nowMs - lastResyncMs >= Self.resyncCooldownMs else { return }
+        guard send(.sync(barsPerSymbol: maxBars)) else { return }
+        lastResyncMs = nowMs
+    }
+
+    /// File a `filings` answer against the request it actually answers.
+    ///
+    /// The engine spawns one task per `get_filings` with no ordering guarantee
+    /// and echoes back only the query string, so query equality alone cannot
+    /// distinguish the desk's bare `onAppear` pull for AAPL from the operator's
+    /// keyword search for the SAME entity. It used to accept both, which meant a
+    /// slow 200-row unfiltered submissions answer silently replaced the keyword
+    /// results being read — spinner already down, no signal at all. A report is
+    /// now attributed to the newest outstanding request it could plausibly have
+    /// come from, and accepted ONLY when that is the latest request — the same
+    /// identity the watchdog uses.
+    private func applyFilings(_ report: FilingsReport) {
+        // `source` says which EDGAR endpoint answered, which is decided by
+        // whether the request carried keywords — so prefer a candidate whose
+        // expectation matches it. The fallback pass is what allows a keyword
+        // request that DEGRADED to the submissions list (efts unreachable, or an
+        // unresolvable entity — the engine discloses both in `note`) to still be
+        // accepted, while a same-query bare request outstanding at the same time
+        // wins the attribution and correctly rejects the stale answer.
+        let fullText = Self.isFullTextReport(report.source)
+        let candidates = outstandingFilings.filter { $0.query == report.query }
+        // Nothing outstanding can explain this report (its request already timed
+        // out, or it arrived unsolicited): leave every piece of state alone.
+        guard let matched = candidates.last(where: { $0.wantsFullText == fullText })
+            ?? candidates.last else { return }
+        guard matched.seq == filingsRequestSeq else {
+            // Superseded: drop the identity so it can never shadow the
+            // attribution of a later answer, and leave the spinner up for the
+            // request still in flight.
+            outstandingFilings.removeAll { $0.seq == matched.seq }
+            return
+        }
+        // Every older request is now unreachable — its answer could only
+        // overwrite this newer one.
+        outstandingFilings.removeAll { $0.seq <= matched.seq }
+        filingsReport = report
+        filingsLoading = false
     }
 
     /// Every scan-board arrival (frame or snapshot) replaces the board and

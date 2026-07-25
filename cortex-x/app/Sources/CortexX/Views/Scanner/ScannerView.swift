@@ -135,11 +135,63 @@ enum ScanColumn: String, CaseIterable, Codable {
         }
     }
 
-    /// Categorical / boolean / client-injected columns aren't row-key sortable.
+    /// Which headers the operator may click to sort. CHG% has no row field, but
+    /// the details table injects the live session change exactly as the summary
+    /// table does (see `ScanSort.apply`) — leaving it unsortable here made the
+    /// SAME header behave differently in the two table modes.
     var sortable: Bool {
         switch self {
-        case .flags, .news, .sector, .shortFloat, .floatUsd, .marketCap, .change: false
+        case .flags, .news, .sector, .shortFloat, .floatUsd, .marketCap: false
         default: true
+        }
+    }
+
+    /// Whether the filter builder may offer this column. Exactly the columns
+    /// `ScanSort.key` answers with a number: a field whose key is nil makes
+    /// `ScanFilter.matches` false for EVERY row, so picking it blanks the whole
+    /// board and the operator reads "no rows match this screen" instead of
+    /// "this filter is structurally incapable of matching". Six fields (chg% /
+    /// sector / mktcap / float$ / short%flt / news) used to be offered that way.
+    /// MUST stay in lockstep with `ScanSort.key` — ScannerRepairTests asserts a
+    /// non-nil key for every filterable column, so a new dead field fails tests
+    /// instead of silently emptying a screen.
+    var filterable: Bool {
+        switch self {
+        // Identity, categorical strings, the boolean news glyph, the live
+        // injected change, and the price-derived cells (mktcap / float$ /
+        // short%flt) have no static row key today.
+        case .symbol, .change, .sector, .marketCap, .floatUsd, .shortFloat, .news, .regime, .flags:
+            false
+        default:
+            true
+        }
+    }
+
+    /// The unit the operator types a filter threshold in, when it isn't the bare
+    /// reading. The return + Δ52w columns STORE simple-return fractions but
+    /// DISPLAY percent (`ScanFormat.pct` multiplies by 100), so a threshold typed
+    /// as "5" for 5% must not be compared against `ret_1m == 0.05` — that screens
+    /// for +500% and quietly empties the board. Rendered beside the value field
+    /// and in the collapsed filter summary so the convention is visible.
+    var filterUnit: String? {
+        switch self {
+        case .ret1w, .ret1m, .ret3m, .dist52wHi: "%"
+        default: nil
+        }
+    }
+
+    /// A raw row reading expressed in the unit the CELL renders, so a filter
+    /// compares against the number the operator can actually see.
+    /// - Returns: percent for the fraction-valued return columns (0.052 → 5.2).
+    ///   Δ52w-hi arrives from the engine as a non-negative drawdown but the cell
+    ///   renders it as a signed distance ("-3.2%"), so the filter reading is
+    ///   negated too — "Δ52w-hi >= -5%" then means "within 5% of the high",
+    ///   which is what the column shows.
+    func filterReading(_ raw: Double) -> Double {
+        switch self {
+        case .ret1w, .ret1m, .ret3m: raw * 100
+        case .dist52wHi: -abs(raw) * 100
+        default: raw
         }
     }
 }
@@ -151,9 +203,15 @@ struct ScanSort: Equatable, Codable {
     var ascending: Bool
 
     /// Numeric sort key for value columns; nil for string columns / flags.
+    /// STATIC — row fields only, no model reads — because `ScanFilter.matches`
+    /// evaluates a persisted screen through it. The live readings the cells
+    /// render are injected into `apply` instead.
     static func key(_ row: ScanRow, _ column: ScanColumn) -> Double? {
         switch column {
-        case .price: row.last_close // real proxy for a live-price sort
+        // The stable daily basis. `apply` prefers the injected live quote (the
+        // number the LAST cell actually shows); this is the fallback + the value
+        // a pure row-only filter screens on.
+        case .price: row.last_close
         case .composite: row.composite
         case .momentum: row.momentum
         case .trend: row.trend
@@ -172,29 +230,65 @@ struct ScanSort: Equatable, Codable {
         }
     }
 
-    func apply(_ rows: [ScanRow]) -> [ScanRow] {
+    /// Sort the rows for the details grid. `price` / `change` inject the LIVE
+    /// readings the cells actually render (`model.lastPrice` /
+    /// `model.sessionChangePct`). Without them LAST sorted on the stale
+    /// `last_close` while the cell showed the live quote, so a descending LAST
+    /// column was visibly not descending — a $99.20 close now trading $104.10
+    /// sank below a $101.00 close now trading $100.40. Both default to "unknown"
+    /// so row-only callers stay pure: LAST then falls back to `last_close`, and
+    /// CHG% (which has no row field at all) sorts as all-absent.
+    func apply(
+        _ rows: [ScanRow],
+        price: (ScanRow) -> Double? = { _ in nil },
+        change: (ScanRow) -> Double? = { _ in nil }
+    ) -> [ScanRow] {
         switch column {
         case .symbol:
+            // Stored field, never absent — a plain compare, no decoration needed.
             return rows.sorted { ascending ? $0.symbol < $1.symbol : $0.symbol > $1.symbol }
         case .regime:
-            return rows.sorted { a, b in
-                switch (a.regime?.label, b.regime?.label) {
-                case let (x?, y?): x == y ? false : (ascending ? x < y : x > y)
-                case (_?, nil): true
-                default: false
-                }
-            }
+            return Self.ordered(rows, ascending: ascending) { $0.regime?.label }
         case .flags:
             return rows
+        case .price:
+            // Same preference the LAST cell renders: the live quote, falling back
+            // to the daily close only when there is no usable tick yet.
+            return Self.ordered(rows, ascending: ascending) {
+                Self.finite(price($0)) ?? Self.finite($0.last_close)
+            }
+        case .change:
+            return Self.ordered(rows, ascending: ascending) { Self.finite(change($0)) }
         default:
-            return rows.sorted { a, b in
-                switch (Self.key(a, column), Self.key(b, column)) {
+            return Self.ordered(rows, ascending: ascending) { Self.finite(Self.key($0, column)) }
+        }
+    }
+
+    /// A non-finite reading is no reading: NaN/±inf sink with nil rather than
+    /// poisoning the comparator (every NaN comparison is false, which makes the
+    /// ordering depend on the sort's internal pivot choices).
+    private static func finite(_ v: Double?) -> Double? {
+        guard let v, v.isFinite else { return nil }
+        return v
+    }
+
+    /// nil-last decorate-sort-undecorate. The key is computed ONCE per row: an
+    /// injected key is an AppModel read (sessionChangePct walks the D1 series
+    /// doing calendar day-key math), and evaluating it inside the comparator
+    /// costs ~2·n·log₂n reads per sort instead of n. nil readings sort last in
+    /// BOTH directions — absent data never floats to the top of a screen.
+    private static func ordered<K: Comparable>(
+        _ rows: [ScanRow], ascending: Bool, key: (ScanRow) -> K?
+    ) -> [ScanRow] {
+        rows.map { (row: $0, k: key($0)) }
+            .sorted { a, b in
+                switch (a.k, b.k) {
                 case let (x?, y?): x == y ? false : (ascending ? x < y : x > y)
                 case (_?, nil): true
                 default: false
                 }
             }
-        }
+            .map(\.row)
     }
 
     /// Repeat click flips direction; first click on a column starts with the
@@ -750,7 +844,8 @@ struct ScannerView: View {
         ("RSI ≤ 30", ScanFilter(column: .rsi, op: .lte, value: 30)),
         ("RSI ≥ 70", ScanFilter(column: .rsi, op: .gte, value: 70)),
         ("RVOL ≥ 2×", ScanFilter(column: .volSurge, op: .gte, value: 2)),
-        ("1M ≥ 0", ScanFilter(column: .ret1m, op: .gte, value: 0)),
+        // Percent, like the 1M% column shows — the threshold is not a fraction.
+        ("1M ≥ 0%", ScanFilter(column: .ret1m, op: .gte, value: 0)),
         ("COMP ≥ 80", ScanFilter(column: .composite, op: .gte, value: 80)),
     ]
 
@@ -819,8 +914,10 @@ struct ScannerView: View {
                 .help("numeric filters, AND-combined with the active preset")
                 .animation(DeckMotion.ease(), value: filtersOpen)
                 if !filtersOpen && !filters.isEmpty {
-                    Text(filters.map { "\($0.column.title) \($0.op.title) \(ScanFormat.raw($0.value, decimals: 1))" }
-                        .joined(separator: " · "))
+                    // Rendered through the filter's own unit-aware summary so the
+                    // collapsed line can't read as a bare unscaled number
+                    // ("1m% >= 5.0" invited the fraction/percent misreading).
+                    Text(filters.map(\.summaryText).joined(separator: " · "))
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundStyle(Theme.dim)
                         .lineLimit(1)
@@ -1025,7 +1122,14 @@ struct ScannerView: View {
     private func displayRows(_ board: ScanBoard) -> [ScanRow] {
         let rows = baseRows(board)
         if showDetails {
-            return sort.map { $0.apply(rows) } ?? rows
+            guard let sort else { return rows }
+            // The live readings the LAST / CHG% cells render, injected so the
+            // sorted order matches what the operator sees in the column.
+            return sort.apply(
+                rows,
+                price: { model.lastPrice($0.symbol) },
+                change: { model.sessionChangePct($0.symbol) }
+            )
         }
         return ScanSummary.sorted(
             rows, by: summarySort,
@@ -1670,7 +1774,7 @@ private struct ScanFilterRowView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help(filter.enabled ? "filter active — click to pause" : "filter paused — click to apply")
+            .help(enableHelp)
             Menu {
                 ForEach(ScanFilter.fields, id: \.self) { column in
                     Button(column.title) { filter.column = column; filter.enabled = true }
@@ -1693,21 +1797,32 @@ private struct ScanFilterRowView: View {
             .menuIndicator(.hidden)
             .fixedSize()
             .help("operator")
-            TextField("value", value: $filter.value, format: .number)
-                .onChange(of: filter.value) { _, _ in filter.enabled = true }
-                .textFieldStyle(.plain)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(Theme.bone)
-                .multilineTextAlignment(.trailing)
-                .frame(width: 56)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(Theme.panel)
-                .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-                .overlay(
-                    RoundedRectangle(cornerRadius: Theme.chipRadius)
-                        .strokeBorder(Theme.line, lineWidth: Theme.hairline)
-                )
+            HStack(spacing: 3) {
+                TextField("value", value: $filter.value, format: .number)
+                    .onChange(of: filter.value) { _, _ in filter.enabled = true }
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(Theme.bone)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 56)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Theme.panel)
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: Theme.chipRadius)
+                            .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+                    )
+                // The unit, on screen. Without it the operator cannot tell that
+                // "1m% >= 5" means +5% and not the raw 5.0 fraction (+500%),
+                // which is exactly how this filter used to silently match nothing.
+                if let unit = filter.column.filterUnit {
+                    Text(unit)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Theme.dim)
+                }
+            }
+            .help(unitHelp)
             Button(action: remove) {
                 Image(systemName: "xmark")
                     .font(.system(size: 8, weight: .semibold))
@@ -1719,8 +1834,26 @@ private struct ScanFilterRowView: View {
             .help("remove filter")
             Spacer()
         }
-        // Dim a paused row (opacity keeps the enable toggle clickable).
-        .opacity(filter.enabled ? 1 : 0.55)
+        // Dim a paused row (opacity keeps the enable toggle clickable). A row
+        // restored from a screen saved on a keyless column is inert too, so it
+        // reads as paused rather than looking like it is culling the board.
+        .opacity(filter.enabled && filter.column.filterable ? 1 : 0.55)
+    }
+
+    /// Spells out the threshold's unit for the columns that have one, so the
+    /// percent convention is discoverable and not just implied by the suffix.
+    private var unitHelp: String {
+        filter.column.filterUnit == nil
+            ? "threshold"
+            : "threshold in percent — the same unit the \(filter.column.title) column shows"
+    }
+
+    private var enableHelp: String {
+        guard filter.column.filterable else {
+            return "\(filter.column.title) has no numeric reading to screen on — "
+                + "this row is ignored; pick another field"
+        }
+        return filter.enabled ? "filter active — click to pause" : "filter paused — click to apply"
     }
 
     private func chipLabel(_ text: String, width: CGFloat) -> some View {

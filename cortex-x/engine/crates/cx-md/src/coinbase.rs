@@ -228,7 +228,9 @@ async fn session(
             Message::Text(text) => match parse_msg(&text) {
                 Some(Parsed::Tick(tick)) => {
                     saw_data = true;
-                    store.set_last_price(&tick.symbol, tick.price);
+                    // A real print: declaring the venue also CLEARS any prior
+                    // synthetic label, so recovery re-enables live routing.
+                    store.set_last_price_from(&tick.symbol, tick.price, Venue::Coinbase);
                     // Every Coinbase match is a real fill — feed the tape.
                     bus.publish(EngineEvent::Tape(tape_of(&tick)));
                     bus.publish(EngineEvent::Tick(tick.clone()));
@@ -239,7 +241,7 @@ async fn session(
                 Some(Parsed::Top { top, last_px }) => {
                     saw_data = true;
                     if let Some(px) = last_px {
-                        store.set_last_price(&top.symbol, px);
+                        store.set_last_price_from(&top.symbol, px, Venue::Coinbase);
                     }
                     bus.publish(EngineEvent::BookTop(top));
                 }

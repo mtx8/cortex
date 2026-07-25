@@ -16,7 +16,10 @@ final class AppModelStateTests: XCTestCase {
     // MARK: - Options-chain frame filtering
 
     func testRequestedChainLandsAndClearsLoading() {
-        let model = AppModel()
+        // Connected: `requestOptionsChain` deliberately does NOT raise the
+        // spinner when the command cannot be delivered (see
+        // testChainSpinnerIsNotRaisedForAnUndeliveredRequest).
+        let model = connectedModel()
         model.requestOptionsChain(underlying: "AAPL")
         XCTAssertTrue(model.chainLoading)
         model.apply(.optionsChain(chain("AAPL")))
@@ -42,7 +45,7 @@ final class AppModelStateTests: XCTestCase {
     }
 
     func testStaleChainNeitherClearsLoadingNorPreemptsNewRequest() {
-        let model = AppModel()
+        let model = connectedModel()
         model.requestOptionsChain(underlying: "AAPL")
         model.apply(.optionsChain(chain("AAPL")))
         model.requestOptionsChain(underlying: "MSFT")
@@ -54,6 +57,44 @@ final class AppModelStateTests: XCTestCase {
         model.apply(.optionsChain(chain("MSFT")))
         XCTAssertEqual(model.optionsChain?.underlying, "MSFT")
         XCTAssertFalse(model.chainLoading)
+    }
+
+    func testChainSpinnerIsNotRaisedForAnUndeliveredRequest() {
+        // OPTIONS used to spin forever: the flag was set unconditionally and
+        // cleared only by a matching chain frame, so a command dropped on a dead
+        // link left the section permanently "Loading chain for X".
+        let model = AppModel() // disconnected
+        model.requestOptionsChain(underlying: "AAPL")
+        XCTAssertFalse(model.chainLoading, "no spinner for a request that never went out")
+        XCTAssertEqual(model.undeliveredCommand?.label, "load AAPL option chain")
+    }
+
+    func testSimRunButtonIsNotLatchedByAnUndeliveredRequest() {
+        // `simRunning` disables the FOUNDRY Run button, so latching it on a dead
+        // link bricked the section for the rest of the session.
+        let model = AppModel() // disconnected
+        model.runSimulation()
+        XCTAssertFalse(model.simRunning)
+    }
+
+    func testDisconnectResolvesInFlightSpinners() {
+        let model = connectedModel()
+        model.requestOptionsChain(underlying: "AAPL")
+        XCTAssertTrue(model.chainLoading)
+        model.handleStateChange(.disconnected)
+        XCTAssertFalse(model.chainLoading)
+        XCTAssertNotNil(model.chainError, "the stalled load states its cause")
+    }
+
+    /// A model whose engine link actually DELIVERS commands. `handleStateChange`
+    /// alone is not enough — it only updates the model's view of the connection,
+    /// while delivery is decided by the client's own socket state.
+    private func connectedModel() -> AppModel {
+        let client = EngineClient()
+        client.sendInterceptor = { _ in true }
+        let model = AppModel(client: client)
+        model.handleStateChange(.connected)
+        return model
     }
 
     // MARK: - Snapshot selection keeping

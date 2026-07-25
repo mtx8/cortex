@@ -89,7 +89,14 @@ final class ScannerSupportTests: XCTestCase {
         XCTAssertFalse(ScanFilter.fields.contains(.flags))
         XCTAssertTrue(ScanFilter.fields.contains(.composite))
         XCTAssertTrue(ScanFilter.fields.contains(.rsi))
-        XCTAssertEqual(ScanFilter.fields.count, ScanColumn.allCases.count - 3)
+        // Pinned against `filterable` rather than a hand-counted offset. The old
+        // `allCases.count - 3` encoded the previous exclusion list, which still
+        // offered six fields whose sort key is nil — picking one silently emptied
+        // the board. The invariant that matters is that every OFFERED field has a
+        // numeric reading, so assert exactly that.
+        // (That every filterable column has a non-nil sort key for a real row is
+        // locked in both directions by ScannerRepairTests.)
+        XCTAssertEqual(ScanFilter.fields, ScanColumn.allCases.filter(\.filterable))
     }
 
     func testFilterJSONRoundtrip() throws {

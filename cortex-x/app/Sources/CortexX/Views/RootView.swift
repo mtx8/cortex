@@ -41,6 +41,14 @@ struct RootView: View {
             TopBar()
                 .zIndex(1) // so the global symbol-search dropdown floats over the content below
             Divider().overlay(Theme.line)
+            if model.engineOutdated {
+                StaleEngineBanner()
+                Divider().overlay(Theme.line)
+            }
+            if let undelivered = model.undeliveredCommand {
+                UndeliveredCommandBanner(note: undelivered)
+                Divider().overlay(Theme.line)
+            }
             HStack(spacing: 0) {
                 IconRail()
                     .zIndex(2) // the hover flyout overflows right into the watchlist;
@@ -173,6 +181,154 @@ enum ShellPanel: CaseIterable {
 /// 13pt collapse affordance in a panel's own header: dim, ember on hover.
 /// Reads the same @AppStorage key RootView arranges by, so no bindings need
 /// to thread through the panels.
+/// Out-of-date-engine notice, pinned under the top bar.
+///
+/// The engine is deliberately left running when the window quits, so a freshly
+/// installed app build routinely connects to a cortexd from a previous build.
+/// That engine still ACCEPTS newer commands — serde ignores fields it does not
+/// know — and answers them wrongly but plausibly, so the only symptom is a
+/// feature that quietly does nothing (an intraday chart that never fills).
+/// Nothing in the UI used to say so. This does, and offers the one-step fix.
+///
+/// Ember dot + bone text, per the warning convention — no coloured alert block.
+private struct StaleEngineBanner: View {
+    @Environment(AppModel.self) private var model
+    @State private var confirming = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Theme.ember)
+                .frame(width: 5, height: 5)
+            Text("ENGINE OUT OF DATE")
+                .font(.system(size: 9, weight: .semibold))
+                .tracking(1.1)
+                .foregroundStyle(Theme.bone)
+            Text(detail)
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.dim)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            if confirming {
+                Text("restart engine? trading and monitoring stop until it is back")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.dim)
+                actionButton("cancel", destructive: false) { confirming = false }
+                actionButton("restart", destructive: true) {
+                    confirming = false
+                    model.restartEngine()
+                }
+            } else {
+                actionButton("restart engine…", destructive: false) { confirming = true }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.panel)
+    }
+
+    /// Names the missing capability rather than a version number: the engine's
+    /// crate version is not bumped per build, so it cannot identify a build.
+    private var detail: String {
+        let missing = model.missingEngineCapabilities.joined(separator: ", ")
+        let version = model.engineVersion.isEmpty ? "unknown build" : "v\(model.engineVersion)"
+        return "running engine (\(version)) lacks: \(missing) — intraday chart history cannot be served"
+    }
+
+    private func actionButton(
+        _ label: String, destructive: Bool, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(Theme.bone)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Theme.panelHi)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4)
+                        .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointingHandCursor(destructive: destructive)
+    }
+}
+
+/// A command that never reached the engine.
+///
+/// The client used to drop every command silently when the socket was down —
+/// including `set_kill_switch` and `flatten_all`. The button gave no feedback,
+/// so the operator could believe trading was halted when the engine never heard
+/// it. This states plainly that the action did not go out.
+private struct UndeliveredCommandBanner: View {
+    @Environment(AppModel.self) private var model
+    let note: UndeliveredCommand
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Theme.ember)
+                .frame(width: 5, height: 5)
+            Text("NOT SENT")
+                .font(.system(size: 9, weight: .semibold))
+                .tracking(1.1)
+                .foregroundStyle(Theme.bone)
+            Text("\(note.label) — \(note.reason)")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.dim)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Button {
+                model.clearUndeliveredCommand()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Theme.dim)
+                    .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("dismiss")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.panel)
+    }
+}
+
+/// Hinomaru red on hover for a destructive action, ember for everything else —
+/// the only place red is permitted.
+private extension View {
+    func pointingHandCursor(destructive: Bool) -> some View {
+        modifier(HoverTint(destructive: destructive))
+    }
+}
+
+private struct HoverTint: ViewModifier {
+    let destructive: Bool
+    @State private var hovering = false
+
+    func body(content: Content) -> some View {
+        content
+            .brightness(hovering ? 0.06 : 0)
+            .overlay {
+                if hovering {
+                    RoundedRectangle(cornerRadius: 4)
+                        .strokeBorder(
+                            destructive ? Theme.down : Theme.ember,
+                            lineWidth: Theme.hairline
+                        )
+                }
+            }
+            .onHover { hovering = $0 }
+            .animation(DeckMotion.ease(), value: hovering)
+    }
+}
+
 struct PanelCollapseButton: View {
     let panel: ShellPanel
     @AppStorage private var visible: Bool

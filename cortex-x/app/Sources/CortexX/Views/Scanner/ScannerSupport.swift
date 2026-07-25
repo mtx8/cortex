@@ -51,14 +51,28 @@ struct ScanFilter: Codable, Equatable, Identifiable {
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
     }
 
-    /// The columns the builder may pick — numeric readings only.
-    static let fields: [ScanColumn] = ScanColumn.allCases.filter {
-        ![.symbol, .regime, .flags].contains($0)
+    /// The columns the builder may pick. Derived from the column's OWN
+    /// capability instead of a hand-written exclusion list: the old list still
+    /// offered chg% / sector / mktcap / float$ / short%flt / news, none of which
+    /// `ScanSort.key` answers, so picking one made `matches` false for every row
+    /// and blanked the board behind a "no rows match this screen" message.
+    static let fields: [ScanColumn] = ScanColumn.allCases.filter(\.filterable)
+
+    /// The collapsed one-line rendering, in the column's own unit — "1m% >= 5.0%"
+    /// rather than the bare "1m% >= 5.0" that invited reading the threshold as a
+    /// raw fraction.
+    var summaryText: String {
+        "\(column.title) \(op.title) \(ScanFormat.raw(value, decimals: 1))\(column.filterUnit ?? "")"
     }
 
     func matches(_ row: ScanRow) -> Bool {
         guard value.isFinite,
-            let reading = ScanSort.key(row, column), reading.isFinite else { return false }
+            let raw = ScanSort.key(row, column), raw.isFinite else { return false }
+        // Compare in the unit the COLUMN DISPLAYS. The return / Δ52w columns
+        // store simple-return fractions but render percent, so a threshold typed
+        // as "5" against `ret_1m == 0.052` screened for +500% and matched nothing
+        // — the operator read that as "no setups", not "broken filter".
+        let reading = column.filterReading(raw)
         switch op {
         case .lte: return reading <= value
         case .gte: return reading >= value
@@ -67,8 +81,13 @@ struct ScanFilter: Codable, Equatable, Identifiable {
 
     /// AND-combination: a row survives only when every ENABLED filter matches.
     /// No enabled filters = identity (a disabled/draft row never culls rows).
+    ///
+    /// A filter on a NON-filterable column is inert too, not fatal: screens saved
+    /// (or JSON decoded) while the builder still offered the keyless fields would
+    /// otherwise reload as a filter that matches no row at all, blanking the
+    /// board. Stale state must not read as "nothing qualifies".
     static func apply(_ filters: [ScanFilter], to rows: [ScanRow]) -> [ScanRow] {
-        let active = filters.filter(\.enabled)
+        let active = filters.filter { $0.enabled && $0.column.filterable }
         guard !active.isEmpty else { return rows }
         return rows.filter { row in active.allSatisfy { $0.matches(row) } }
     }
