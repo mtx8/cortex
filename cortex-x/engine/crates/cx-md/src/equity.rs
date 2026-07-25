@@ -6,6 +6,13 @@
 //! feed advertises itself as Degraded (never Live) so downstream consumers
 //! and the operator can see exactly what they are trading on.
 //!
+//! Honest data also means honest CLOCKS and honest SIZES. Every tick this
+//! poller emits is stamped with the quote's own `last_trade_time`, not with
+//! wall-clock arrival, and carries the per-poll delta of the venue's cumulative
+//! session volume as its size. Both feed `agg`, which buckets bars and gates
+//! the daily session bar on `Tick::ts_ms`, and whose bars land in the same
+//! [`BarStore`] series as the Yahoo backfill above.
+//!
 //! LEVEL 2 depth for equities: there is NO real order book here. Equities
 //! carry only CBOE ~15-min-DELAYED top-of-book (L1) today. For the actively-
 //! viewed equity symbol this feed therefore publishes a MINIMAL, honest
@@ -33,6 +40,15 @@ use tokio::sync::watch;
 
 const POLL_SECS: u64 = 20;
 const FEED_NAME: &str = "cboe-equities";
+/// Nominal age of a CBOE delayed quote, used ONLY as the fallback stamp when
+/// `last_trade_time` cannot be parsed. Stamping a ~15-minute-old quote with the
+/// wall clock shifted every live equity bar 15 minutes late and broke the daily
+/// session bar at both ends: at 09:30 ET the quote in hand still reflects
+/// pre-open, yet `us_rth(now)` accepted it as today's official OPEN, and from
+/// 16:00–16:15 ET the quotes carrying the closing auction were rejected as
+/// extended hours, leaving the session CLOSE at the ~15:45 print. Both the bar
+/// bucketing and the equity D1 session gate in `agg` read `Tick::ts_ms`.
+const FEED_DELAY_MS: i64 = 15 * 60_000;
 /// Honest provenance label carried on every equity [`BookDepth`]: delayed L1
 /// with no real order-book depth.
 const EQUITY_DEPTH_SOURCE: &str = "cboe delayed L1 (no depth)";
@@ -83,9 +99,76 @@ pub(crate) fn parse_quote(raw: &str) -> Option<EquityQuote> {
     (q.price.is_finite() && q.price > 0.0).then_some(q)
 }
 
-/// Yahoo v8 chart JSON -> complete bars. Null slots (halts, partial rows)
-/// are skipped; a malformed payload yields an empty vec, never a panic.
-pub(crate) fn parse_yahoo_chart(symbol: &str, interval: Interval, raw: &str, max: usize) -> Vec<Bar> {
+/// CBOE stamps `last_trade_time` as a ZONELESS local US/Eastern instant
+/// ("2026-07-02T16:00:00"). Resolve it to epoch ms so bars are bucketed — and
+/// the equity D1 RTH gate judged — on the instant the trade actually printed
+/// rather than on when this poller happened to see it.
+///
+/// Returns `None` when the field is missing, unparseable, or lands implausibly
+/// far from `now`: a feed that is 15 minutes BEHIND us can never be ahead of
+/// us, and a stamp days off means the format changed under us. Callers fall
+/// back to `now - FEED_DELAY_MS` rather than trusting a guess — never to `now`.
+pub(crate) fn parse_trade_time_ms(raw: &str, now: i64) -> Option<i64> {
+    use chrono::{DateTime, NaiveDateTime};
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // An explicit offset (not what CBOE sends today, but cheap to honour if it
+    // ever appears) is authoritative and needs no zone guessing.
+    let ts = if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        dt.timestamp_millis()
+    } else {
+        const FORMATS: [&str; 4] = [
+            "%Y-%m-%dT%H:%M:%S%.f",
+            "%Y-%m-%d %H:%M:%S%.f",
+            "%Y-%m-%dT%H:%M",
+            "%Y-%m-%d %H:%M",
+        ];
+        let naive = FORMATS
+            .iter()
+            .find_map(|f| NaiveDateTime::parse_from_str(s, f).ok())?;
+        let naive_ms = naive.and_utc().timestamp_millis();
+        // Resolve US/Eastern by testing the EDT reading against the DST window;
+        // outside it the stamp is EST. The single ambiguous hour is the 02:00
+        // autumn fold, which is never a trading instant.
+        let edt = naive_ms + 4 * 3_600_000;
+        if crate::agg::is_us_eastern_dst(edt) {
+            edt
+        } else {
+            naive_ms + 5 * 3_600_000
+        }
+    };
+    (ts > now - 7 * 86_400_000 && ts <= now + 60_000).then_some(ts)
+}
+
+/// Per-poll traded volume from CBOE's CUMULATIVE session `volume` field.
+///
+/// The cumulative number was parsed and then used only for change detection, so
+/// every tick was published with `size: 0.0` and every live-formed equity bar
+/// carried volume exactly 0 — the chart's volume pane skips zero-volume bars, so
+/// the live tail read as "no trading" while the crosshair printed a
+/// measured-looking "v 0.00". The delta is floored at 0 so the session rollover
+/// (cumulative resets to near zero) cannot emit a negative size, and is 0 on the
+/// first poll of a symbol, which has no baseline to difference against. NaN
+/// inputs yield 0 (`f64::max` returns the non-NaN operand).
+fn traded_delta(prev_cumulative: Option<f64>, cumulative: f64) -> f64 {
+    match prev_cumulative {
+        Some(prev) => (cumulative - prev).max(0.0),
+        None => 0.0,
+    }
+}
+
+/// Yahoo v8 chart JSON -> bars. Null slots (halts, partial rows) are skipped;
+/// a malformed payload yields an empty vec, never a panic. `now` is the wall
+/// clock (injected for tests) and decides which trailing row is still forming.
+pub(crate) fn parse_yahoo_chart(
+    symbol: &str,
+    interval: Interval,
+    raw: &str,
+    max: usize,
+    now: i64,
+) -> Vec<Bar> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
         return Vec::new();
     };
@@ -117,6 +200,16 @@ pub(crate) fn parse_yahoo_chart(symbol: &str, interval: Interval, raw: &str, max
         return Vec::new();
     };
 
+    // Yahoo returns the still-forming bucket as its last row. Stamping it
+    // `complete: true` walked a partial session straight through the very gates
+    // that exist to exclude forming bars (`scanner::read_bars`,
+    // `regimes::classify`): days_in_state reset, vol_surge divided a half-day
+    // volume by 20 full-day averages, and "new 52w high" could flag off a
+    // mid-session print. The row is kept — the chart draws a forming bar
+    // distinctly, and the live aggregator folds it in as a bucket seed — but it
+    // is labelled honestly. Same grid as live aggregation by construction:
+    // `agg::bar_bucket` is the one definition of the bucket grid.
+    let forming_bucket = crate::agg::bar_bucket(symbol, interval, now);
     let mut bars: Vec<Bar> = Vec::new();
     for i in 0..ts.len() {
         let (Some(t), Some(o), Some(h), Some(l), Some(c)) = (
@@ -137,22 +230,26 @@ pub(crate) fn parse_yahoo_chart(symbol: &str, interval: Interval, raw: &str, max
         // would alias the 09:30 RTH bar into the 09:00 pre-market bucket —
         // destroying the pre-market bar in the store and mis-shading the
         // first regular hour as extended on every equity H1 chart.
+        let ts_open_ms = if interval == Interval::D1 {
+            cx_core::time::bucket_start(t * 1000, interval.ms())
+        } else {
+            t * 1000
+        };
         bars.push(Bar {
             symbol: symbol.to_string(),
             interval,
-            ts_open_ms: if interval == Interval::D1 {
-                cx_core::time::bucket_start(t * 1000, interval.ms())
-            } else {
-                t * 1000
-            },
+            ts_open_ms,
             open: o,
             high: h,
             low: l,
             close: c,
             volume: volume.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0),
+            // 0 marks this as a VENUE bar: `agg::is_venue_bar` reads it to tell
+            // a backfill row apart from an aggregator-built bar, so it must
+            // stay 0 here.
             trade_count: 0,
             vwap: c,
-            complete: true,
+            complete: ts_open_ms < forming_bucket,
         });
     }
     let start = bars.len().saturating_sub(max);
@@ -187,7 +284,8 @@ pub(crate) async fn run(
             let url = chart_url(symbol, range, gran, pre_post);
             match egress.get_text(&url).await {
                 Ok(raw) => {
-                    let bars = parse_yahoo_chart(symbol, interval, &raw, backfill_bars as usize);
+                    let bars =
+                        parse_yahoo_chart(symbol, interval, &raw, backfill_bars as usize, now_ms());
                     let n = bars.len();
                     for bar in bars {
                         store.push(bar);
@@ -212,24 +310,51 @@ pub(crate) async fn run(
     let mut last_seen: std::collections::HashMap<String, EquityQuote> =
         std::collections::HashMap::new();
     let mut consecutive_failures = 0u32;
+    // Whether the last published health for this feed was `Down`. Without it
+    // the status LATCHES: the loop announced Down after a failure streak and
+    // never announced anything again, so a recovered feed kept reading "down"
+    // in the chart header and the empty-chart panel indefinitely — telling the
+    // operator the wrong reason for missing data. (Observed live: "down" with a
+    // two-day-old timestamp while the endpoint served HTTP 200.)
+    let mut published_down = false;
     loop {
         for symbol in &symbols {
             match egress.get_text(&quote_url(symbol)).await {
                 Ok(raw) => {
                     consecutive_failures = 0;
+                    // Recovery is as newsworthy as the failure. Republish the
+                    // steady-state health so the UI stops blaming a dead feed.
+                    if published_down {
+                        published_down = false;
+                        bus.publish(EngineEvent::FeedStatus(FeedStatus {
+                            feed: FEED_NAME.into(),
+                            health: FeedHealth::Degraded,
+                            detail: "cboe delayed quotes (~15m), polled — recovered".into(),
+                            ts_ms: now_ms(),
+                        }));
+                    }
                     let Some(q) = parse_quote(&raw) else { continue };
                     let changed = last_seen.get(symbol) != Some(&q);
                     if !changed {
                         continue;
                     }
-                    last_seen.insert(symbol.clone(), q.clone());
                     let ts = now_ms();
-                    store.set_last_price(symbol, q.price);
+                    // Difference the CUMULATIVE session volume against the
+                    // previous poll BEFORE overwriting the baseline.
+                    let traded = traded_delta(last_seen.get(symbol).map(|p| p.volume), q.volume);
+                    // The quote's OWN trade time, never the wall clock: this
+                    // feed is ~15 minutes behind the tape and `Tick::ts_ms` is
+                    // what decides the bar bucket and whether the print counts
+                    // as regular-hours for the daily session bar.
+                    let trade_ts = parse_trade_time_ms(&q.last_trade_time, ts)
+                        .unwrap_or_else(|| ts.saturating_sub(FEED_DELAY_MS));
+                    last_seen.insert(symbol.clone(), q.clone());
+                    store.set_last_price_from(symbol, q.price, Venue::Cboe);
                     let tick = Tick {
                         symbol: symbol.clone(),
-                        ts_ms: ts,
+                        ts_ms: trade_ts,
                         price: q.price,
-                        size: 0.0,
+                        size: traded,
                         aggressor: None,
                         venue: Venue::Cboe,
                     };
@@ -255,6 +380,7 @@ pub(crate) async fn run(
                 Err(e) => {
                     consecutive_failures += 1;
                     if consecutive_failures == 3 {
+                        published_down = true;
                         bus.publish(EngineEvent::FeedStatus(FeedStatus {
                             feed: FEED_NAME.into(),
                             health: FeedHealth::Down,
@@ -417,6 +543,10 @@ mod tests {
         assert!(!d1.contains("includePrePost"));
     }
 
+    /// Wall clock well past every fixture row, so all of them are finished
+    /// buckets (the forming-row case has its own test below).
+    const AFTER_FIXTURES_MS: i64 = 1_800_000_000_000; // 2027-01-15
+
     #[test]
     fn yahoo_chart_parses_skips_nulls_and_caps() {
         let raw = r#"{"chart":{"result":[{"timestamp":[1751500800,1751587200,1751673600],
@@ -424,18 +554,18 @@ mod tests {
                 "open":[100.0,null,105.0],"high":[105.0,107.0,107.5],
                 "low":[99.0,103.0,104.0],"close":[104.0,106.0,106.5],
                 "volume":[1000,900,1100]}]}}]}}"#;
-        let bars = parse_yahoo_chart("AAPL", Interval::D1, raw, 10);
+        let bars = parse_yahoo_chart("AAPL", Interval::D1, raw, 10, AFTER_FIXTURES_MS);
         // Middle row has a null open -> skipped.
         assert_eq!(bars.len(), 2);
         assert!(bars[0].ts_open_ms < bars[1].ts_open_ms);
         assert_eq!(bars[1].close, 106.5);
         assert!(bars.iter().all(|b| b.complete && b.interval == Interval::D1));
         // Capping keeps the newest.
-        let capped = parse_yahoo_chart("AAPL", Interval::D1, raw, 1);
+        let capped = parse_yahoo_chart("AAPL", Interval::D1, raw, 1, AFTER_FIXTURES_MS);
         assert_eq!(capped.len(), 1);
         assert_eq!(capped[0].close, 106.5);
-        assert!(parse_yahoo_chart("AAPL", Interval::D1, "junk", 10).is_empty());
-        assert!(parse_yahoo_chart("AAPL", Interval::D1, "{}", 10).is_empty());
+        assert!(parse_yahoo_chart("AAPL", Interval::D1, "junk", 10, AFTER_FIXTURES_MS).is_empty());
+        assert!(parse_yahoo_chart("AAPL", Interval::D1, "{}", 10, AFTER_FIXTURES_MS).is_empty());
     }
 
     /// Intraday bars keep Yahoo's true opens; D1 floors to UTC midnight.
@@ -451,15 +581,110 @@ mod tests {
                 "low":[99.5,100.5],"close":[100.8,102.4],
                 "volume":[500,9000]}]}}]}}"#;
 
-        let h1 = parse_yahoo_chart("AAPL", Interval::H1, raw, 10);
+        let h1 = parse_yahoo_chart("AAPL", Interval::H1, raw, 10, AFTER_FIXTURES_MS);
         assert_eq!(h1.len(), 2, "pre-market and RTH bars must both survive");
         assert_eq!(h1[0].ts_open_ms, 1_751_461_200_000); // 09:00 ET, as sent
         assert_eq!(h1[1].ts_open_ms, 1_751_463_000_000); // 09:30 ET, not floored
-        let m5 = parse_yahoo_chart("AAPL", Interval::M5, raw, 10);
+        let m5 = parse_yahoo_chart("AAPL", Interval::M5, raw, 10, AFTER_FIXTURES_MS);
         assert_eq!(m5[0].ts_open_ms, 1_751_461_200_000);
 
-        let d1 = parse_yahoo_chart("AAPL", Interval::D1, raw, 10);
+        let d1 = parse_yahoo_chart("AAPL", Interval::D1, raw, 10, AFTER_FIXTURES_MS);
         // Both land in the same UTC day; the same-bucket tail replaces.
         assert!(d1.iter().all(|b| b.ts_open_ms == 1_751_414_400_000));
+
+        // Those true opens are exactly the grid live aggregation uses, so the
+        // two sources cannot interleave two hourly grids in one store series.
+        assert_eq!(
+            crate::agg::bar_bucket("AAPL", Interval::H1, 1_751_463_000_000 + 900_000),
+            1_751_463_000_000
+        );
+        assert_eq!(
+            crate::agg::bar_bucket("AAPL", Interval::H1, 1_751_461_200_000 + 600_000),
+            1_751_461_200_000
+        );
+    }
+
+    /// Yahoo hands back the in-progress bucket as its last row. It must not be
+    /// labelled `complete` — `scanner::read_bars` and `regimes::classify` gate
+    /// on that flag precisely to exclude forming bars, and a half session
+    /// walking through resets days_in_state and divides a partial-day volume by
+    /// 20 full-day averages.
+    #[test]
+    fn forming_bucket_row_is_not_marked_complete() {
+        // Rows at 2025-07-02 09:00 ET (13:00 UTC) and 09:30 ET (13:30 UTC).
+        let raw = r#"{"chart":{"result":[{"timestamp":[1751461200,1751463000],
+            "indicators":{"quote":[{
+                "open":[100.0,101.0],"high":[101.0,103.0],
+                "low":[99.5,100.5],"close":[100.8,102.4],
+                "volume":[500,9000]}]}}]}}"#;
+
+        // Wall clock inside the 09:30 RTH hourly: the earlier row is finished,
+        // the 09:30 one is still forming.
+        let now = 1_751_463_000_000 + 20 * 60_000; // 09:50 ET
+        let h1 = parse_yahoo_chart("AAPL", Interval::H1, raw, 10, now);
+        assert_eq!(h1.len(), 2);
+        assert!(h1[0].complete, "the 09:00 hourly has ended");
+        assert!(!h1[1].complete, "the 09:30 hourly is still forming");
+        // The partial row is KEPT (the chart draws it, and the live aggregator
+        // seeds its forming bucket from it) — only the label changes.
+        assert_eq!(h1[1].volume, 9000.0);
+
+        // Same rule for the daily series: today's session is not a finished bar.
+        let d1 = parse_yahoo_chart("AAPL", Interval::D1, raw, 10, now);
+        assert!(d1.iter().all(|b| !b.complete));
+        // A day later it is.
+        let d1_after = parse_yahoo_chart("AAPL", Interval::D1, raw, 10, now + 86_400_000);
+        assert!(d1_after.iter().all(|b| b.complete));
+    }
+
+    /// The venue's own trade time, not our wall clock, decides which bucket a
+    /// delayed quote lands in and whether it counts as a regular-hours print.
+    #[test]
+    fn trade_time_resolves_eastern_and_rejects_nonsense() {
+        // 2026-07-02 is EDT (UTC-4): 16:00 ET = 20:00 UTC.
+        let edt_now = 1_783_022_400_000; // 2026-07-02T20:00:00Z
+        assert_eq!(
+            parse_trade_time_ms("2026-07-02T16:00:00", edt_now),
+            Some(1_783_022_400_000)
+        );
+        // 2026-01-15 is EST (UTC-5): 16:00 ET = 21:00 UTC.
+        let est_now = 1_768_510_800_000; // 2026-01-15T21:00:00Z
+        assert_eq!(
+            parse_trade_time_ms("2026-01-15T16:00:00", est_now),
+            Some(1_768_510_800_000)
+        );
+        // Space separator and fractional seconds also parse.
+        assert_eq!(
+            parse_trade_time_ms("2026-07-02 16:00:00.000", edt_now),
+            Some(1_783_022_400_000)
+        );
+        // An explicit offset is honoured as sent.
+        assert_eq!(
+            parse_trade_time_ms("2026-07-02T20:00:00+00:00", edt_now),
+            Some(1_783_022_400_000)
+        );
+        // Empty / malformed / implausible -> None, so the caller falls back to
+        // `now - FEED_DELAY_MS` instead of trusting a guess.
+        assert!(parse_trade_time_ms("", edt_now).is_none());
+        assert!(parse_trade_time_ms("not a time", edt_now).is_none());
+        assert!(
+            parse_trade_time_ms("2027-07-02T16:00:00", edt_now).is_none(),
+            "a feed 15 minutes behind us can never be ahead of us"
+        );
+        assert!(parse_trade_time_ms("2019-07-02T16:00:00", edt_now).is_none());
+    }
+
+    /// Live equity bars used to carry volume 0 because the cumulative session
+    /// volume was parsed and dropped: the chart's volume pane skips zero-volume
+    /// bars, so the live tail read as "no trading".
+    #[test]
+    fn traded_volume_is_the_cumulative_delta_never_negative() {
+        assert_eq!(traded_delta(None, 75_400_626.0), 0.0, "no baseline yet");
+        assert_eq!(traded_delta(Some(75_400_626.0), 75_412_000.0), 11_374.0);
+        // Session rollover: cumulative resets, and a negative size is not a
+        // thing. Same for a NaN on either side of the difference.
+        assert_eq!(traded_delta(Some(75_412_000.0), 1_200.0), 0.0);
+        assert_eq!(traded_delta(Some(f64::NAN), 1_200.0), 0.0);
+        assert_eq!(traded_delta(Some(1_000.0), f64::NAN), 0.0);
     }
 }

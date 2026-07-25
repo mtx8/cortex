@@ -30,7 +30,15 @@ fn chain_url(underlying: &str) -> String {
 /// OCC symbol: ROOT + YYMMDD + C|P + strike*1000 zero-padded to 8.
 /// Parsed from the END so variable-length roots never matter.
 pub(crate) fn parse_occ(occ: &str) -> Option<(String, OptionRight, f64)> {
-    if occ.len() < 16 {
+    // ASCII gate before ANY byte-offset slicing. `occ` is third-party text from
+    // the venue's JSON, and the checks below index by byte; a multi-byte
+    // character landing on one of those offsets makes `split_at` panic on a
+    // non-char-boundary. The release profile sets `panic = "abort"`
+    // (engine/Cargo.toml), so that panic would not merely kill the options task —
+    // it would take down the whole engine process, mid-session. OCC symbology is
+    // ASCII by definition (root, 6 date digits, C|P, 8 strike digits), so
+    // anything else is malformed input to be refused, not parsed.
+    if !occ.is_ascii() || occ.len() < 16 {
         return None;
     }
     let (head, strike_s) = occ.split_at(occ.len() - 8);
@@ -220,6 +228,26 @@ mod tests {
         assert_eq!(strike, 420.5);
         assert!(parse_occ("junk").is_none());
         assert!(parse_occ("SPY260706X00500000").is_none());
+    }
+
+    /// `parse_occ` slices by BYTE offset, so a multi-byte character sitting on
+    /// one of those offsets used to panic on a non-char-boundary — and with
+    /// `panic = "abort"` in the release profile that aborts the entire engine
+    /// process, not just the options refresh. Venue JSON is third-party text, so
+    /// malformed input must be refused rather than trusted.
+    #[test]
+    fn non_ascii_occ_is_refused_instead_of_panicking() {
+        // 'é' is two bytes: these are long enough to pass the length check and
+        // land a multi-byte boundary on the strike / right / date split points.
+        for occ in [
+            "SPYé60706C00500000",
+            "SPY260706C0050é000",
+            "SPY26070éC00500000",
+            "é",
+            "ééééééééééééééééé",
+        ] {
+            assert!(parse_occ(occ).is_none(), "must refuse {occ:?}, not panic");
+        }
     }
 
     #[test]

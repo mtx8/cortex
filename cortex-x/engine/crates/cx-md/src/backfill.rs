@@ -9,7 +9,7 @@ use std::time::Duration;
 use cx_core::egress::Egress;
 use cx_core::events::Bar;
 use cx_core::store::BarStore;
-use cx_core::time::bucket_start;
+use cx_core::time::{bucket_start, now_ms};
 use cx_core::types::Interval;
 
 /// Coinbase candle granularities (seconds) and the intervals they seed.
@@ -32,7 +32,7 @@ pub(crate) async fn run(egress: &Egress, store: &BarStore, symbols: &[String], m
             );
             match egress.get_text(&url).await {
                 Ok(body) => {
-                    let bars = parse_candles(symbol, interval, &body, max_bars as usize);
+                    let bars = parse_candles(symbol, interval, &body, max_bars as usize, now_ms());
                     let n = bars.len();
                     for bar in bars {
                         store.push(bar);
@@ -91,7 +91,7 @@ async fn deep_d1(egress: &Egress, store: &BarStore, symbol: &str) {
         );
         match egress.get_text(&url).await {
             Ok(body) => {
-                let bars = parse_candles(symbol, Interval::D1, &body, 320);
+                let bars = parse_candles(symbol, Interval::D1, &body, 320, now_ms());
                 if bars.is_empty() {
                     return; // history exhausted — listing date reached
                 }
@@ -114,8 +114,23 @@ async fn deep_d1(egress: &Egress, store: &BarStore, symbol: &str) {
 
 /// Parse a Coinbase candles body: JSON rows of
 /// `[ts_sec, low, high, open, close, volume]`, newest-first. Returns at most
-/// `max` bars, ascending by open time, all marked complete.
-pub(crate) fn parse_candles(symbol: &str, interval: Interval, body: &str, max: usize) -> Vec<Bar> {
+/// `max` bars, ascending by open time.
+///
+/// `now` decides which trailing row is still FORMING. Every row used to be
+/// stamped `complete: true`, including the newest — which is by definition the
+/// in-progress bucket, since Coinbase returns candles newest-first up to the
+/// current moment. Downstream consumers gate on `complete` (scanner
+/// completeness, regime classification, indicator warmup), so a partial candle
+/// asserting completeness fed a half-formed close into those decisions. Crypto
+/// trades 24/7 on the plain UTC grid, so `bucket_start` is the right bucket here
+/// (unlike equities, whose RTH hourlies are :30-anchored — see `agg::bar_bucket`).
+pub(crate) fn parse_candles(
+    symbol: &str,
+    interval: Interval,
+    body: &str,
+    max: usize,
+    now: i64,
+) -> Vec<Bar> {
     let rows: Vec<[f64; 6]> = match serde_json::from_str(body) {
         Ok(rows) => rows,
         Err(e) => {
@@ -123,16 +138,22 @@ pub(crate) fn parse_candles(symbol: &str, interval: Interval, body: &str, max: u
             return Vec::new();
         }
     };
+    let forming_bucket = bucket_start(now, interval.ms());
     let mut bars: Vec<Bar> = rows
         .into_iter()
         .take(max)
-        .filter_map(|row| candle_to_bar(symbol, interval, row))
+        .filter_map(|row| candle_to_bar(symbol, interval, row, forming_bucket))
         .collect();
     bars.reverse();
     bars
 }
 
-fn candle_to_bar(symbol: &str, interval: Interval, row: [f64; 6]) -> Option<Bar> {
+fn candle_to_bar(
+    symbol: &str,
+    interval: Interval,
+    row: [f64; 6],
+    forming_bucket: i64,
+) -> Option<Bar> {
     let [ts_sec, low, high, open, close, volume] = row;
     if !(ts_sec.is_finite() && ts_sec > 0.0) {
         return None;
@@ -147,10 +168,11 @@ fn candle_to_bar(symbol: &str, interval: Interval, row: [f64; 6]) -> Option<Bar>
     } else {
         0.0
     };
+    let ts_open_ms = bucket_start(ts_sec as i64 * 1_000, interval.ms());
     Some(Bar {
         symbol: symbol.to_string(),
         interval,
-        ts_open_ms: bucket_start(ts_sec as i64 * 1_000, interval.ms()),
+        ts_open_ms,
         open,
         high,
         low,
@@ -158,7 +180,9 @@ fn candle_to_bar(symbol: &str, interval: Interval, row: [f64; 6]) -> Option<Bar>
         volume,
         trade_count: 0,
         vwap: close,
-        complete: true,
+        // The newest bucket is still accumulating trades. Kept (the chart renders
+        // a forming bar distinctly) but labelled honestly.
+        complete: ts_open_ms < forming_bucket,
     })
 }
 
@@ -175,7 +199,7 @@ mod tests {
 
     #[test]
     fn fixture_parses_ascending_complete_bars() {
-        let bars = parse_candles("BTC-USD", Interval::M1, FIXTURE, 300);
+        let bars = parse_candles("BTC-USD", Interval::M1, FIXTURE, 300, i64::MAX / 2);
         assert_eq!(bars.len(), 3);
         let ts: Vec<i64> = bars.iter().map(|b| b.ts_open_ms).collect();
         assert_eq!(ts, vec![1_751_716_680_000, 1_751_716_740_000, 1_751_716_800_000]);
@@ -199,7 +223,7 @@ mod tests {
 
     #[test]
     fn max_caps_to_newest_rows() {
-        let bars = parse_candles("BTC-USD", Interval::M1, FIXTURE, 2);
+        let bars = parse_candles("BTC-USD", Interval::M1, FIXTURE, 2, i64::MAX / 2);
         assert_eq!(bars.len(), 2);
         // Newest two rows survive, still ascending.
         assert_eq!(bars[0].ts_open_ms, 1_751_716_740_000);
@@ -208,14 +232,14 @@ mod tests {
 
     #[test]
     fn bad_rows_and_bodies_degrade_to_empty_or_skipped() {
-        assert!(parse_candles("BTC-USD", Interval::M1, "surprise!", 10).is_empty());
-        assert!(parse_candles("BTC-USD", Interval::M1, r#"{"error":"rate limit"}"#, 10).is_empty());
+        assert!(parse_candles("BTC-USD", Interval::M1, "surprise!", 10, i64::MAX / 2).is_empty());
+        assert!(parse_candles("BTC-USD", Interval::M1, r#"{"error":"rate limit"}"#, 10, i64::MAX / 2).is_empty());
         // A row with a non-positive price is dropped; the good row survives.
         let mixed = r#"[
             [1751716800, -1.0, 108250.0, 108000.0, 108100.25, 42.5],
             [1751716740, 107800.0, 108050.0, 107950.5, 108000.0, 17.25]
         ]"#;
-        let bars = parse_candles("BTC-USD", Interval::M1, mixed, 10);
+        let bars = parse_candles("BTC-USD", Interval::M1, mixed, 10, i64::MAX / 2);
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].ts_open_ms, 1_751_716_740_000);
     }
