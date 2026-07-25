@@ -55,6 +55,11 @@ pub struct SnapshotSrc {
     /// snapshots so any of them can chart + be searched client-side.
     universe: Vec<String>,
     store: Arc<BarStore>,
+    /// The paper simulator. NO LONGER the snapshot's portfolio source — in IBKR
+    /// mode it is bypassed and stays phantom-flat on simulator cash, so reading
+    /// it shipped a fabricated book (see `snapshot`). Kept so `new`'s signature
+    /// (and main.rs's wiring) stays stable for the paper-only call sites.
+    #[allow(dead_code)]
     oms: Arc<Oms>,
     risk: Arc<RiskEngine>,
     dial: Arc<AutonomyDial>,
@@ -308,8 +313,17 @@ impl SnapshotSource for SnapshotSrc {
         serde_json::json!({
             "symbols": self.symbols,
             "bars": bars,
-            "positions": self.oms.positions(),
-            "account": self.oms.account(),
+            // Portfolio truth comes from the ACTIVE broker, never the paper OMS.
+            // In IBKR mode the OMS is bypassed entirely (IBKR fills never reach
+            // it), so it stays phantom-flat with its $100k simulator cash —
+            // and the app rebuilds positions WHOLESALE from this snapshot, so
+            // shipping the paper book made the deck read "flat" with fabricated
+            // equity while real shares sat at the broker (IBKR only re-emits
+            // positions ON CHANGE, so that could persist all session). In paper
+            // mode the active broker IS the PaperBroker, which delegates
+            // straight through to this same OMS — byte-for-byte unchanged.
+            "positions": self.broker.positions(),
+            "account": self.broker.account(),
             "risk": self.risk.status(self.dial.get()),
             "thoughts": thoughts,
             "orders": orders,
@@ -535,5 +549,186 @@ mod tests {
     fn depth_absent_serializes_as_null() {
         let v = serde_json::to_value(depth_snapshot_map(None)).unwrap();
         assert!(v.is_null());
+    }
+
+    // -----------------------------------------------------------------------
+    // Portfolio source: the ACTIVE BROKER, never the paper OMS.
+    // -----------------------------------------------------------------------
+
+    use cx_core::events::{
+        AccountSnapshot, BrokerMode, BrokerStatus, OrderIntent, OrderSource, Position,
+    };
+    use cx_core::time::now_ms;
+    use cx_core::types::{AutonomyLevel, OrderType, Side, Tif};
+    use cx_core::{Config, KillSwitch};
+    use cx_broker::{BrokerError, BrokerOrderId, PaperBroker};
+
+    /// A broker that reports a FIXED book, standing in for the IBKR adapter
+    /// whose positions/account come from the venue's own callbacks and never
+    /// touch the paper OMS.
+    struct VenueBroker {
+        positions: Vec<Position>,
+        account: AccountSnapshot,
+    }
+
+    #[async_trait::async_trait]
+    impl Broker for VenueBroker {
+        fn name(&self) -> &'static str {
+            "venue"
+        }
+        async fn connect(&self) -> Result<(), BrokerError> {
+            Ok(())
+        }
+        async fn disconnect(&self) {}
+        async fn place(&self, intent: OrderIntent) -> Result<BrokerOrderId, BrokerError> {
+            Ok(BrokerOrderId::paper(intent.id))
+        }
+        async fn cancel(&self, _order_id: u64) -> bool {
+            true
+        }
+        async fn cancel_all(&self, _reason: &str) {}
+        async fn flatten_all(&self, _reason: &str) -> Vec<u64> {
+            Vec::new()
+        }
+        fn positions(&self) -> Vec<Position> {
+            self.positions.clone()
+        }
+        fn account(&self) -> AccountSnapshot {
+            self.account.clone()
+        }
+        fn status(&self) -> BrokerStatus {
+            BrokerStatus {
+                mode: BrokerMode::IbkrLive,
+                connected: true,
+                account_masked: Some("U*****21".into()),
+            }
+        }
+    }
+
+    fn venue_position(symbol: &str, qty: f64, px: f64) -> Position {
+        Position {
+            symbol: symbol.into(),
+            qty,
+            avg_px: px,
+            mark_px: px,
+            unrealized_pnl: 0.0,
+            realized_pnl: 0.0,
+            ts_ms: now_ms(),
+        }
+    }
+
+    fn venue_account(equity: f64, cash: f64) -> AccountSnapshot {
+        AccountSnapshot {
+            equity,
+            cash,
+            gross_exposure: equity - cash,
+            net_exposure: equity - cash,
+            unrealized_pnl: 0.0,
+            realized_pnl_day: 0.0,
+            fees_paid: 0.0,
+            open_orders: 0,
+            daily_trades: 0,
+            drawdown_day: 0.0,
+            drawdown_total: 0.0,
+            ts_ms: now_ms(),
+        }
+    }
+
+    /// Build a snapshot source over a real (paper) OMS plus whatever broker the
+    /// caller wants as the ACTIVE sink.
+    fn src_with(oms: Arc<Oms>, broker: Arc<dyn Broker>) -> Arc<SnapshotSrc> {
+        let cfg = Config::default();
+        let kill = Arc::new(KillSwitch::new());
+        let risk = Arc::new(RiskEngine::new(cfg.risk.clone(), kill));
+        SnapshotSrc::new(
+            vec!["AAPL".to_string()],
+            Vec::new(),
+            Arc::new(BarStore::new()),
+            oms,
+            risk,
+            Arc::new(AutonomyDial::new(AutonomyLevel::Manual)),
+            broker,
+        )
+    }
+
+    fn paper_oms(bus: &Arc<Bus>) -> Arc<Oms> {
+        Oms::new(
+            Arc::clone(bus),
+            Arc::new(BarStore::new()),
+            Config::default().paper,
+        )
+    }
+
+    /// In IBKR mode the OMS is bypassed (venue fills never reach it), so it sits
+    /// phantom-flat on its simulator cash. The app rebuilds positions WHOLESALE
+    /// from this snapshot, so shipping the OMS book made the deck read "flat"
+    /// with fabricated equity while real shares sat at the broker. The snapshot
+    /// must report the ACTIVE BROKER's book instead.
+    #[test]
+    fn snapshot_portfolio_comes_from_the_active_broker_not_the_paper_oms() {
+        let bus = Bus::new(64);
+        let oms = paper_oms(&bus);
+        // The paper OMS: flat, $100,000 of simulator cash — exactly the wrong
+        // thing to ship while trading a real IBKR account.
+        assert!(oms.positions().is_empty());
+        assert!((oms.account().equity - 100_000.0).abs() < 1e-6);
+
+        let broker: Arc<dyn Broker> = Arc::new(VenueBroker {
+            positions: vec![venue_position("AAPL", 500.0, 190.0)],
+            account: venue_account(250_000.0, 155_000.0),
+        });
+        let src = src_with(Arc::clone(&oms), broker);
+        let snap = src.snapshot(10);
+
+        let positions = snap["positions"].as_array().expect("positions array");
+        assert_eq!(positions.len(), 1, "the venue's real position must be shipped");
+        assert_eq!(positions[0]["symbol"], "AAPL");
+        assert_eq!(positions[0]["qty"], 500.0);
+        // Not the simulator's $100k.
+        assert_eq!(snap["account"]["equity"], 250_000.0);
+        assert_eq!(snap["account"]["cash"], 155_000.0);
+        // The broker posture keeps coming from the same broker (unchanged).
+        assert_eq!(snap["broker"]["mode"], "ibkr_live");
+    }
+
+    /// Paper mode must be byte-for-byte unchanged: the active broker there IS
+    /// the PaperBroker, which delegates straight back to this same OMS.
+    #[tokio::test]
+    async fn paper_mode_snapshot_still_mirrors_the_oms_exactly() {
+        let bus = Bus::new(256);
+        let store = Arc::new(BarStore::new());
+        let oms = Oms::new(Arc::clone(&bus), Arc::clone(&store), Config::default().paper);
+        store.set_last_price("AAPL", 100.0);
+        oms.submit(OrderIntent {
+            id: 0,
+            symbol: "AAPL".into(),
+            side: Side::Buy,
+            qty: 3.0,
+            order_type: OrderType::Market,
+            limit_px: None,
+            stop_px: None,
+            tif: Tif::Ioc,
+            reduce_only: false,
+            source: OrderSource::Manual,
+            rationale: "test".into(),
+            ts_ms: now_ms(),
+        })
+        .await;
+
+        let broker: Arc<dyn Broker> = PaperBroker::new(Arc::clone(&oms));
+        let src = src_with(Arc::clone(&oms), broker);
+        let snap = src.snapshot(10);
+
+        assert_eq!(
+            snap["positions"],
+            serde_json::to_value(oms.positions()).unwrap(),
+            "paper positions must be identical to the OMS book"
+        );
+        // Equity/cash identical (ts_ms is sampled per call, so compare fields).
+        let a = oms.account();
+        assert_eq!(snap["account"]["equity"], a.equity);
+        assert_eq!(snap["account"]["cash"], a.cash);
+        assert_eq!(snap["account"]["gross_exposure"], a.gross_exposure);
+        assert_eq!(snap["broker"]["mode"], "paper");
     }
 }

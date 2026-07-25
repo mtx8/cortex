@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use cx_core::autonomy::AutonomyDial;
 use cx_core::events::{
-    AgentThought, Bar, EngineEvent, OrderIntent, OrderSource, OrderStatus, OrderUpdate,
+    AgentThought, Bar, BrokerMode, EngineEvent, OrderIntent, OrderSource, OrderStatus, OrderUpdate,
     StrategySignal,
 };
 use cx_core::store::BarStore;
@@ -48,8 +48,10 @@ pub struct TradePipeline {
     bus: Arc<Bus>,
     store: Arc<BarStore>,
     /// The paper OMS: the source of truth for the portfolio VIEW handed to
-    /// risk, the marker, and the snapshot — in every mode. Orders are SUNK
-    /// through `broker`, which in paper mode delegates straight back here.
+    /// risk and for the marker — in every mode. Orders are SUNK through
+    /// `broker`, which in paper mode delegates straight back here. (The
+    /// connect snapshot reads the ACTIVE BROKER's book instead, since this one
+    /// stays phantom-flat in IBKR mode — see snapshot.rs.)
     oms: Arc<Oms>,
     /// The active order sink (paper or IBKR), downstream of risk approval.
     broker: Arc<dyn Broker>,
@@ -473,6 +475,41 @@ impl TradePipeline {
         } else {
             None
         };
+        // REAL MONEY MAY NOT BE ROUTED OFF A FABRICATED PRICE.
+        //
+        // When a market-data websocket fails, the synthetic GBM fallback keeps
+        // publishing marks into this same store so the rest of the system stays
+        // alive. Nothing in the order path used to distinguish those from real
+        // prints (cx-oms, cx-risk, cx-strategy and this file contained zero
+        // references to feed health or tick venue), so at full autonomy with the
+        // IBKR sink selected, invented prices could size and send live orders.
+        //
+        // Gated on LIVE mode only, deliberately: with the paper sink the
+        // simulator running on synthetic prices is the intended offline
+        // behaviour, and halting it would break development and demos. Rejection
+        // is published like any other, so it is visible rather than a silent drop.
+        if !matches!(self.broker.status().mode, BrokerMode::Paper)
+            && self.store.mark_is_synthetic(&intent.symbol)
+        {
+            let reason = format!(
+                "{} mark is synthetic (market data feed is in fallback) — \
+                 refusing to route a live order off a fabricated price",
+                intent.symbol
+            );
+            self.bus.publish(EngineEvent::OrderUpdate(OrderUpdate {
+                order_id: intent.id,
+                intent: intent.clone(),
+                status: OrderStatus::RejectedByRisk {
+                    reason: reason.clone(),
+                },
+                filled_qty: 0.0,
+                avg_fill_px: 0.0,
+                ts_ms: now_ms(),
+            }));
+            self.thought(Severity::Critical, Some(&intent.symbol), &reason);
+            return RiskDecision::Rejected { reason };
+        }
+
         let decision = self.risk.evaluate(&intent, &view, last_px, stop_distance);
         match &decision {
             RiskDecision::Approved { qty, notes } => {
@@ -525,10 +562,7 @@ impl TradePipeline {
                 limit_px,
                 stop_px,
             } => {
-                let Some(last_px) = self.store.last_price(&symbol) else {
-                    self.thought(Severity::Warning, Some(&symbol), "manual order: no market data");
-                    return;
-                };
+                let last_px = self.store.last_price(&symbol);
                 let current = self.oms.view().position_qty(&symbol);
                 let reduces = qty <= current.abs() + 1e-12
                     && current.abs() > 1e-12
@@ -537,6 +571,8 @@ impl TradePipeline {
                 // a protective reduce-only stop takes risk's permissive exit
                 // path, a new-risk stop faces the full sizing checks. Order-type
                 // validity (a stop needs a stop price) is enforced at the OMS.
+                // The intent is built BEFORE the market-data check so a rejection
+                // still has a real order id + intent to publish.
                 let intent = OrderIntent {
                     id: cx_core::ids::next_order_id(),
                     symbol,
@@ -550,6 +586,40 @@ impl TradePipeline {
                     source: OrderSource::Manual,
                     rationale: "operator order".into(),
                     ts_ms: now_ms(),
+                };
+                // No mark for the symbol (post-restart reconcile before the
+                // first tick, or a dropped feed): the risk gate cannot size or
+                // bound the trade, so the order is NOT sent — but the operator's
+                // click must never vanish. Publish the rejection as an
+                // OrderUpdate so a row with the reason lands in the ORDERS tab,
+                // exactly like the RejectedByRisk branch in
+                // `submit_through_risk`. Before this, `handle_command` returned
+                // after only an AgentThought: FLATTEN / row-Close looked
+                // accepted while the position stayed open. This is a HARD stop,
+                // never a bypass — no order reaches the broker unpriced.
+                let Some(last_px) = last_px else {
+                    let reason =
+                        format!("no market data for {}: order not sent", intent.symbol);
+                    self.bus.publish(EngineEvent::OrderUpdate(OrderUpdate {
+                        order_id: intent.id,
+                        // RejectedByRisk (not Canceled) because that is the only
+                        // terminal state the deck renders the REASON for — a
+                        // "canceled" chip alone would still leave the operator
+                        // guessing why nothing happened.
+                        status: OrderStatus::RejectedByRisk {
+                            reason: reason.clone(),
+                        },
+                        intent: intent.clone(),
+                        filled_qty: 0.0,
+                        avg_fill_px: 0.0,
+                        ts_ms: now_ms(),
+                    }));
+                    self.thought(
+                        Severity::Warning,
+                        Some(&intent.symbol),
+                        &format!("manual order rejected: {reason}"),
+                    );
+                    return;
                 };
                 self.submit_through_risk(intent, last_px).await;
             }
@@ -657,14 +727,35 @@ mod tests {
     struct RecordingBroker {
         flatten_calls: std::sync::Mutex<Vec<String>>,
         cancel_all_calls: std::sync::Mutex<Vec<String>>,
+        /// Posture this stub reports. Defaults to Paper (what every existing test
+        /// assumes); `new_live` reports a REAL-MONEY posture so the
+        /// synthetic-price gate can be exercised on the side it actually guards.
+        mode: cx_core::events::BrokerMode,
+        /// Intents that actually reached the sink. A gate that is supposed to stop
+        /// an order is only proven by this staying empty.
+        placed: std::sync::Mutex<Vec<OrderIntent>>,
     }
 
     impl RecordingBroker {
         fn new() -> Arc<Self> {
+            Self::with_mode(cx_core::events::BrokerMode::Paper)
+        }
+
+        fn new_live() -> Arc<Self> {
+            Self::with_mode(cx_core::events::BrokerMode::IbkrLive)
+        }
+
+        fn with_mode(mode: cx_core::events::BrokerMode) -> Arc<Self> {
             Arc::new(Self {
                 flatten_calls: std::sync::Mutex::new(Vec::new()),
                 cancel_all_calls: std::sync::Mutex::new(Vec::new()),
+                mode,
+                placed: std::sync::Mutex::new(Vec::new()),
             })
+        }
+
+        fn placed_count(&self) -> usize {
+            self.placed.lock().unwrap().len()
         }
     }
 
@@ -681,7 +772,9 @@ mod tests {
             &self,
             intent: OrderIntent,
         ) -> Result<cx_broker::BrokerOrderId, cx_broker::BrokerError> {
-            Ok(cx_broker::BrokerOrderId::paper(intent.id))
+            let id = intent.id;
+            self.placed.lock().unwrap().push(intent);
+            Ok(cx_broker::BrokerOrderId::paper(id))
         }
         async fn cancel(&self, _order_id: u64) -> bool {
             true
@@ -701,7 +794,7 @@ mod tests {
         }
         fn status(&self) -> cx_core::events::BrokerStatus {
             cx_core::events::BrokerStatus {
-                mode: cx_core::events::BrokerMode::Paper,
+                mode: self.mode,
                 connected: true,
                 account_masked: None,
             }
@@ -819,6 +912,172 @@ mod tests {
             .await;
         // Exactly one flatten (from the engage), none from the disengage.
         assert_eq!(rec.flatten_calls.lock().unwrap().len(), 1);
+    }
+
+    /// A LIVE order must never be routed off a price the synthetic fallback
+    /// invented. When a market-data websocket dies, the GBM fallback keeps
+    /// writing marks into the same store as real quotes; before this gate,
+    /// nothing between the strategy and the broker could tell the difference, so
+    /// at full autonomy with the IBKR sink selected a fabricated price could size
+    /// and send real money.
+    #[tokio::test]
+    async fn live_orders_are_refused_on_a_synthetic_mark() {
+        let rec = RecordingBroker::new_live();
+        let (bus, store, _oms, _kill, pipeline) =
+            setup_with_broker(test_cfg(), Arc::clone(&rec) as Arc<dyn Broker>);
+        // Exactly the state the fallback leaves behind: a plausible, finite,
+        // positive price whose ONLY defect is that nobody traded at it.
+        store.set_last_price_from("BTC-USD", 100.0, cx_core::types::Venue::Synthetic);
+        assert!(store.mark_is_synthetic("BTC-USD"));
+
+        let mut rx = bus.subscribe();
+        pipeline
+            .handle_command(Command::PlaceOrder {
+                symbol: "BTC-USD".into(),
+                side: Side::Buy,
+                qty: 1.0,
+                order_type: OrderType::Market,
+                limit_px: None,
+                stop_px: None,
+            })
+            .await;
+
+        assert_eq!(rec.placed_count(), 0, "nothing may reach a live sink");
+        let ups = order_updates(&mut rx);
+        assert_eq!(ups.len(), 1, "the refusal is visible, not a silent drop");
+        match &ups[0].status {
+            OrderStatus::RejectedByRisk { reason } => {
+                assert!(reason.contains("synthetic"), "names the cause: {reason}");
+                assert!(reason.contains("BTC-USD"), "names the symbol: {reason}");
+            }
+            other => panic!("expected a visible rejection, got {other:?}"),
+        }
+    }
+
+    /// The gate is scoped to real money on purpose. The paper simulator running
+    /// on synthetic prices IS the intended offline behaviour — halting it would
+    /// break development and demos for no safety gain.
+    #[tokio::test]
+    async fn paper_orders_still_fill_on_a_synthetic_mark() {
+        let rec = RecordingBroker::new(); // paper posture
+        let (_bus, store, _oms, _kill, pipeline) =
+            setup_with_broker(test_cfg(), Arc::clone(&rec) as Arc<dyn Broker>);
+        store.set_last_price_from("BTC-USD", 100.0, cx_core::types::Venue::Synthetic);
+
+        pipeline
+            .handle_command(Command::PlaceOrder {
+                symbol: "BTC-USD".into(),
+                side: Side::Buy,
+                qty: 1.0,
+                order_type: OrderType::Market,
+                limit_px: None,
+                stop_px: None,
+            })
+            .await;
+
+        assert_eq!(rec.placed_count(), 1, "the simulator keeps working offline");
+    }
+
+    /// A real print clears the synthetic label, so feed recovery re-enables live
+    /// routing without any operator action.
+    #[tokio::test]
+    async fn a_real_print_restores_live_routing() {
+        let rec = RecordingBroker::new_live();
+        let (_bus, store, _oms, _kill, pipeline) =
+            setup_with_broker(test_cfg(), Arc::clone(&rec) as Arc<dyn Broker>);
+        store.set_last_price_from("BTC-USD", 100.0, cx_core::types::Venue::Synthetic);
+        store.set_last_price_from("BTC-USD", 99.0, cx_core::types::Venue::Coinbase);
+        assert!(!store.mark_is_synthetic("BTC-USD"));
+
+        pipeline
+            .handle_command(Command::PlaceOrder {
+                symbol: "BTC-USD".into(),
+                side: Side::Buy,
+                qty: 1.0,
+                order_type: OrderType::Market,
+                limit_px: None,
+                stop_px: None,
+            })
+            .await;
+
+        assert_eq!(rec.placed_count(), 1, "recovery needs no operator action");
+    }
+
+    #[tokio::test]
+    async fn manual_order_without_a_mark_is_visibly_rejected_not_silently_dropped() {
+        // A restart that reconciles positions from the broker BEFORE the first
+        // tick (or a dropped feed) leaves the store with no last price. The
+        // operator's FLATTEN / positions-row Close must NOT evaporate: the app
+        // is fire-and-forget with no ack, so a bare AgentThought left the button
+        // looking accepted while the position stayed open.
+        let rec = RecordingBroker::new();
+        let (bus, store, oms, _kill, pipeline) =
+            setup_with_broker(test_cfg(), Arc::clone(&rec) as Arc<dyn Broker>);
+        assert!(store.last_price("AAPL").is_none(), "fixture has no mark");
+
+        let mut rx = bus.subscribe();
+        pipeline
+            .handle_command(Command::PlaceOrder {
+                symbol: "AAPL".into(),
+                side: Side::Sell,
+                qty: 500.0,
+                order_type: OrderType::Market,
+                limit_px: None,
+                stop_px: None,
+            })
+            .await;
+
+        let ups = order_updates(&mut rx);
+        assert_eq!(ups.len(), 1, "the click must leave exactly one visible row");
+        match &ups[0].status {
+            OrderStatus::RejectedByRisk { reason } => {
+                // The deck only renders a REASON for a rejection, so this is the
+                // state that actually tells the operator why nothing happened.
+                assert!(reason.contains("AAPL"), "names the symbol: {reason}");
+                assert!(reason.contains("no market data"), "states why: {reason}");
+                assert!(reason.contains("not sent"), "states the outcome: {reason}");
+            }
+            other => panic!("expected a visible rejection, got {other:?}"),
+        }
+        assert!(ups[0].order_id > 0, "carries a real order id for the row");
+        assert_eq!(ups[0].order_id, ups[0].intent.id);
+        assert_eq!(ups[0].intent.symbol, "AAPL");
+        assert_eq!(ups[0].intent.side, Side::Sell);
+        assert_eq!(ups[0].intent.source, OrderSource::Manual);
+        assert!((ups[0].intent.qty - 500.0).abs() < 1e-9);
+
+        // And NOT a bypass: an unpriceable order never reaches the broker/OMS.
+        assert!(oms.view().position_qty("AAPL").abs() < 1e-12);
+        assert_eq!(oms.account().open_orders, 0);
+    }
+
+    #[tokio::test]
+    async fn manual_order_with_a_mark_still_routes_normally() {
+        // The rejection above must not have changed the happy path: with a mark
+        // present the order goes through the risk gate to the broker as before.
+        let (bus, store, oms, pipeline) = setup(test_cfg());
+        store.set_last_price("BTC-USD", 100.0);
+        let mut rx = bus.subscribe();
+        pipeline
+            .handle_command(Command::PlaceOrder {
+                symbol: "BTC-USD".into(),
+                side: Side::Buy,
+                qty: 1.0,
+                order_type: OrderType::Market,
+                limit_px: None,
+                stop_px: None,
+            })
+            .await;
+        let ups = order_updates(&mut rx);
+        assert!(!ups.is_empty(), "the order must be routed, not rejected");
+        assert!(
+            !ups.iter().any(|u| matches!(
+                &u.status,
+                OrderStatus::RejectedByRisk { reason } if reason.contains("no market data")
+            )),
+            "a priced order must never hit the no-market-data guard"
+        );
+        assert!(oms.view().position_qty("BTC-USD") > 0.0, "position opened");
     }
 
     fn account(equity: f64, ts_ms: i64) -> cx_core::events::AccountSnapshot {

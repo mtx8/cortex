@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::events::Bar;
-use crate::types::Interval;
+use crate::types::{Interval, Venue};
 
 const MAX_BARS: usize = 3_000;
 
@@ -13,6 +13,16 @@ const MAX_BARS: usize = 3_000;
 pub struct BarStore {
     inner: RwLock<HashMap<(String, Interval), Vec<Bar>>>,
     last_price: RwLock<HashMap<String, f64>>,
+    /// Which venue produced each symbol's CURRENT mark, when the feed that set
+    /// it declared one.
+    ///
+    /// Exists so the order path can tell a real print from a fabricated one. The
+    /// synthetic GBM fallback writes marks into this same store as real quotes,
+    /// and nothing downstream could distinguish them — so a failed market-data
+    /// websocket could size and route orders off invented prices. Provenance is
+    /// recorded here rather than replacing `set_last_price`, whose signature is
+    /// used by ~50 call sites.
+    mark_venue: RwLock<HashMap<String, Venue>>,
 }
 
 impl BarStore {
@@ -46,13 +56,59 @@ impl BarStore {
         }
     }
 
+    /// Set the mark with UNDECLARED provenance.
+    ///
+    /// Any previously recorded venue is cleared: a stale "synthetic" label
+    /// outliving the mark it described would keep gating orders after real prices
+    /// returned. Prefer [`set_last_price_from`] in feed code.
     pub fn set_last_price(&self, symbol: &str, px: f64) {
         if px.is_finite() && px > 0.0 {
             self.last_price
                 .write()
                 .unwrap_or_else(|p| p.into_inner())
                 .insert(symbol.to_string(), px);
+            self.mark_venue
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(symbol);
         }
+    }
+
+    /// Set the mark AND record which venue produced it. Feed code should use
+    /// this so downstream gates can tell a real print from a fabricated one.
+    /// A real print overwrites a synthetic label, so recovery clears itself.
+    pub fn set_last_price_from(&self, symbol: &str, px: f64, venue: Venue) {
+        if px.is_finite() && px > 0.0 {
+            self.last_price
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(symbol.to_string(), px);
+            self.mark_venue
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(symbol.to_string(), venue);
+        }
+    }
+
+    /// The venue behind this symbol's current mark, or `None` when the writer
+    /// did not declare one.
+    pub fn mark_venue(&self, symbol: &str) -> Option<Venue> {
+        self.mark_venue
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(symbol)
+            .copied()
+    }
+
+    /// True only when this symbol's mark is KNOWN to be fabricated by the
+    /// synthetic fallback.
+    ///
+    /// Deliberately false for an undeclared mark rather than defaulting to
+    /// "unsafe": the gate this feeds must never halt trading on a symbol merely
+    /// because its feed does not report provenance. It is a strict improvement
+    /// on the previous state, where nothing in the order path could tell.
+    pub fn mark_is_synthetic(&self, symbol: &str) -> bool {
+        self.mark_venue(symbol) == Some(Venue::Synthetic)
     }
 
     pub fn last_price(&self, symbol: &str) -> Option<f64> {

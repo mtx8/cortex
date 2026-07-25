@@ -79,69 +79,50 @@ struct OrderTicket: View {
     }
 
     private var whole: Bool { AppModel.isEquity(symbol) }
-    private var price: Double? { model.lastPrice(symbol) }
-    private var book: BookTop? { model.bookTop[symbol] }
     private var increment: Double { OrderSizing.defaultIncrement(whole: whole) }
 
-    private var usesLimit: Bool { orderType == .limit || orderType == .stop_limit }
-    private var usesStop: Bool { orderType == .stop || orderType == .stop_limit }
+    /// The non-market half of the ticket — typed text, armed side, order type,
+    /// sizing mode — bundled into one value so the live-data leaf views can do
+    /// the whole size/risk computation themselves. This is what keeps live quote
+    /// and account reads OUT of this view's body (see the note on `body`).
+    private var form: TicketForm {
+        TicketForm(
+            symbol: symbol,
+            side: side,
+            orderType: orderType,
+            sizingMode: sizingMode,
+            qtyText: qtyText,
+            dollarText: dollarText,
+            pctSelected: pctSelected,
+            limitText: limitText,
+            stopText: stopText
+        )
+    }
 
-    private var limitPx: Double? { Self.parse(limitText) }
-    private var stopPx: Double? { Self.parse(stopText) }
+    private var usesLimit: Bool { form.usesLimit }
+    private var usesStop: Bool { form.usesStop }
+
+    private var limitPx: Double? { form.limitPx }
+    private var stopPx: Double? { form.stopPx }
+
+    // MARK: Live market reads — ACTION PATHS ONLY
+    //
+    // `lastTick`, `bookTop` and `account` are single stored properties on the
+    // @Observable AppModel and are republished on every ~12 Hz coalescer flush,
+    // for ANY symbol. Reading one inside this view's body (or any property the
+    // body composes) therefore re-lays-out the ENTIRE ticket twelve times a
+    // second — text fields, hotkey handler and all. These accessors are read
+    // only from actions (clicks, key presses, seeding), which run outside the
+    // body's observation-tracking scope; the views that DISPLAY live data read
+    // it themselves in their own small bodies.
+
+    private var price: Double? { model.lastPrice(symbol) }
+    private var book: BookTop? { model.bookTop[symbol] }
 
     /// The share count the current sizing mode resolves to, at the working
     /// price. nil when the mode's inputs are incomplete or price is missing.
     private var effectiveQty: Double? {
-        switch sizingMode {
-        case .shares:
-            // Floor equities to whole shares (crypto stays fractional) — same
-            // rule the $/% modes apply, so a typed "10.7" can't submit 10.7 AAPL.
-            return OrderSizing.normalize(shares: Self.parse(qtyText), whole: whole)
-        case .dollars:
-            guard let d = Self.parse(dollarText), let p = price else { return nil }
-            return OrderSizing.shares(dollars: d, price: p, whole: whole)
-        case .percent:
-            guard let f = pctSelected, let p = price else { return nil }
-            return OrderSizing.sharesFromBuyingPower(
-                fraction: f, buyingPower: model.buyingPower, price: p, whole: whole
-            )
-        }
-    }
-
-    /// The price the order works at — for notional and the fill reference.
-    private var workingPrice: Double? {
-        if usesLimit, let l = limitPx { return l }
-        if orderType == .stop, let s = stopPx { return s }
-        return price
-    }
-
-    private var notional: Double? {
-        guard let q = effectiveQty, let p = workingPrice else { return nil }
-        return OrderSizing.notional(qty: q, price: p)
-    }
-
-    private var equityFraction: Double? {
-        guard let n = notional else { return nil }
-        return OrderSizing.fractionOfEquity(notional: n, equity: model.account.equity)
-    }
-
-    /// Signed loss/share from the current market to the protective stop.
-    private var riskPerShare: Double? {
-        guard usesStop, let s = stopPx, let p = price else { return nil }
-        return OrderRisk.riskPerShare(side: side, entry: p, stop: s)
-    }
-
-    private var totalRisk: Double? {
-        guard let rps = riskPerShare, let q = effectiveQty else { return nil }
-        return abs(rps) * q
-    }
-
-    /// Reward:risk once a stop-limit sets both a stop and a target limit,
-    /// measured from where the market is now.
-    private var rewardRisk: Double? {
-        guard orderType == .stop_limit,
-            let s = stopPx, let t = limitPx, let p = price else { return nil }
-        return OrderRisk.rr(side: side, entry: p, stop: s, target: t)
+        form.qty(price: price, buyingPower: model.buyingPower)
     }
 
     /// The open position on this symbol (nil when flat) — flatten/reverse gate.
@@ -151,15 +132,13 @@ struct OrderTicket: View {
         return p
     }
 
-    private var isValid: Bool {
-        guard let q = effectiveQty, q > 0 else { return false }
-        if usesLimit && limitPx == nil { return false }
-        if usesStop && stopPx == nil { return false }
-        return true
-    }
-
     private var canSubmit: Bool {
-        isValid && model.connection == .connected && !model.risk.kill_switch
+        form.canSubmit(
+            price: price,
+            buyingPower: model.buyingPower,
+            connected: model.connection == .connected,
+            killSwitch: model.risk.kill_switch
+        )
     }
 
     // MARK: Body
@@ -170,16 +149,33 @@ struct OrderTicket: View {
         // no scrolling. The symbol picker rides in the header; the quote and
         // the size/risk readout are each a single compact line; price fields
         // stay hidden for MKT.
+        //
+        // PERF INVARIANT: this body reads NO live market or account state. The
+        // ticket is mounted whenever the bottom deck is open, so when it read
+        // `lastPrice` / `bookTop` / `account` directly, every ~12 Hz flush — for
+        // any symbol, in any workspace — re-laid-out all nine sections, fought
+        // with typing in the limit field and reinstalled the key handler. The
+        // four sections that need live data own their reads in their own leaf
+        // views instead, the same split as `LivePriceText` in the chart header
+        // and `AccountVitals` in the top bar: a tick invalidates only the leaf.
         VStack(alignment: .leading, spacing: 6) {
             header
-            quoteRow
+            TicketQuoteRow(
+                symbol: symbol,
+                onBid: { aggress(side: .sell, at: $0) },
+                onAsk: { aggress(side: .buy, at: $0) }
+            )
             typeSegment
             priceFields
             sizeModeRow
             sizingInput
-            readoutLine
-            submitControls
-            flattenReverseRow
+            TicketReadoutLine(form: form)
+            TicketSubmitControls(form: form, onSubmit: submit)
+            TicketPositionActions(
+                symbol: symbol,
+                onFlatten: flatten,
+                onReverse: reverse
+            )
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -324,75 +320,6 @@ struct OrderTicket: View {
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .frame(maxWidth: .infinity)
-    }
-
-    // MARK: Quote row — one compact line: bid · last · ask · spread. Bid/ask
-    // stay click-to-price; the size sub-line is dropped for deck density.
-
-    private var quoteRow: some View {
-        HStack(spacing: 5) {
-            quoteCell(label: "bid", px: book?.bid_px, tint: Theme.up, action: clickBid)
-            quoteCell(label: "last", px: price, tint: Theme.bone, action: nil)
-            quoteCell(label: "ask", px: book?.ask_px, tint: Theme.down, action: clickAsk)
-            spreadCell
-        }
-    }
-
-    private func quoteCell(
-        label: String, px: Double?, tint: Color, action: (() -> Void)?
-    ) -> some View {
-        let content = VStack(spacing: 1) {
-            Text(label.uppercased())
-                .font(.system(size: 7, weight: .semibold))
-                .tracking(0.6)
-                .foregroundStyle(Theme.dim)
-            Text(px.map { DashFormat.price($0) } ?? "—")
-                .numeric(size: 11, weight: .semibold)
-                .foregroundStyle(px == nil ? Theme.dim : tint)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 4)
-        .background(Theme.ink)
-        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.chipRadius)
-                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
-        )
-
-        return Group {
-            if let action {
-                Button(action: action) { content.contentShape(Rectangle()) }
-                    .buttonStyle(.plain)
-                    .help(label == "bid" ? "sell the bid" : "buy the ask")
-            } else {
-                content
-            }
-        }
-    }
-
-    private var spread: Double? {
-        guard let b = book, b.ask_px.isFinite, b.bid_px.isFinite,
-            b.ask_px > 0, b.bid_px > 0, b.ask_px >= b.bid_px else { return nil }
-        return b.ask_px - b.bid_px
-    }
-
-    private var spreadCell: some View {
-        VStack(spacing: 1) {
-            Text("SPR")
-                .font(.system(size: 7, weight: .semibold))
-                .tracking(0.6)
-                .foregroundStyle(Theme.dim)
-            Text(spread.map { DashFormat.price($0) } ?? "—")
-                .numeric(size: 11)
-                .foregroundStyle(Theme.dim)
-                .lineLimit(1)
-                .minimumScaleFactor(0.6)
-        }
-        .frame(width: 54)
-        .padding(.vertical, 4)
-        .help("bid/ask spread")
     }
 
     // MARK: Order type
@@ -554,143 +481,6 @@ struct OrderTicket: View {
         .help("\(Int(fraction * 100))% of buying power")
     }
 
-    // MARK: Risk / size readout — one compact line: resolved shares, notional,
-    // % of equity (ember dot when concentrated), and — once a stop is set —
-    // total risk and reward:risk. All formatting/gating lives in the pure
-    // TicketReadout helper.
-
-    private var readoutLine: some View {
-        let r = TicketReadout.make(
-            qty: effectiveQty,
-            notional: notional,
-            equityFraction: equityFraction,
-            totalRisk: totalRisk,
-            rewardRisk: rewardRisk
-        )
-        return HStack(spacing: 6) {
-            readoutSeg("=", r.shares, effectiveQty == nil ? Theme.dim : Theme.bone)
-            readoutSeg("notl", r.notional, Theme.dim)
-            readoutSeg("eq", r.equityPct, r.concentrated ? Theme.bone : Theme.dim, warn: r.concentrated)
-            if let risk = r.risk { readoutSeg("risk", risk, Theme.dim) }
-            if let rr = r.rewardRisk { readoutSeg("r:r", rr, Theme.dim) }
-            Spacer(minLength: 0)
-        }
-        .help(r.concentrated
-            ? "size is large — over \(DashFormat.pct(OrderSizing.warnFractionOfEquity, decimals: 0)) of equity"
-            : "size · notional · % of equity · risk to stop · reward:risk")
-    }
-
-    private func readoutSeg(
-        _ label: String, _ value: String, _ color: Color, warn: Bool = false
-    ) -> some View {
-        HStack(spacing: 3) {
-            Text(label)
-                .font(.system(size: 8, weight: .semibold))
-                .tracking(0.5)
-                .foregroundStyle(Theme.dim)
-            if warn { Circle().fill(Theme.ember).frame(width: 4, height: 4) }
-            Text(value)
-                .numeric(size: 10, weight: .medium)
-                .foregroundStyle(color)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
-        }
-    }
-
-    // MARK: Submit + position actions
-
-    @ViewBuilder
-    private var submitControls: some View {
-        if model.risk.kill_switch {
-            Text("Kill switch engaged")
-                .font(.system(size: 11, weight: .semibold))
-                .tracking(0.8)
-                .foregroundStyle(Theme.down)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .overlay(
-                    RoundedRectangle(cornerRadius: Theme.cornerRadius)
-                        .strokeBorder(Theme.down.opacity(0.5), lineWidth: Theme.hairline)
-                )
-        } else {
-            VStack(spacing: 6) {
-                venueTag
-                HStack(spacing: 8) {
-                    Button { submit(.buy) } label: {
-                        Text("BUY").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(BuySellButtonStyle(tint: Theme.up, armed: side == .buy))
-                    .disabled(!canSubmit)
-
-                    Button { submit(.sell) } label: {
-                        Text("SELL").frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(BuySellButtonStyle(tint: Theme.down, armed: side == .sell))
-                    .disabled(!canSubmit)
-                }
-                .opacity(canSubmit ? 1 : 0.5)
-            }
-        }
-    }
-
-    /// Compact execution-venue tag pinned above BUY/SELL so the trader always
-    /// knows where the order lands before clicking. Derives from the shared
-    /// BrokerBadge mapping (single source of truth), so it can never disagree
-    /// with the TopBar: calm inline text for PAPER / IBKR PAPER, a loud ember
-    /// chip for a connected LIVE account.
-    private var venueTag: some View {
-        let tag = TicketVenueTag.make(for: model.broker)
-        return HStack(spacing: 5) {
-            Text("venue")
-                .font(.system(size: 8, weight: .semibold))
-                .tracking(1.0)
-                .foregroundStyle(Theme.dim)
-            Text(tag.text)
-                .font(.system(size: 10, weight: tag.isLive ? .bold : .semibold))
-                .tracking(1.0)
-                .foregroundStyle(tag.color)
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, tag.isLive ? 8 : 0)
-        .padding(.vertical, tag.isLive ? 3 : 0)
-        .background(tag.isLive ? Theme.ember.opacity(0.12) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
-        .overlay(
-            RoundedRectangle(cornerRadius: Theme.chipRadius)
-                .strokeBorder(
-                    tag.isLive ? Theme.ember.opacity(0.55) : Color.clear,
-                    lineWidth: Theme.hairline
-                )
-        )
-        .help(tag.isLive
-            ? "REAL MONEY — orders execute at your live broker account"
-            : "execution venue for this ticket")
-        .accessibilityLabel("venue \(tag.text)")
-    }
-
-    private var flattenReverseRow: some View {
-        // FLATTEN and REVERSE gate SEPARATELY: closing is allowed under a kill
-        // switch, but reversing (which opens a LARGER opposite position) is not —
-        // it must never be a way around a halt.
-        let noPosition = position == nil || model.connection != .connected
-        return HStack(spacing: 8) {
-            Button { flatten() } label: {
-                Text("FLATTEN").frame(maxWidth: .infinity)
-            }
-            .buttonStyle(DeckTintedButtonStyle(tint: Theme.bone, border: Theme.line))
-            .disabled(noPosition)
-            .opacity(noPosition ? 0.45 : 1)
-
-            Button { reverse() } label: {
-                Text("REVERSE").frame(maxWidth: .infinity)
-            }
-            .buttonStyle(DeckTintedButtonStyle(tint: Theme.bone, border: Theme.line))
-            .disabled(noPosition || model.risk.kill_switch)
-            .opacity(noPosition || model.risk.kill_switch ? 0.45 : 1)
-        }
-        .help(position == nil ? "no position on \(symbol)" : "market unwind of \(symbol)")
-    }
-
     // MARK: Actions
 
     private func select(_ s: String) {
@@ -730,9 +520,6 @@ struct OrderTicket: View {
             stopText = DashFormat.editable(p)
         }
     }
-
-    private func clickBid() { aggress(side: .sell, at: book?.bid_px) }
-    private func clickAsk() { aggress(side: .buy, at: book?.ask_px) }
 
     /// "Buy the ask / sell the bid": arm the aggressive side, switch to a
     /// limit if not already price-bearing, and seat the limit at that level.
@@ -883,12 +670,390 @@ struct OrderTicket: View {
         }
     }
 
-    private static func parse(_ text: String) -> Double? {
+    /// One parser for every numeric field — shared with the leaf views through
+    /// `TicketForm` so the ticket and its readout can never disagree about what
+    /// a typed string means.
+    private static func parse(_ text: String) -> Double? { TicketForm.parse(text) }
+}
+
+// MARK: - Ticket form (the non-market half of the ticket)
+
+/// Everything the ticket's size/risk math needs that is NOT live market data.
+/// Held as one plain value so the live-reading leaf views below can compute the
+/// numbers they display from `(form, price, buyingPower, equity)` themselves —
+/// which is what keeps `lastPrice` / `bookTop` / `account` out of the parent's
+/// body, where a single read costs a full ticket re-layout on every ~12 Hz
+/// market flush. Pure, so every rule here is unit-tested without a live model.
+///
+/// @MainActor only because `whole` asks `AppModel.isEquity` (the single source of
+/// truth for the equity-vs-crypto sizing rule) and AppModel is main-actor —
+/// exactly the isolation this math already had while it lived inside the view.
+@MainActor
+struct TicketForm {
+    var symbol: String
+    var side: Side
+    var orderType: OrderType
+    var sizingMode: OrderTicket.SizingMode
+    var qtyText: String
+    var dollarText: String
+    var pctSelected: Double?
+    var limitText: String
+    var stopText: String
+
+    /// Equities size in whole shares; crypto stays fractional.
+    var whole: Bool { AppModel.isEquity(symbol) }
+    var usesLimit: Bool { orderType == .limit || orderType == .stop_limit }
+    var usesStop: Bool { orderType == .stop || orderType == .stop_limit }
+    var limitPx: Double? { TicketForm.parse(limitText) }
+    var stopPx: Double? { TicketForm.parse(stopText) }
+
+    /// The share count the active sizing mode resolves to at `price`. nil when
+    /// the mode's inputs are incomplete or the price is missing.
+    func qty(price: Double?, buyingPower: Double) -> Double? {
+        switch sizingMode {
+        case .shares:
+            // Floor equities to whole shares (crypto stays fractional) — same
+            // rule the $/% modes apply, so a typed "10.7" can't submit 10.7 AAPL.
+            return OrderSizing.normalize(shares: TicketForm.parse(qtyText), whole: whole)
+        case .dollars:
+            guard let d = TicketForm.parse(dollarText), let p = price else { return nil }
+            return OrderSizing.shares(dollars: d, price: p, whole: whole)
+        case .percent:
+            guard let f = pctSelected, let p = price else { return nil }
+            return OrderSizing.sharesFromBuyingPower(
+                fraction: f, buyingPower: buyingPower, price: p, whole: whole
+            )
+        }
+    }
+
+    /// The price the order works at — for notional and the fill reference.
+    func workingPrice(_ price: Double?) -> Double? {
+        if usesLimit, let l = limitPx { return l }
+        if orderType == .stop, let s = stopPx { return s }
+        return price
+    }
+
+    func notional(price: Double?, buyingPower: Double) -> Double? {
+        guard let q = qty(price: price, buyingPower: buyingPower),
+            let p = workingPrice(price) else { return nil }
+        return OrderSizing.notional(qty: q, price: p)
+    }
+
+    func equityFraction(price: Double?, buyingPower: Double, equity: Double) -> Double? {
+        guard let n = notional(price: price, buyingPower: buyingPower) else { return nil }
+        return OrderSizing.fractionOfEquity(notional: n, equity: equity)
+    }
+
+    /// Signed loss/share from the current market to the protective stop.
+    func riskPerShare(price: Double?) -> Double? {
+        guard usesStop, let s = stopPx, let p = price else { return nil }
+        return OrderRisk.riskPerShare(side: side, entry: p, stop: s)
+    }
+
+    func totalRisk(price: Double?, buyingPower: Double) -> Double? {
+        guard let rps = riskPerShare(price: price),
+            let q = qty(price: price, buyingPower: buyingPower) else { return nil }
+        return abs(rps) * q
+    }
+
+    /// Reward:risk once a stop-limit sets both a stop and a target limit,
+    /// measured from where the market is now.
+    func rewardRisk(price: Double?) -> Double? {
+        guard orderType == .stop_limit,
+            let s = stopPx, let t = limitPx, let p = price else { return nil }
+        return OrderRisk.rr(side: side, entry: p, stop: s, target: t)
+    }
+
+    func isValid(price: Double?, buyingPower: Double) -> Bool {
+        guard let q = qty(price: price, buyingPower: buyingPower), q > 0 else { return false }
+        if usesLimit && limitPx == nil { return false }
+        if usesStop && stopPx == nil { return false }
+        return true
+    }
+
+    /// The full submit gate: a resolvable size, a live link, and no halt.
+    func canSubmit(
+        price: Double?, buyingPower: Double, connected: Bool, killSwitch: Bool
+    ) -> Bool {
+        isValid(price: price, buyingPower: buyingPower) && connected && !killSwitch
+    }
+
+    /// Numeric field parser: strips grouping commas, rejects blanks, non-numbers,
+    /// non-finite values and anything <= 0 (a price or size of zero is not an
+    /// order). Shared by the ticket and every leaf so there is one meaning.
+    static func parse(_ text: String) -> Double? {
         let cleaned = text
             .replacingOccurrences(of: ",", with: "")
             .trimmingCharacters(in: .whitespaces)
         guard !cleaned.isEmpty, let v = Double(cleaned), v.isFinite, v > 0 else { return nil }
         return v
+    }
+}
+
+// MARK: - Live-data leaves
+//
+// Each of these owns its OWN AppModel read of the ~12 Hz market/account state it
+// displays, so a tick invalidates only that leaf instead of the whole ticket.
+// Same technique as `LivePriceText` (Chart/ChartPanel.swift) and `AccountVitals`
+// (Shell/TopBar.swift). Callbacks hand interaction back to the ticket, which
+// owns the focus and text state.
+
+/// One compact line: bid · last · ask · spread. Bid/ask stay click-to-price
+/// ("sell the bid" / "buy the ask"); the level the operator clicked is handed up
+/// so the ticket arms the aggressive side and seats the limit.
+private struct TicketQuoteRow: View {
+    @Environment(AppModel.self) private var model
+    let symbol: String
+    let onBid: (Double?) -> Void
+    let onAsk: (Double?) -> Void
+
+    var body: some View {
+        let book = model.bookTop[symbol]
+        let last = model.lastPrice(symbol)
+        HStack(spacing: 5) {
+            quoteCell(label: "bid", px: book?.bid_px, tint: Theme.up) { onBid(book?.bid_px) }
+            quoteCell(label: "last", px: last, tint: Theme.bone, action: nil)
+            quoteCell(label: "ask", px: book?.ask_px, tint: Theme.down) { onAsk(book?.ask_px) }
+            spreadCell(book)
+        }
+    }
+
+    private func quoteCell(
+        label: String, px: Double?, tint: Color, action: (() -> Void)?
+    ) -> some View {
+        let content = VStack(spacing: 1) {
+            Text(label.uppercased())
+                .font(.system(size: 7, weight: .semibold))
+                .tracking(0.6)
+                .foregroundStyle(Theme.dim)
+            Text(px.map { DashFormat.price($0) } ?? "—")
+                .numeric(size: 11, weight: .semibold)
+                .foregroundStyle(px == nil ? Theme.dim : tint)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 4)
+        .background(Theme.ink)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.chipRadius)
+                .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+        )
+
+        return Group {
+            if let action {
+                Button(action: action) { content.contentShape(Rectangle()) }
+                    .buttonStyle(.plain)
+                    .help(label == "bid" ? "sell the bid" : "buy the ask")
+            } else {
+                content
+            }
+        }
+    }
+
+    /// Crossed / non-finite / non-positive books show "—" rather than a
+    /// nonsense negative spread.
+    private func spread(_ book: BookTop?) -> Double? {
+        guard let b = book, b.ask_px.isFinite, b.bid_px.isFinite,
+            b.ask_px > 0, b.bid_px > 0, b.ask_px >= b.bid_px else { return nil }
+        return b.ask_px - b.bid_px
+    }
+
+    private func spreadCell(_ book: BookTop?) -> some View {
+        VStack(spacing: 1) {
+            Text("SPR")
+                .font(.system(size: 7, weight: .semibold))
+                .tracking(0.6)
+                .foregroundStyle(Theme.dim)
+            Text(spread(book).map { DashFormat.price($0) } ?? "—")
+                .numeric(size: 11)
+                .foregroundStyle(Theme.dim)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
+        }
+        .frame(width: 54)
+        .padding(.vertical, 4)
+        .help("bid/ask spread")
+    }
+}
+
+/// Risk / size readout — one compact line: resolved shares, notional, % of
+/// equity (ember dot when concentrated), and — once a stop is set — total risk
+/// and reward:risk. Reads price + account itself; all formatting/gating stays in
+/// the pure `TicketReadout` helper.
+private struct TicketReadoutLine: View {
+    @Environment(AppModel.self) private var model
+    let form: TicketForm
+
+    var body: some View {
+        let price = model.lastPrice(form.symbol)
+        let bp = model.buyingPower
+        let qty = form.qty(price: price, buyingPower: bp)
+        let r = TicketReadout.make(
+            qty: qty,
+            notional: form.notional(price: price, buyingPower: bp),
+            equityFraction: form.equityFraction(
+                price: price, buyingPower: bp, equity: model.account.equity
+            ),
+            totalRisk: form.totalRisk(price: price, buyingPower: bp),
+            rewardRisk: form.rewardRisk(price: price)
+        )
+        HStack(spacing: 6) {
+            readoutSeg("=", r.shares, qty == nil ? Theme.dim : Theme.bone)
+            readoutSeg("notl", r.notional, Theme.dim)
+            readoutSeg("eq", r.equityPct, r.concentrated ? Theme.bone : Theme.dim, warn: r.concentrated)
+            if let risk = r.risk { readoutSeg("risk", risk, Theme.dim) }
+            if let rr = r.rewardRisk { readoutSeg("r:r", rr, Theme.dim) }
+            Spacer(minLength: 0)
+        }
+        .help(r.concentrated
+            ? "size is large — over \(DashFormat.pct(OrderSizing.warnFractionOfEquity, decimals: 0)) of equity"
+            : "size · notional · % of equity · risk to stop · reward:risk")
+    }
+
+    private func readoutSeg(
+        _ label: String, _ value: String, _ color: Color, warn: Bool = false
+    ) -> some View {
+        HStack(spacing: 3) {
+            Text(label)
+                .font(.system(size: 8, weight: .semibold))
+                .tracking(0.5)
+                .foregroundStyle(Theme.dim)
+            if warn { Circle().fill(Theme.ember).frame(width: 4, height: 4) }
+            Text(value)
+                .numeric(size: 10, weight: .medium)
+                .foregroundStyle(color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        }
+    }
+}
+
+/// Venue tag + BUY/SELL, or the kill-switch notice in their place. Owns the
+/// submit-gate read (price / buying power / link / halt) so the enabled state
+/// stays exact — a directional button that cannot fire must not look armed —
+/// without that read costing the whole ticket a re-layout on every tick.
+private struct TicketSubmitControls: View {
+    @Environment(AppModel.self) private var model
+    let form: TicketForm
+    let onSubmit: (Side) -> Void
+
+    /// The submit gate, resolved against live price / buying power / link / halt.
+    private var canSubmit: Bool {
+        form.canSubmit(
+            price: model.lastPrice(form.symbol),
+            buyingPower: model.buyingPower,
+            connected: model.connection == .connected,
+            killSwitch: model.risk.kill_switch
+        )
+    }
+
+    var body: some View {
+        if model.risk.kill_switch {
+            Text("Kill switch engaged")
+                .font(.system(size: 11, weight: .semibold))
+                .tracking(0.8)
+                .foregroundStyle(Theme.down)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.cornerRadius)
+                        .strokeBorder(Theme.down.opacity(0.5), lineWidth: Theme.hairline)
+                )
+        } else {
+            VStack(spacing: 6) {
+                venueTag
+                HStack(spacing: 8) {
+                    Button { onSubmit(.buy) } label: {
+                        Text("BUY").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(BuySellButtonStyle(tint: Theme.up, armed: form.side == .buy))
+                    .disabled(!canSubmit)
+
+                    Button { onSubmit(.sell) } label: {
+                        Text("SELL").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(BuySellButtonStyle(tint: Theme.down, armed: form.side == .sell))
+                    .disabled(!canSubmit)
+                }
+                .opacity(canSubmit ? 1 : 0.5)
+            }
+        }
+    }
+
+    /// Compact execution-venue tag pinned above BUY/SELL so the trader always
+    /// knows where the order lands before clicking. Derives from the shared
+    /// BrokerBadge mapping (single source of truth), so it can never disagree
+    /// with the TopBar: calm inline text for PAPER / IBKR PAPER, a loud ember
+    /// chip for a connected LIVE account.
+    private var venueTag: some View {
+        let tag = TicketVenueTag.make(for: model.broker)
+        return HStack(spacing: 5) {
+            Text("venue")
+                .font(.system(size: 8, weight: .semibold))
+                .tracking(1.0)
+                .foregroundStyle(Theme.dim)
+            Text(tag.text)
+                .font(.system(size: 10, weight: tag.isLive ? .bold : .semibold))
+                .tracking(1.0)
+                .foregroundStyle(tag.color)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, tag.isLive ? 8 : 0)
+        .padding(.vertical, tag.isLive ? 3 : 0)
+        .background(tag.isLive ? Theme.ember.opacity(0.12) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Theme.chipRadius)
+                .strokeBorder(
+                    tag.isLive ? Theme.ember.opacity(0.55) : Color.clear,
+                    lineWidth: Theme.hairline
+                )
+        )
+        .help(tag.isLive
+            ? "REAL MONEY — orders execute at your live broker account"
+            : "execution venue for this ticket")
+        .accessibilityLabel("venue \(tag.text)")
+    }
+}
+
+/// FLATTEN / REVERSE. Reads the position book itself — positions are marked on
+/// the same ~12 Hz flush as ticks, so keeping this read out of the parent is
+/// what stops a marked-to-market position from re-laying-out the whole ticket.
+private struct TicketPositionActions: View {
+    @Environment(AppModel.self) private var model
+    let symbol: String
+    let onFlatten: () -> Void
+    let onReverse: () -> Void
+
+    private var position: Position? {
+        guard let p = model.positions[symbol],
+            abs(p.qty) > PositionAction.flatEpsilon else { return nil }
+        return p
+    }
+
+    var body: some View {
+        // FLATTEN and REVERSE gate SEPARATELY: closing is allowed under a kill
+        // switch, but reversing (which opens a LARGER opposite position) is not —
+        // it must never be a way around a halt.
+        let noPosition = position == nil || model.connection != .connected
+        HStack(spacing: 8) {
+            Button(action: onFlatten) {
+                Text("FLATTEN").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(DeckTintedButtonStyle(tint: Theme.bone, border: Theme.line))
+            .disabled(noPosition)
+            .opacity(noPosition ? 0.45 : 1)
+
+            Button(action: onReverse) {
+                Text("REVERSE").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(DeckTintedButtonStyle(tint: Theme.bone, border: Theme.line))
+            .disabled(noPosition || model.risk.kill_switch)
+            .opacity(noPosition || model.risk.kill_switch ? 0.45 : 1)
+        }
+        .help(position == nil ? "no position on \(symbol)" : "market unwind of \(symbol)")
     }
 }
 

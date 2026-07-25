@@ -11,6 +11,14 @@ struct RiskHUD: View {
         let risk = model.risk
         VStack(alignment: .leading, spacing: 10) {
             SectionLabel(text: "risk")
+            // Every control below is a COMMAND to the engine. With the link down
+            // they cannot do anything, and the client used to drop them silently
+            // — so an operator could click "Engage Kill Switch" on a dead socket
+            // and reasonably believe trading was halted. State it up front, and
+            // disable the controls so the belief never forms.
+            if !model.engineReachable {
+                unreachableNotice
+            }
             killControl(risk)
             autonomyControl(risk)
             cautionRow(risk)
@@ -23,6 +31,21 @@ struct RiskHUD: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .panel()
+        // The whole HUD is inert without the engine. Disabling it is the honest
+        // presentation: a risk control that cannot act must not look armed.
+        .disabled(!model.engineReachable)
+    }
+
+    /// Ember dot + bone text, per the warning convention — no coloured block.
+    private var unreachableNotice: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(Theme.ember)
+                .frame(width: 5, height: 5)
+            Text("engine unreachable — risk controls cannot act")
+                .font(.system(size: 10))
+                .foregroundStyle(Theme.bone)
+        }
     }
 
     // MARK: Kill switch
