@@ -21,11 +21,13 @@
 //!   recall answers are never re-remembered (see [`ingest`]) — recalled
 //!   memory compounding back into the drawers would otherwise ratchet the
 //!   palace to its cap and freeze all writes.
-//! - Off the hot path: writes happen on the palace ingest task (a bus
-//!   subscriber, the SINGLE writer); the closet mutex is held only for
-//!   accounting/index updates, never across file IO (the byte guard is an
-//!   atomic pre-check — a concurrent writer could overshoot by at most one
-//!   line). Failures degrade to a log line.
+//! - Off the hot path: the bus ingest task only ROUTES (see [`route`]) and
+//!   hands the entry to a dedicated writer thread ([`spawn_ingest`]) that is
+//!   the SINGLE writer and owns every `fs` call — no drawer append and no
+//!   compaction ever runs on a tokio worker. The closet mutex is held only
+//!   for accounting/index updates, never across file IO (the byte guard is
+//!   an atomic pre-check — a concurrent writer could overshoot by at most
+//!   one line). Failures degrade to a log line.
 //! - Room names are sanitized to a fixed character set: an event can never
 //!   name a path outside the palace directory.
 
@@ -60,6 +62,13 @@ const RECALL_CAP: usize = 8;
 const ENTRY_CHARS: usize = 4_000;
 /// The closet render shows at most this many rooms (~15 lines total).
 const RENDER_ROOMS: usize = 13;
+/// Depth of the queue between the bus ingest task and the palace writer
+/// thread. Bounded on purpose: a runaway bus must never grow the queue
+/// without bound, and a full queue drops the entry with a warn rather than
+/// back-pressuring the async task (blocking there would reintroduce exactly
+/// the worker stall the writer thread exists to remove). The writer is idle
+/// almost always, so reaching this depth already means something is wrong.
+const WRITE_QUEUE: usize = 512;
 
 /// One remembered line. `text` is verbatim — exactly what crossed the bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +78,18 @@ pub(crate) struct PalaceEntry {
     pub kind: String,
     pub text: String,
     pub tags: Vec<String>,
+}
+
+/// One routed entry on its way to a drawer: what [`route`] decided a bus
+/// event means to the palace, before any file is touched. Routing is pure and
+/// cheap (it may run on a tokio worker); the write is not, and travels to the
+/// palace writer thread as one of these.
+pub(crate) struct Remembrance {
+    room: String,
+    kind: &'static str,
+    text: String,
+    tags: Vec<String>,
+    ts_ms: i64,
 }
 
 /// The closet's per-room card: how full the drawer is and what it last held.
@@ -96,6 +117,12 @@ pub(crate) struct Palace {
     /// overshoot the cap by at most one line.
     total_bytes: AtomicU64,
     state: Mutex<ClosetState>,
+    /// Test-only: which thread performed the most recent drawer append. The
+    /// bus-ingest path must do its file IO on the dedicated palace writer
+    /// thread and NEVER on a tokio worker (see [`spawn_ingest`]); recording
+    /// where the write actually ran is the cheapest way to assert that.
+    #[cfg(test)]
+    last_write_thread: Mutex<Option<std::thread::ThreadId>>,
 }
 
 impl Palace {
@@ -167,6 +194,8 @@ impl Palace {
             total_cap,
             total_bytes: AtomicU64::new(total_bytes),
             state: Mutex::new(state),
+            #[cfg(test)]
+            last_write_thread: Mutex::new(None),
         }))
     }
 
@@ -231,6 +260,13 @@ impl Palace {
             return;
         }
         self.total_bytes.fetch_add(len, Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            *self
+                .last_write_thread
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(std::thread::current().id());
+        }
         let needs_compact = {
             let mut st = self.lock();
             let idx = st.rooms.entry(room.clone()).or_default();
@@ -240,6 +276,22 @@ impl Palace {
         if needs_compact {
             self.compact_room(&room);
         }
+    }
+
+    /// Write one already-routed entry. Blocking, like [`Self::remember`] —
+    /// only the palace writer thread (or a `spawn_blocking` caller) may call
+    /// this, never a tokio worker.
+    fn remember_routed(&self, r: Remembrance) {
+        self.remember(&r.room, r.kind, r.text, r.tags, r.ts_ms);
+    }
+
+    /// Test-only: the thread that performed the most recent drawer append.
+    #[cfg(test)]
+    fn last_write_thread(&self) -> Option<std::thread::ThreadId> {
+        *self
+            .last_write_thread
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
     }
 
     /// Rewrite one drawer keeping only the newest `room_cap` lines
@@ -468,13 +520,78 @@ fn sanitize_room(room: &str) -> String {
 ///   answers are SKIPPED (they embed stored memory — re-remembering them
 ///   would compound the palace into itself)
 /// - adopted ParamUpdate events -> room "research" (the audit trail)
+///
+/// The bus task itself only routes ([`route`]); the drawer writes happen on a
+/// dedicated "cx-palace-writer" thread fed by a bounded queue, so no palace
+/// file IO ever runs on a tokio worker.
 pub(crate) fn spawn_ingest(palace: &Arc<Palace>, bus: &Bus) {
     let mut rx = bus.subscribe();
     let palace = Arc::clone(palace);
+
+    // The drawer IO — an append per remembered event plus the occasional
+    // full-drawer compaction (read_to_string + write + rename of a
+    // multi-megabyte file, hundreds of ms) — runs on its OWN thread, never on
+    // a tokio worker. On a worker it would stall every other task scheduled
+    // there (tick->bar aggregation, the trade pipeline's bus loop, a client's
+    // websocket pump) and surface as chart/tape stutter with no attributable
+    // cause. Cautions alone are republished on every evaluation while a
+    // condition persists, so the append rate tracks the bar cadence. One
+    // dedicated thread also preserves the palace's single-writer invariant
+    // (the byte-guard pre-check stays exact).
+    let (tx, drain) = std::sync::mpsc::sync_channel::<Remembrance>(WRITE_QUEUE);
+    let writer = {
+        let palace = Arc::clone(&palace);
+        std::thread::Builder::new()
+            .name("cx-palace-writer".into())
+            .spawn(move || {
+                // Ends when the ingest task drops `tx` (bus closed at
+                // shutdown), after draining whatever is still queued.
+                while let Ok(entry) = drain.recv() {
+                    palace.remember_routed(entry);
+                }
+            })
+    };
+    let tx = match writer {
+        Ok(_) => Some(tx),
+        // A thread we cannot spawn must not cost the mesh its institutional
+        // memory: degrade to inline writes (the old behaviour, stalls and
+        // all) rather than silently forgetting every decision.
+        Err(e) => {
+            tracing::warn!(error = %e, "palace writer thread unavailable; writing inline");
+            None
+        }
+    };
+
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(ev) => ingest(&palace, &ev),
+                Ok(ev) => {
+                    // Routing only — cheap and allocation-bounded. The write
+                    // travels to the writer thread.
+                    let Some(entry) = route(&ev) else { continue };
+                    let Some(tx) = &tx else {
+                        palace.remember_routed(entry);
+                        continue;
+                    };
+                    match tx.try_send(entry) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(entry)) => {
+                            // Never block here: back-pressure on this task is
+                            // the very stall this queue removes.
+                            tracing::warn!(
+                                room = %entry.room,
+                                "palace writer queue full; dropping entry"
+                            );
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(entry)) => {
+                            // Writer gone (should be unreachable — nothing on
+                            // that path panics). Keep the memory rather than
+                            // lose it.
+                            tracing::warn!("palace writer gone; writing inline");
+                            palace.remember_routed(entry);
+                        }
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => break,
             }
@@ -482,11 +599,22 @@ pub(crate) fn spawn_ingest(palace: &Arc<Palace>, bus: &Bus) {
     });
 }
 
-/// Fold one bus event into the palace (pure routing; testable).
+/// Fold one bus event into the palace synchronously: route it, then write it.
+/// Test-only — the production path is [`spawn_ingest`], which routes on the
+/// bus task and leaves the blocking write to the palace writer thread.
+#[cfg(test)]
 pub(crate) fn ingest(palace: &Palace, ev: &EngineEvent) {
+    if let Some(entry) = route(ev) {
+        palace.remember_routed(entry);
+    }
+}
+
+/// Decide what (if anything) one bus event means to the palace. Pure — no
+/// file IO, so it is safe on a tokio worker (see [`spawn_ingest`]).
+fn route(ev: &EngineEvent) -> Option<Remembrance> {
     match ev {
         EngineEvent::Thought(t) => {
-            let routed: Option<(String, &str)> = if t.squadron == "strategy-ai" {
+            let routed: Option<(String, &'static str)> = if t.squadron == "strategy-ai" {
                 Some(("decisions".into(), "strategist"))
             } else if t.squadron == "research" {
                 Some(("research".into(), "brief"))
@@ -500,20 +628,22 @@ pub(crate) fn ingest(palace: &Palace, ev: &EngineEvent) {
             } else {
                 None
             };
-            if let Some((room, kind)) = routed {
-                palace.remember(&room, kind, t.text.clone(), t.tags.clone(), t.ts_ms);
-            }
+            let (room, kind) = routed?;
+            Some(Remembrance {
+                room,
+                kind,
+                text: t.text.clone(),
+                tags: t.tags.clone(),
+                ts_ms: t.ts_ms,
+            })
         }
-        EngineEvent::Caution(c) => {
-            let room = c.scope.clone().unwrap_or_else(|| "caution".into());
-            palace.remember(
-                &room,
-                "caution",
-                format!("{} raised caution {:.2}: {}", c.agent, c.value, c.reason),
-                vec!["caution".into(), c.agent.clone()],
-                c.ts_ms,
-            );
-        }
+        EngineEvent::Caution(c) => Some(Remembrance {
+            room: c.scope.clone().unwrap_or_else(|| "caution".into()),
+            kind: "caution",
+            text: format!("{} raised caution {:.2}: {}", c.agent, c.value, c.reason),
+            tags: vec!["caution".into(), c.agent.clone()],
+            ts_ms: c.ts_ms,
+        }),
         EngineEvent::AiAnswer(a) => {
             // Self-referential recall answers are NEVER re-remembered: a
             // recall answer embeds stored drawer hits, and re-storing it
@@ -531,17 +661,17 @@ pub(crate) fn ingest(palace: &Palace, ev: &EngineEvent) {
                 || crate::copilot::web_query(&a.question).is_some()
                 || a.answer.starts_with(crate::copilot::RECALL_ANSWER_PREFIX)
             {
-                return;
+                return None;
             }
             // Q&A persists in plaintext and can re-enter remote LLM prompts
             // via recall: scrub pasted secrets before anything is written.
-            palace.remember(
-                "copilot",
-                "qa",
-                format!("Q: {}\nA: {}", redact(&a.question), redact(&a.answer)),
-                vec!["copilot".into()],
-                a.ts_ms,
-            );
+            Some(Remembrance {
+                room: "copilot".into(),
+                kind: "qa",
+                text: format!("Q: {}\nA: {}", redact(&a.question), redact(&a.answer)),
+                tags: vec!["copilot".into()],
+                ts_ms: a.ts_ms,
+            })
         }
         EngineEvent::ParamUpdate(p) => {
             let params = p
@@ -550,18 +680,18 @@ pub(crate) fn ingest(palace: &Palace, ev: &EngineEvent) {
                 .map(|(k, v)| format!("{k}={v:.4}"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            palace.remember(
-                "research",
-                "param_update",
-                format!(
+            Some(Remembrance {
+                room: "research".into(),
+                kind: "param_update",
+                text: format!(
                     "{} adopted for {}: {} — {}",
                     p.source, p.strategy, params, p.rationale
                 ),
-                vec!["autoresearch".into(), p.strategy.clone()],
-                p.ts_ms,
-            );
+                tags: vec!["autoresearch".into(), p.strategy.clone()],
+                ts_ms: p.ts_ms,
+            })
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -907,6 +1037,70 @@ mod tests {
         assert!(hits[0].contains("autoresearch adopted for meanrev_z"));
         let qa = palace.recall("how are we positioned");
         assert!(qa[0].contains("Q: how are we positioned?\nA: flat and patient"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The bus ingest task may only ROUTE: every drawer append and every
+    /// compaction must run on the dedicated palace writer thread. Doing that
+    /// IO on a tokio worker stalls whatever else is scheduled there (the
+    /// tick->bar aggregator, the pipeline's bus loop, a websocket pump) and
+    /// shows up as chart/tape stutter with no attributable cause.
+    #[test]
+    fn bus_ingest_writes_off_the_tokio_worker_and_still_compacts() {
+        let dir = test_dir("offworker");
+        // Tiny room cap so the drawer crosses it and the writer also has to
+        // do a full-file compaction — the expensive half of the palace's IO.
+        let palace = Palace::open_with_caps(dir.clone(), 3, u64::MAX).unwrap();
+        // Single-threaded runtime: its ONE worker is the very thread
+        // `block_on` runs on, so "this write happened on a worker" is
+        // unambiguous — no thread-pool ambiguity to reason about.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let drawer = dir.join("regime.jsonl");
+        let worker = rt.block_on(async {
+            let bus = Bus::new(64);
+            spawn_ingest(&palace, &bus);
+            for i in 0..6i64 {
+                bus.publish(EngineEvent::Caution(CautionUpdate {
+                    scope: Some("regime".into()),
+                    value: 0.4,
+                    reason: format!("caution number {i}"),
+                    agent: "risk_officer".into(),
+                    ts_ms: 10 + i,
+                }));
+            }
+            // The writer thread runs independently of this runtime. Both
+            // conditions together hold only after the LAST append AND the
+            // compaction it triggered have finished.
+            for _ in 0..400 {
+                if let Ok(raw) = fs::read_to_string(&drawer) {
+                    if raw.contains("caution number 5") && raw.lines().count() == 3 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            std::thread::current().id()
+        });
+        let writer = palace
+            .last_write_thread()
+            .expect("the cautions must have reached a drawer");
+        assert_ne!(
+            writer, worker,
+            "palace ingest must never touch the filesystem on a tokio worker"
+        );
+        // Nothing lost or reordered by the extra queue hop, and the room cap
+        // still holds (drop-oldest).
+        let hits = palace.recall("caution number");
+        assert_eq!(hits.len(), 3, "{hits:?}");
+        assert!(hits[0].contains("caution number 5"), "newest first: {hits:?}");
+        assert!(
+            !hits.iter().any(|h| h.contains("caution number 0")),
+            "oldest must be compacted away: {hits:?}"
+        );
+        drop(rt);
         let _ = fs::remove_dir_all(dir);
     }
 }
