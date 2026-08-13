@@ -276,8 +276,8 @@ mod tests {
         // header (and every paper fill priced off last_price) jumps to
         // 100,000.00 mid-session.
         let store = BarStore::new();
-        store.set_last_price("BTC-USD", 63_412.55);
-        store.set_last_price("ETH-USD", 2_204.10);
+        store.set_last_price_untracked("BTC-USD", 63_412.55);
+        store.set_last_price_untracked("ETH-USD", 2_204.10);
         let symbols = vec!["BTC-USD".to_string(), "ETH-USD".to_string(), "SOL-USD".into()];
 
         let seeds = seeds(&store, &symbols);

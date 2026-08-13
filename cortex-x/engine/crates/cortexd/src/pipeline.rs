@@ -488,7 +488,21 @@ impl TradePipeline {
         // simulator running on synthetic prices is the intended offline
         // behaviour, and halting it would break development and demos. Rejection
         // is published like any other, so it is visible rather than a silent drop.
+        //
+        // REDUCE-ONLY EXITS ARE EXEMPT, and that exemption is load-bearing.
+        // Refusing an exit does not protect the operator — the position stays
+        // open and unhedged, so a fabricated mark would silently DISARM the ATR
+        // trailing stop and the positions-row Close while the operator believes
+        // both are armed. A stop that has been quietly switched off by a
+        // data-feed failure is worse than no stop at all. This mirrors the rule
+        // every other gate here already follows: the kill switch exempts
+        // reduce-only manual/flatten exits (cx-risk), the RiskEngine has a
+        // reduce-only fast path, and the live broker guard passes exits through
+        // even mid-halt — "the risk-off path must stay open exactly when the
+        // guard is darkest" (cx-broker::guard). Getting flatter is always allowed;
+        // only NEW risk is refused.
         if !matches!(self.broker.status().mode, BrokerMode::Paper)
+            && !intent.reduce_only
             && self.store.mark_is_synthetic(&intent.symbol)
         {
             let reason = format!(
@@ -954,6 +968,51 @@ mod tests {
         }
     }
 
+    /// A reduce-only EXIT must still reach a live sink on a synthetic mark.
+    ///
+    /// Refusing an exit leaves the position open, so a fabricated price would
+    /// silently disarm the ATR trail and the operator's Close button while both
+    /// still look armed — strictly worse than having no stop. Every other gate in
+    /// this engine already exempts the risk-off path; this one shipped without
+    /// the exemption, which an adversarial review caught.
+    #[tokio::test]
+    async fn live_exits_are_never_refused_on_a_synthetic_mark() {
+        let rec = RecordingBroker::new_live();
+        let (_bus, store, oms, _kill, pipeline) =
+            setup_with_broker(test_cfg(), Arc::clone(&rec) as Arc<dyn Broker>);
+        // A real open position to exit from — the RiskEngine correctly refuses a
+        // reduce-only order with nothing to reduce, so without this the test
+        // would pass or fail for the wrong reason.
+        open_position(&store, &oms, "BTC-USD", Side::Buy, 1.0, 100.0).await;
+        // NOW the feed falls back to invented prices, with the position still on.
+        store.set_last_price_from("BTC-USD", 100.0, cx_core::types::Venue::Synthetic);
+        assert!(store.mark_is_synthetic("BTC-USD"));
+        let before = rec.placed_count();
+
+        // Exactly what the ATR trail and the positions-row Close emit.
+        let exit = OrderIntent {
+            id: cx_core::ids::next_order_id(),
+            symbol: "BTC-USD".into(),
+            side: Side::Sell,
+            qty: 1.0,
+            order_type: OrderType::Market,
+            limit_px: None,
+            stop_px: None,
+            tif: Tif::Ioc,
+            reduce_only: true,
+            source: OrderSource::Manual,
+            rationale: "protective exit".into(),
+            ts_ms: now_ms(),
+        };
+        pipeline.submit_through_risk(exit, 100.0).await;
+
+        assert_eq!(
+            rec.placed_count() - before,
+            1,
+            "getting flatter must always be allowed — a refused exit disarms the stop"
+        );
+    }
+
     /// The gate is scoped to real money on purpose. The paper simulator running
     /// on synthetic prices IS the intended offline behaviour — halting it would
     /// break development and demos for no safety gain.
@@ -1056,7 +1115,7 @@ mod tests {
         // The rejection above must not have changed the happy path: with a mark
         // present the order goes through the risk gate to the broker as before.
         let (bus, store, oms, pipeline) = setup(test_cfg());
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let mut rx = bus.subscribe();
         pipeline
             .handle_command(Command::PlaceOrder {
@@ -1121,7 +1180,7 @@ mod tests {
     }
 
     async fn open_position(store: &BarStore, oms: &Oms, symbol: &str, side: Side, qty: f64, px: f64) {
-        store.set_last_price(symbol, px);
+        store.set_last_price_untracked(symbol, px);
         oms.submit(OrderIntent {
             id: 0,
             symbol: symbol.into(),
@@ -1163,7 +1222,7 @@ mod tests {
         assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
 
         // Deep retrace: 101 -> 96 = 5.0 >= 2.5 * ATR (~1.31 after this bar).
-        store.set_last_price("BTC-USD", 96.0);
+        store.set_last_price_untracked("BTC-USD", 96.0);
         pipeline.on_event(&m1("BTC-USD", 22, 100.0, 95.5, 96.0)).await;
 
         let ups = order_updates(&mut rx);
@@ -1189,7 +1248,7 @@ mod tests {
         assert!(order_updates(&mut rx).is_empty());
 
         // Bounce against the short: 98 -> 103 = 5.0 >= 2.5 * ATR.
-        store.set_last_price("ETH-USD", 103.0);
+        store.set_last_price_untracked("ETH-USD", 103.0);
         pipeline.on_event(&m1("ETH-USD", 21, 103.5, 102.5, 103.0)).await;
 
         let ups = order_updates(&mut rx);
@@ -1213,7 +1272,7 @@ mod tests {
 
         let mut rx = bus.subscribe();
         pipeline.on_event(&m1("BTC-USD", 10, 100.5, 99.5, 100.0)).await;
-        store.set_last_price("BTC-USD", 80.0);
+        store.set_last_price_untracked("BTC-USD", 80.0);
         pipeline.on_event(&m1("BTC-USD", 11, 100.0, 79.5, 80.0)).await;
         assert!(order_updates(&mut rx).is_empty());
         assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
@@ -1240,7 +1299,7 @@ mod tests {
 
         let mut rx = bus.subscribe();
         pipeline.on_event(&m1("BTC-USD", 20, 101.5, 100.5, 101.0)).await;
-        store.set_last_price("BTC-USD", 90.0);
+        store.set_last_price_untracked("BTC-USD", 90.0);
         pipeline.on_event(&m1("BTC-USD", 21, 101.0, 89.5, 90.0)).await;
         assert!(order_updates(&mut rx).is_empty());
         assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
@@ -1262,7 +1321,7 @@ mod tests {
         let mut rx = bus.subscribe();
         // Deep retrace fires the trail, but Agent("protector") is not
         // kill-exempt: risk rejects and the position stays open.
-        store.set_last_price("BTC-USD", 96.0);
+        store.set_last_price_untracked("BTC-USD", 96.0);
         pipeline.on_event(&m1("BTC-USD", 21, 100.0, 95.5, 96.0)).await;
         let ups = order_updates(&mut rx);
         assert!(
@@ -1287,7 +1346,7 @@ mod tests {
             .await;
 
         // Next qualifying bar fires again and now closes the position.
-        store.set_last_price("BTC-USD", 95.5);
+        store.set_last_price_untracked("BTC-USD", 95.5);
         pipeline.on_event(&m1("BTC-USD", 22, 96.5, 95.0, 95.5)).await;
         let ups = order_updates(&mut rx);
         assert!(
@@ -1307,7 +1366,7 @@ mod tests {
 
         // Same-sign close-and-reopen between bars, with the flat Position
         // event dropped (bus lag): the pipeline never observes qty == 0.
-        store.set_last_price("BTC-USD", 105.0);
+        store.set_last_price_untracked("BTC-USD", 105.0);
         oms.submit(OrderIntent {
             id: 0,
             symbol: "BTC-USD".into(),
@@ -1339,7 +1398,7 @@ mod tests {
         }
 
         // The re-seeded mark still protects: a deep retrace from 96 fires.
-        store.set_last_price("BTC-USD", 89.0);
+        store.set_last_price_untracked("BTC-USD", 89.0);
         pipeline.on_event(&m1("BTC-USD", 22, 96.0, 88.5, 89.0)).await;
         let ups = order_updates(&mut rx);
         assert!(!ups.is_empty(), "re-seeded trail should fire");
@@ -1373,7 +1432,7 @@ mod tests {
         let mut rx = bus.subscribe();
         // 105 -> 100 would trip a stale mark (5.0 >= 2.5 * ATR); a fresh
         // mark re-seeds at 100 and holds.
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         pipeline.on_event(&m1("BTC-USD", 21, 105.0, 99.5, 100.0)).await;
         assert!(order_updates(&mut rx).is_empty());
         assert!((oms.view().position_qty("BTC-USD") - 1.0).abs() < 1e-9);
@@ -1387,7 +1446,7 @@ mod tests {
         // never depends on the sizing caps. The dial is parked at Manual —
         // manual operator commands are not autonomy-gated.
         let (bus, store, oms, pipeline) = setup(test_cfg());
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         // Open a 1.0 long directly (setup only).
         open_position(&store, &oms, "BTC-USD", Side::Buy, 1.0, 100.0).await;
 
@@ -1473,7 +1532,7 @@ mod tests {
         // as `set_broker_config` would) must not break order routing: the
         // pipeline holds a stable ActiveBroker whose delegate simply changes.
         let (_bus, store, oms, _kill, active, pipeline) = setup_with_active(test_cfg());
-        store.set_last_price("AAPL", 100.0);
+        store.set_last_price_untracked("AAPL", 100.0);
 
         // Pre-swap: a manual buy routes through the initial paper broker.
         pipeline.handle_command(buy("AAPL", 2.0)).await;

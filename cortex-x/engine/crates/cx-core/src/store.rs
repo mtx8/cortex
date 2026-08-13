@@ -20,8 +20,8 @@ pub struct BarStore {
     /// synthetic GBM fallback writes marks into this same store as real quotes,
     /// and nothing downstream could distinguish them — so a failed market-data
     /// websocket could size and route orders off invented prices. Provenance is
-    /// recorded here rather than replacing `set_last_price`, whose signature is
-    /// used by ~50 call sites.
+    /// recorded here rather than folded into the plain setter, which stays
+    /// available as `set_last_price_untracked` for tests and fixtures.
     mark_venue: RwLock<HashMap<String, Venue>>,
 }
 
@@ -56,12 +56,16 @@ impl BarStore {
         }
     }
 
-    /// Set the mark with UNDECLARED provenance.
+    /// Set the mark with UNDECLARED provenance. **Not for feed code.**
     ///
-    /// Any previously recorded venue is cleared: a stale "synthetic" label
-    /// outliving the mark it described would keep gating orders after real prices
-    /// returned. Prefer [`set_last_price_from`] in feed code.
-    pub fn set_last_price(&self, symbol: &str, px: f64) {
+    /// Named `_untracked` deliberately. It clears any recorded venue, so calling
+    /// it from a feed silently DISARMS the synthetic-price gate for that symbol —
+    /// no test fails, nothing is logged, and live orders resume routing off
+    /// whatever the fallback invented. That is not hypothetical: the gate shipped
+    /// inert for exactly this reason, because the feeds were still calling the
+    /// plainly-named setter. Feed code uses [`set_last_price_from`]; this exists
+    /// for tests and fixtures that have no venue to declare.
+    pub fn set_last_price_untracked(&self, symbol: &str, px: f64) {
         if px.is_finite() && px > 0.0 {
             self.last_price
                 .write()

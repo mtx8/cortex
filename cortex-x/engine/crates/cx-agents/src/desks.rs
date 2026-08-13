@@ -1480,7 +1480,7 @@ mod tests {
     fn cycle_notes_equity_gap_from_store_once_per_day() {
         let store = BarStore::new();
         store.push(d1_bar("AAPL", 11, 100.0));
-        store.set_last_price("AAPL", 103.0);
+        store.set_last_price_untracked("AAPL", 103.0);
         let mut state = DesksState::new(&["AAPL".to_string(), "BTC-USD".to_string()]);
         // Day 12 (a Tuesday): no weekend caution can muddy the assert.
         let now = 12 * DAY_MS + 3_600_000;

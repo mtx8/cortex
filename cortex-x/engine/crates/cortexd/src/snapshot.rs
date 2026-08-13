@@ -698,7 +698,7 @@ mod tests {
         let bus = Bus::new(256);
         let store = Arc::new(BarStore::new());
         let oms = Oms::new(Arc::clone(&bus), Arc::clone(&store), Config::default().paper);
-        store.set_last_price("AAPL", 100.0);
+        store.set_last_price_untracked("AAPL", 100.0);
         oms.submit(OrderIntent {
             id: 0,
             symbol: "AAPL".into(),

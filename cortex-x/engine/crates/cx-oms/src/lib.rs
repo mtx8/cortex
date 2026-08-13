@@ -933,10 +933,10 @@ mod tests {
     #[tokio::test]
     async fn long_round_trip_realized_pnl_and_fees_exact() {
         let (_bus, store, oms) = setup(cfg(0, 10.0, 10.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         oms.submit(intent("BTC-USD", Side::Buy, 2.0, OrderType::Market, None))
             .await;
-        store.set_last_price("BTC-USD", 110.0);
+        store.set_last_price_untracked("BTC-USD", 110.0);
         oms.submit(intent("BTC-USD", Side::Sell, 2.0, OrderType::Market, None))
             .await;
 
@@ -966,7 +966,7 @@ mod tests {
     #[tokio::test]
     async fn short_round_trip_symmetric() {
         let (_bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("ETH-USD", 50.0);
+        store.set_last_price_untracked("ETH-USD", 50.0);
         oms.submit(intent("ETH-USD", Side::Sell, 3.0, OrderType::Market, None))
             .await;
 
@@ -977,7 +977,7 @@ mod tests {
         approx(acct.gross_exposure, 150.0);
         approx(acct.equity, 100_000.0);
 
-        store.set_last_price("ETH-USD", 45.0);
+        store.set_last_price_untracked("ETH-USD", 45.0);
         oms.submit(intent("ETH-USD", Side::Buy, 3.0, OrderType::Market, None))
             .await;
         let acct = oms.account();
@@ -989,11 +989,11 @@ mod tests {
     #[tokio::test]
     async fn average_cost_weights_adds() {
         let (_bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         oms.submit(intent("BTC-USD", Side::Buy, 1.0, OrderType::Market, None))
             .await;
         approx(oms.account().equity, 100_000.0); // buy at mark moves no equity
-        store.set_last_price("BTC-USD", 110.0);
+        store.set_last_price_untracked("BTC-USD", 110.0);
         oms.submit(intent("BTC-USD", Side::Buy, 1.0, OrderType::Market, None))
             .await;
 
@@ -1008,10 +1008,10 @@ mod tests {
     #[tokio::test]
     async fn cross_through_zero_realizes_then_reopens() {
         let (_bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("SOL-USD", 100.0);
+        store.set_last_price_untracked("SOL-USD", 100.0);
         oms.submit(intent("SOL-USD", Side::Buy, 2.0, OrderType::Market, None))
             .await;
-        store.set_last_price("SOL-USD", 120.0);
+        store.set_last_price_untracked("SOL-USD", 120.0);
         oms.submit(intent("SOL-USD", Side::Sell, 5.0, OrderType::Market, None))
             .await;
 
@@ -1025,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn resting_limit_fills_on_crossing_tick_via_marker() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 5.0, 2.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let _marker = oms.spawn_marker();
         let mut rx = bus.subscribe();
 
@@ -1068,7 +1068,7 @@ mod tests {
     #[tokio::test]
     async fn marketable_limit_fills_immediately_at_limit_as_taker() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 5.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let mut rx = bus.subscribe();
         let id = oms
             .submit(intent(
@@ -1109,7 +1109,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_order_is_nan_safe_and_cancels() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 5.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let mut rx = bus.subscribe();
         let id = oms
             .submit(intent("BTC-USD", Side::Buy, f64::NAN, OrderType::Market, None))
@@ -1134,7 +1134,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_only_hits_resting_or_working() {
         let (_bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let id = oms
             .submit(intent("BTC-USD", Side::Buy, 1.0, OrderType::Limit, Some(90.0)))
             .await;
@@ -1147,8 +1147,8 @@ mod tests {
     #[tokio::test]
     async fn flatten_all_closes_everything() {
         let (_bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
-        store.set_last_price("ETH-USD", 50.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
+        store.set_last_price_untracked("ETH-USD", 50.0);
         oms.submit(intent("BTC-USD", Side::Buy, 2.0, OrderType::Market, None))
             .await;
         oms.submit(intent("ETH-USD", Side::Sell, 4.0, OrderType::Market, None))
@@ -1170,7 +1170,7 @@ mod tests {
     #[tokio::test]
     async fn daily_trade_counter_counts_fills_not_orders() {
         let (_bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         oms.submit(intent("BTC-USD", Side::Buy, 1.0, OrderType::Market, None))
             .await;
         assert_eq!(oms.account().daily_trades, 1);
@@ -1186,7 +1186,7 @@ mod tests {
     #[tokio::test]
     async fn marker_marks_positions_and_view_reflects_it() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let _marker = oms.spawn_marker();
         oms.submit(intent("BTC-USD", Side::Buy, 1.0, OrderType::Market, None))
             .await;
@@ -1228,7 +1228,7 @@ mod tests {
     #[tokio::test]
     async fn racing_reduce_only_closes_fill_once_and_cancel_once() {
         let (bus, store, oms) = setup(cfg(50, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         oms.submit(intent("BTC-USD", Side::Buy, 2.0, OrderType::Market, None))
             .await;
 
@@ -1274,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn racing_partial_reduce_only_closes_clamp_and_never_flip() {
         let (bus, store, oms) = setup(cfg(50, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         oms.submit(intent("BTC-USD", Side::Buy, 2.0, OrderType::Market, None))
             .await;
 
@@ -1309,7 +1309,7 @@ mod tests {
     #[tokio::test]
     async fn reduce_only_cancels_when_flat_or_same_side() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let mut rx = bus.subscribe();
 
         // Flat book: nothing to reduce.
@@ -1339,7 +1339,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_during_latency_window_prevents_execution() {
         let (_bus, store, oms) = setup(cfg(150, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let oms2 = Arc::clone(&oms);
         let submit = tokio::spawn(async move {
             oms2.submit(intent("BTC-USD", Side::Buy, 1.0, OrderType::Market, None))
@@ -1369,7 +1369,7 @@ mod tests {
     #[tokio::test]
     async fn buy_stop_triggers_only_at_or_above_stop_then_fills() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let _marker = oms.spawn_marker();
         let mut rx = bus.subscribe();
 
@@ -1411,7 +1411,7 @@ mod tests {
     #[tokio::test]
     async fn sell_stop_triggers_only_at_or_below_stop_then_fills() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("ETH-USD", 100.0);
+        store.set_last_price_untracked("ETH-USD", 100.0);
         let _marker = oms.spawn_marker();
         let mut rx = bus.subscribe();
 
@@ -1453,7 +1453,7 @@ mod tests {
         // set ABOVE last (last <= stop) are already through their trigger, so
         // they fire at placement without waiting for a tick.
         let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let mut rx = bus.subscribe();
 
         let id = oms
@@ -1473,7 +1473,7 @@ mod tests {
         approx(u.avg_fill_px, 100.0);
         approx(oms.positions()[0].qty, 1.0);
 
-        store.set_last_price("SOL-USD", 50.0);
+        store.set_last_price_untracked("SOL-USD", 50.0);
         let id = oms
             .submit(stop_intent(
                 "SOL-USD",
@@ -1495,7 +1495,7 @@ mod tests {
     #[tokio::test]
     async fn stop_limit_becomes_resting_limit_and_fills_per_limit_rules() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 5.0, 2.0));
-        store.set_last_price("BTC-USD", 95.0);
+        store.set_last_price_untracked("BTC-USD", 95.0);
         let _marker = oms.spawn_marker();
         let mut rx = bus.subscribe();
 
@@ -1537,7 +1537,7 @@ mod tests {
     #[tokio::test]
     async fn stop_limit_triggered_and_marketable_fills_at_limit_as_taker() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 5.0, 2.0));
-        store.set_last_price("BTC-USD", 95.0);
+        store.set_last_price_untracked("BTC-USD", 95.0);
         let _marker = oms.spawn_marker();
         let mut rx = bus.subscribe();
 
@@ -1570,7 +1570,7 @@ mod tests {
     #[tokio::test]
     async fn working_stop_limit_does_not_fill_as_a_limit_before_its_stop_arms() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 95.0);
+        store.set_last_price_untracked("BTC-USD", 95.0);
         let _marker = oms.spawn_marker();
         let mut rx = bus.subscribe();
 
@@ -1604,7 +1604,7 @@ mod tests {
     #[tokio::test]
     async fn stop_without_stop_px_is_rejected_with_a_clear_reason() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let mut rx = bus.subscribe();
 
         // Absent stop_px: rejected before ever being Accepted.
@@ -1672,7 +1672,7 @@ mod tests {
     #[tokio::test]
     async fn protective_sell_stop_reduces_long_and_never_flips() {
         let (bus, store, oms) = setup(cfg(0, 0.0, 0.0, 0.0));
-        store.set_last_price("BTC-USD", 100.0);
+        store.set_last_price_untracked("BTC-USD", 100.0);
         let _marker = oms.spawn_marker();
 
         // Open a 1.0 long.

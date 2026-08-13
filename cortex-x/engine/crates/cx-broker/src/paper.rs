@@ -123,7 +123,7 @@ mod tests {
     #[tokio::test]
     async fn place_delegates_to_oms_and_fills_like_today() {
         let (store, oms, broker) = setup();
-        store.set_last_price("AAPL", 100.0);
+        store.set_last_price_untracked("AAPL", 100.0);
         let id = broker
             .place(market("AAPL", Side::Buy, 2.0))
             .await
@@ -142,8 +142,8 @@ mod tests {
     #[tokio::test]
     async fn flatten_all_cancels_working_and_flattens_positions() {
         let (store, _oms, broker) = setup();
-        store.set_last_price("AAPL", 100.0);
-        store.set_last_price("MSFT", 50.0);
+        store.set_last_price_untracked("AAPL", 100.0);
+        store.set_last_price_untracked("MSFT", 50.0);
         broker.place(market("AAPL", Side::Buy, 2.0)).await.unwrap();
         broker.place(market("MSFT", Side::Sell, 4.0)).await.unwrap();
         // A resting limit that must not survive the flatten.
@@ -164,7 +164,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_all_cancels_open_orders() {
         let (store, _oms, broker) = setup();
-        store.set_last_price("AAPL", 100.0);
+        store.set_last_price_untracked("AAPL", 100.0);
         let mut resting = market("AAPL", Side::Buy, 1.0);
         resting.order_type = OrderType::Limit;
         resting.limit_px = Some(90.0);
