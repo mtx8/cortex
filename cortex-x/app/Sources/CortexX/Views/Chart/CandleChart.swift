@@ -244,6 +244,23 @@ struct CandleChart: View {
             drawingStore: drawingStore
         )
         .padding(8)
+        // Bar-close countdown, in the axis column directly under the live-price
+        // tag. A SwiftUI overlay with its OWN 1 Hz timer, deliberately NOT part
+        // of the Canvas: repainting the whole plot once a second to animate four
+        // characters is exactly the waste the render budget forbids. It reads
+        // only two Int64s, so the 12-40 Hz tick storm never re-renders its body.
+        if let tag = frame.lastPriceTagCenter, let last = bars.last {
+            BarCountdownChip(
+                symbol: symbol, interval: interval, weekly: weekly,
+                barOpenMs: last.ts_open_ms, barSpanMs: barSpanMs
+            )
+                .position(
+                    x: tag.x,
+                    y: CGFloat(ChartMath.countdownCenterY(
+                        priceTagY: Double(tag.y), paneMaxY: Double(frame.mainRect.maxY)
+                    ))
+                )
+        }
         if !interaction.isFollowing {
             liveChip(frame)
         }
@@ -372,6 +389,72 @@ struct CandleChart: View {
         case .degraded, .synthetic_fallback: Theme.warn
         case .down: Theme.down
         }
+    }
+}
+
+// MARK: - Bar-close countdown (isolated 1 Hz target)
+
+/// Time remaining until the newest candle closes, rendered in the right price
+/// axis directly beneath the live-price tag — TradingView's countdown.
+///
+/// Two gates keep it honest, and both matter:
+///
+/// 1. The newest bar must genuinely be the CURRENT one. Equity quotes ride a
+///    ~15-minute delayed feed, so an equity chart's newest sub-hourly bar has
+///    usually already closed and this shows nothing (the header's DELAYED chip
+///    owns that explanation — it is not repeated here).
+/// 2. `open + span` must actually BE this instrument's close
+///    (`ChartMath.countdownGridIsUniform`). It is not, for equity hourly, daily
+///    or weekly bars — the engine's session grid makes those non-uniform, so a
+///    naive countdown would tick down over a bar that has already closed.
+///
+/// Crypto streams in real time on a uniform 24/7 UTC grid, so it counts down
+/// continuously at every interval.
+///
+/// It rides a one-second timer of its own and reads only two Int64s, so the
+/// ~12 Hz model commits never re-render it — and, being a SwiftUI overlay rather
+/// than Canvas work, animating it never repaints the plot.
+private struct BarCountdownChip: View {
+    let symbol: String
+    let interval: Interval
+    let weekly: Bool
+    let barOpenMs: Int64
+    let barSpanMs: Int64
+
+    @State private var now = Date()
+
+    /// ONE shared second-hand for every chart pane, and — critically — a stored
+    /// property the view struct does NOT carry. An instance
+    /// `Timer.publish(...).autoconnect()` would be a fresh publisher on every
+    /// init: the parent's body re-runs on each ~12 Hz model commit, so the
+    /// countdown's own body would be re-evaluated (and its subscription churned)
+    /// at tick rate. With the publisher hoisted out, this view is two Int64s —
+    /// unchanged between bars, so SwiftUI skips it entirely and the subscription
+    /// simply persists.
+    private static let tick = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        Group {
+            if let text = ChartMath.barCountdownText(
+                symbol: symbol, interval: interval, weekly: weekly,
+                barOpenMs: barOpenMs, barSpanMs: barSpanMs,
+                nowMs: Int64((now.timeIntervalSince1970 * 1000).rounded())
+            ) {
+                Text(text)
+                    // Deliberately quiet: the price tag above is the headline,
+                    // this is TradingView's secondary line.
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(Theme.dim)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    // Canvas ink, so the price-axis label it covers cannot bleed
+                    // through. No border: the tag above owns the emphasis.
+                    .background(Theme.ink)
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+            }
+        }
+        .onReceive(Self.tick) { now = $0 }
+        .allowsHitTesting(false)
     }
 }
 
@@ -1485,15 +1568,24 @@ private struct ChartFrame {
         bars.last(where: { !ChartMath.isExtendedHours($0.ts_open_ms) })?.close
     }
 
-    private func drawLastPrice(_ ctx: GraphicsContext) {
-        guard let last = bars.last else { return }
+    /// Centre of the last-price tag in the right axis column, or nil when the
+    /// last close sits outside the price pane (where no tag is drawn either).
+    /// The SwiftUI bar-close countdown hangs off this, so the countdown can
+    /// never drift away from the tag it belongs under.
+    var lastPriceTagCenter: CGPoint? {
+        guard let last = bars.last else { return nil }
         let y = yPrice(last.close)
-        guard y > mainRect.minY + 2, y < mainRect.maxY - 2 else { return }
+        guard y > mainRect.minY + 2, y < mainRect.maxY - 2 else { return nil }
+        return CGPoint(x: axisX + (size.width - axisX) / 2, y: y.rounded() + 0.5)
+    }
+
+    private func drawLastPrice(_ ctx: GraphicsContext) {
+        guard let last = bars.last, let tag = lastPriceTagCenter else { return }
         // During an equity pre/post session the live price reads EMBER + "EXT" so
         // the operator sees at a glance it's an extended-hours print (TradingView).
         let ext = inExtendedHours
         var p = Path()
-        let yy = y.rounded() + 0.5
+        let yy = tag.y
         p.move(to: CGPoint(x: 0, y: yy))
         p.addLine(to: CGPoint(x: plotWidth, y: yy))
         ctx.stroke(
@@ -1502,7 +1594,7 @@ private struct ChartFrame {
         )
         drawTag(
             ctx, text: ext ? ChartMath.formatPrice(last.close) + " EXT" : ChartMath.formatPrice(last.close),
-            center: CGPoint(x: axisX + (size.width - axisX) / 2, y: yy),
+            center: tag,
             background: ext ? Theme.ember.opacity(0.18) : Theme.panelHi,
             textColor: ext ? Theme.ember : Theme.bone
         )

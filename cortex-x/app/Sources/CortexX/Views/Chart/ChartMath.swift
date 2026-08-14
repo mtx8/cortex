@@ -386,6 +386,133 @@ enum ChartMath {
         return tsMs - tsMs % spanMs
     }
 
+    // MARK: - Bar-close countdown
+
+    /// How far a bar's open may lead the local clock and still be treated as the
+    /// current bar. Engine and client share a machine, so real skew is
+    /// milliseconds; this is generous.
+    static let maxCountdownSkewMs: Int64 = 2_000
+
+    /// Seconds remaining until the newest bar closes — nil unless that bar is
+    /// genuinely the CURRENT one, i.e. `nowMs` falls inside
+    /// `[barOpenMs, barOpenMs + barSpanMs)`.
+    ///
+    /// `barOpenMs` must come from the DATA (`bars.last.ts_open_ms`), never from
+    /// a client-side re-bucketing of the clock. `bucket(_:spanMs:)` is
+    /// epoch-anchored, but the engine anchors equity HOURLY bars to 09:30 ET
+    /// through the regular session (`agg::bar_bucket`), so a recomputation would
+    /// be 30 minutes wrong on every equity 1h chart. Building on the bar's own
+    /// open time agrees with whatever grid the engine used, automatically.
+    ///
+    /// The nil case is the honest one and it is not rare: equity quotes arrive on
+    /// a ~15-minute delayed feed, so an equity chart's newest bar has usually
+    /// already closed. A countdown there would be meaningless or negative — the
+    /// caller shows nothing instead (the separate DELAYED chip explains why).
+    ///
+    /// A bar stamped slightly AHEAD of the client clock (routine engine/client
+    /// skew) is clamped to its own open rather than dropped, so the countdown
+    /// reads a full span instead of blinking out; the result is therefore always
+    /// in `1...ceil(barSpanMs / 1000)` and never negative.
+    static func secondsUntilBarClose(barOpenMs: Int64, barSpanMs: Int64, nowMs: Int64) -> Int? {
+        guard barSpanMs > 0 else { return nil }
+        let (closeMs, overflow) = barOpenMs.addingReportingOverflow(barSpanMs)
+        guard !overflow, nowMs < closeMs else { return nil }
+        // A bar cannot legitimately open in the future: opens come from trade
+        // time, which is always behind the clock (15 minutes behind, on the
+        // delayed equity feed). A small lead is routine skew between the engine
+        // and this process — both on localhost — and is clamped below. A LARGE
+        // lead is a bad stamp or a wrong clock, and clamping it would freeze the
+        // chip at a full span for as long as the skew lasts: a countdown that
+        // does not count is worse than none.
+        guard barOpenMs - nowMs <= maxCountdownSkewMs else { return nil }
+        let remainingMs = closeMs - max(nowMs, barOpenMs)
+        // Round UP: a bar with 400 ms left still has a second on the clock, and
+        // "00:00" must never sit on screen for a bar that has not closed.
+        // (Divide first — `remainingMs + 999` could overflow at the extremes.)
+        let whole = remainingMs / 1_000
+        return Int(remainingMs % 1_000 == 0 ? whole : whole + 1)
+    }
+
+    /// `MM:SS` under an hour, `H:MM:SS` at or above one (daily / weekly bars).
+    /// Zero-padded, never negative. Hours are not padded and are not wrapped at
+    /// 24, so a fresh weekly bar honestly reads `167:59:59` rather than pretending
+    /// to be a wall clock.
+    static func formatCountdown(_ seconds: Int) -> String {
+        let s = max(0, seconds)
+        let h = s / 3_600
+        let m = (s % 3_600) / 60
+        let sec = s % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, sec) }
+        return String(format: "%02d:%02d", m, sec)
+    }
+
+    /// Whether `barOpen + barSpan` is genuinely when this instrument's bar
+    /// closes — the precondition the whole countdown rests on.
+    ///
+    /// It holds far less often than it looks. `secondsUntilBarClose` inherits the
+    /// engine's bar ANCHOR from the data, but it assumes a UNIFORM span, and the
+    /// engine's equity grid is not uniform:
+    ///
+    /// - **Equity hourly** is 09:30-ET anchored through the session, then falls
+    ///   back to the ET hour outside it (`agg::equity_hour_bucket`). So the 09:00
+    ///   pre-market and 15:30 closing buckets are each **30 minutes**, not 60. On
+    ///   the 15:30 bar, `open + 1h` says 16:30 ET — half an hour after the market
+    ///   shut — and the chip would tick down over a bar that closed at 16:00.
+    /// - **Equity daily** is finalised at the 16:00 ET session close: a print from
+    ///   outside regular hours rolls the bar up rather than extending it
+    ///   (`agg.rs`, the D1 + `!us_rth` guard). Its span runs to UTC midnight
+    ///   (20:00 ET), so `open + 24h` would animate for four hours over a bar that
+    ///   is already final.
+    /// - **Equity weekly** rides the d1 series on a Monday-UTC `weekFloor`, but
+    ///   the trading week ends Friday 16:00 ET — the naive close is Sunday 20:00
+    ///   ET, so the chip would count down all weekend on a frozen bar.
+    ///
+    /// Crypto is uniform everywhere: 24/7 on the plain UTC grid, no session, no
+    /// anchor offset. Equity sub-hourly is uniform too — those buckets are plain
+    /// UTC-floored, and the 30-minute RTH offset is a whole multiple of 1s/1m/5m/15m.
+    ///
+    /// Resolving the non-uniform cases needs the engine's ET/DST session maths on
+    /// this side, which is exactly the duplication that produces two grids that
+    /// disagree. Until the true close is available from the data, show nothing:
+    /// a missing countdown is a small loss, a confidently wrong one is a lie
+    /// about when the operator's bar closes.
+    static func countdownGridIsUniform(symbol: String, interval: Interval, weekly: Bool) -> Bool {
+        // "-" pairs are crypto (matching AppModel.isEquity's convention).
+        guard !symbol.contains("-") else { return true }
+        return !weekly && interval.ms < Interval.h1.ms
+    }
+
+    /// The countdown label for the newest bar, or nil when that bar is not the
+    /// current one, or when this instrument's bar close cannot be derived from
+    /// `open + span` (see `countdownGridIsUniform`) — the single call the chart
+    /// overlay makes.
+    static func barCountdownText(
+        symbol: String,
+        interval: Interval,
+        weekly: Bool,
+        barOpenMs: Int64,
+        barSpanMs: Int64,
+        nowMs: Int64
+    ) -> String? {
+        guard countdownGridIsUniform(symbol: symbol, interval: interval, weekly: weekly) else {
+            return nil
+        }
+        guard let s = secondsUntilBarClose(
+            barOpenMs: barOpenMs, barSpanMs: barSpanMs, nowMs: nowMs
+        ) else { return nil }
+        return formatCountdown(s)
+    }
+
+    /// Vertical centre for the countdown chip: `offset` below the last-price
+    /// tag, flipped to the same distance ABOVE it when the tag sits too close to
+    /// the bottom of the price pane for the chip to fit under it.
+    static func countdownCenterY(
+        priceTagY: Double, paneMaxY: Double, offset: Double = 14, halfHeight: Double = 7
+    ) -> Double {
+        let below = priceTagY + offset
+        return below + halfHeight <= paneMaxY ? below : priceTagY - offset
+    }
+
     /// Floor a timestamp to the Monday 00:00 UTC opening its trading week.
     /// Floored modulo, so pre-1970 timestamps still round downward.
     static func weekFloor(_ tsMs: Int64) -> Int64 {
@@ -509,6 +636,19 @@ enum ChartMath {
 
     /// Adaptive price format: >= 100 -> 2dp; >= 1 -> 2-4dp (trailing zeros
     /// trimmed to 2dp); < 1 -> 4 significant digits.
+    /// A duration as the shortest honest label: `45s`, `16m`, `2h 05m`.
+    ///
+    /// Used for "how old is this print", where the operator needs the magnitude
+    /// at a glance and never a decimal. Rounds DOWN, so the age shown is never
+    /// older than the data actually is.
+    static func compactAge(_ seconds: Double) -> String {
+        let s = Int(max(0, seconds))
+        if s < 60 { return "\(s)s" }
+        let m = s / 60
+        if m < 60 { return "\(m)m" }
+        return String(format: "%dh %02dm", m / 60, m % 60)
+    }
+
     static func formatPrice(_ v: Double, grouped: Bool = false) -> String {
         guard v.isFinite else { return "—" }
         let a = abs(v)

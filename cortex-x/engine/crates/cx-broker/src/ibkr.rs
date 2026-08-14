@@ -361,6 +361,19 @@ impl IbkrBroker {
     }
 }
 
+// The incremental depth ladder. ALWAYS compiled — it imports no `ibapi` type,
+// so the logic that can actually be wrong is unit-tested in the default paper
+// build instead of only being observable against a live Gateway. The
+// feature-gated wire layer merely maps `MarketDepth`/`MarketDepthL2` onto its
+// input type.
+pub mod book;
+
+/// The LIVE equity market-data feed (reqMktDepth + tick-by-tick AllLast). It
+/// runs BESIDE the order adapter on its own Gateway session and cannot touch
+/// the order path; see the module docs for why the separation is deliberate.
+#[cfg(feature = "ibkr")]
+pub mod marketdata;
+
 #[cfg(feature = "ibkr")]
 mod wire;
 

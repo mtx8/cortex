@@ -61,6 +61,29 @@ struct DomLadder: View {
     /// Horizontal inset shared by the column header + rows (insets prices from
     /// the spine and sizes from the outer rails).
     private static let rowInset: CGFloat = 8
+    /// Ceiling for the montage when an honesty notice sits beneath it: the
+    /// levels hug the header and the notice follows immediately, instead of a
+    /// lone delayed row floating over a pane-height void that reads as a broken
+    /// order book.
+    private static let compactBookMaxHeight: CGFloat = 220
+
+    /// The feed's facts for the honesty rules, read from the model once per
+    /// render. `depthSymbol` (not the selection) is the symbol the book belongs
+    /// to; it decides equity-vs-crypto, and its absence is the honest signal
+    /// that nothing was ever subscribed.
+    private func facts(_ b: Book) -> DepthFeedFacts {
+        let symbol = model.depthSymbol ?? model.selectedSymbol
+        return DepthFeedFacts(
+            isEquity: AppModel.isEquity(symbol),
+            isSubscribed: model.depthSymbol != nil,
+            hasDepth: depth != nil,
+            isLive: depth?.is_live ?? false,
+            source: depth?.source ?? "",
+            bidLevels: b.bids.count,
+            askLevels: b.asks.count,
+            quoteTsMs: depth?.ts_ms
+        )
+    }
 
     var body: some View {
         let b = book
@@ -174,50 +197,75 @@ struct DomLadder: View {
 
     // MARK: Columns (the montage body)
 
+    /// The montage body, or the honest statement of why there is no book — the
+    /// two are chosen by the pure `DepthHonesty.depthPane` rule, never by
+    /// guessing from how many levels turned up. A delayed equity frame draws its
+    /// one level per side AND says, right underneath, that this is a delayed
+    /// quote and not an order book.
     @ViewBuilder
     private func columns(_ b: Book) -> some View {
-        if depth == nil {
-            DeckEmpty(text: "waiting for depth…")
-        } else if b.isEmpty {
-            DeckEmpty(text: "no book")
-        } else {
-            GeometryReader { geo in
-                let capacity = DepthMontage.rowCapacity(
-                    height: Double(geo.size.height), rowHeight: Double(Self.rowHeight)
-                )
-                let bidRows = DepthMontage.column(
-                    b.bids, rowHeight: Double(Self.rowHeight), capacity: capacity, topY: 0
-                )
-                let askRows = DepthMontage.column(
-                    b.asks, rowHeight: Double(Self.rowHeight), capacity: capacity, topY: 0
-                )
-                // Scale the depth histogram to the largest VISIBLE level, not the
-                // whole book — a huge resting size below the fold must not squash
-                // every drawn bar to a sliver.
-                let visMax = DepthLadder.maxSize(
-                    bids: bidRows.map(\.level), asks: askRows.map(\.level)
-                )
-                Canvas(opaque: true, rendersAsynchronously: false) { ctx, size in
-                    MontageCanvas(
-                        bidRows: bidRows, askRows: askRows,
-                        maxSize: visMax, inset: Self.rowInset,
-                        routeWidth: b.hasRoutes ? Self.routeWidth : 0
-                    ).draw(in: ctx, size: size)
-                }
-                .contentShape(Rectangle())
-                // Click-to-price: the click's side (x vs the spine) picks the
-                // column, then the same drawn rows map y → level → ticket price.
-                .gesture(
-                    SpatialTapGesture().onEnded { value in
-                        let spine = Double(geo.size.width) / 2
-                        let rows = Double(value.location.x) < spine ? bidRows : askRows
-                        if let level = DepthMontage.level(atY: Double(value.location.y), rows: rows) {
-                            model.setTicketPrice(level.px)
-                        }
-                    }
-                )
-                .help("click a level to set the order-ticket price")
+        switch DepthHonesty.depthPane(facts(b)) {
+        case .book:
+            montage(b)
+        case .bookWithNotice(let notice):
+            let rows = max(b.bids.count, b.asks.count)
+            VStack(spacing: 0) {
+                montage(b)
+                    .frame(height: min(CGFloat(rows) * Self.rowHeight, Self.compactBookMaxHeight))
+                Divider().overlay(Theme.line)
+                FeedNoticeView(notice: notice)
+                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        case .noticeOnly(let notice):
+            VStack(spacing: 0) {
+                FeedNoticeView(notice: notice)
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+    }
+
+    /// The two-column Canvas montage itself. Fills whatever height it is given —
+    /// the whole pane for a real book, a content-sized strip when an honesty
+    /// notice sits beneath it.
+    private func montage(_ b: Book) -> some View {
+        GeometryReader { geo in
+            let capacity = DepthMontage.rowCapacity(
+                height: Double(geo.size.height), rowHeight: Double(Self.rowHeight)
+            )
+            let bidRows = DepthMontage.column(
+                b.bids, rowHeight: Double(Self.rowHeight), capacity: capacity, topY: 0
+            )
+            let askRows = DepthMontage.column(
+                b.asks, rowHeight: Double(Self.rowHeight), capacity: capacity, topY: 0
+            )
+            // Scale the depth histogram to the largest VISIBLE level, not the
+            // whole book — a huge resting size below the fold must not squash
+            // every drawn bar to a sliver.
+            let visMax = DepthLadder.maxSize(
+                bids: bidRows.map(\.level), asks: askRows.map(\.level)
+            )
+            Canvas(opaque: true, rendersAsynchronously: false) { ctx, size in
+                MontageCanvas(
+                    bidRows: bidRows, askRows: askRows,
+                    maxSize: visMax, inset: Self.rowInset,
+                    routeWidth: b.hasRoutes ? Self.routeWidth : 0
+                ).draw(in: ctx, size: size)
+            }
+            .contentShape(Rectangle())
+            // Click-to-price: the click's side (x vs the spine) picks the
+            // column, then the same drawn rows map y → level → ticket price.
+            .gesture(
+                SpatialTapGesture().onEnded { value in
+                    let spine = Double(geo.size.width) / 2
+                    let rows = Double(value.location.x) < spine ? bidRows : askRows
+                    if let level = DepthMontage.level(atY: Double(value.location.y), rows: rows) {
+                        model.setTicketPrice(level.px)
+                    }
+                }
+            )
+            .help("click a level to set the order-ticket price")
         }
     }
 }
@@ -345,16 +393,33 @@ private struct MontageCanvas {
 /// prints, each colored by aggressor (buy = up, sell = down, unknown = dim).
 /// Reads the model's ring-capped `tape`; the header/collapse chrome lives in
 /// the dock. Grid only.
+///
+/// An EQUITY on the keyless feed gets a permanent statement instead of an empty
+/// pane: nothing in the engine emits prints for stocks, so "waiting for prints…"
+/// was a promise that could never be kept. The crypto path (a real Coinbase
+/// tape) is untouched — its quiet state still reads as quiet, because there
+/// prints genuinely do arrive.
 struct TimeSalesPane: View {
     @Environment(AppModel.self) private var model
+
+    /// Feed facts for the tape's honesty rule. Only the symbol's kind, the
+    /// subscription and whether a book has landed matter here — the tape has no
+    /// levels of its own.
+    private var facts: DepthFeedFacts {
+        let symbol = model.depthSymbol ?? model.selectedSymbol
+        return DepthFeedFacts(
+            isEquity: AppModel.isEquity(symbol),
+            isSubscribed: model.depthSymbol != nil,
+            hasDepth: model.bookDepth != nil
+        )
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             tapeHeaderRow
             Divider().overlay(Theme.line)
-            if model.tape.isEmpty {
-                DeckEmpty(text: model.bookDepth == nil ? "waiting for prints…" : "no prints yet")
-            } else {
+            switch DepthHonesty.tapePane(facts, hasPrints: !model.tape.isEmpty) {
+            case .prints:
                 ScrollView(.vertical, showsIndicators: false) {
                     LazyVStack(spacing: 0) {
                         // Newest-first already; enumerated offset keeps identity
@@ -366,6 +431,14 @@ struct TimeSalesPane: View {
                     }
                 }
                 .frame(maxHeight: .infinity, alignment: .top)
+            case .notice(let notice):
+                VStack(spacing: 0) {
+                    FeedNoticeView(notice: notice)
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            case .empty(let text):
+                DeckEmpty(text: text)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -383,6 +456,76 @@ struct TimeSalesPane: View {
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
         .background(Theme.ink)
+    }
+}
+
+// MARK: - Honest feed notice
+
+/// The statement a pane shows in place of — or directly beneath — data the feed
+/// cannot supply: an ember dot, an uppercase stamp headline in bone, the plain
+/// reason in dim, and (for a delayed quote) a slow-ticking age line.
+///
+/// Deliberately NOT a loading state: no spinner, no ellipsis on a terminal
+/// notice, no centered grey shrug. A pane that will never fill says so in words,
+/// which is the whole point — "waiting for prints…" on a feed with no tape is a
+/// lie the operator reads as a broken app.
+private struct FeedNoticeView: View {
+    let notice: FeedNotice
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Circle()
+                .fill(Theme.ember)
+                .frame(width: 5, height: 5)
+                .padding(.top, 4)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(notice.headline)
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(1.1)
+                    .foregroundStyle(Theme.bone)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(notice.detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(Theme.dim)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let ts = notice.quoteTsMs {
+                    QuoteAgeLine(tsMs: ts)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.panel)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(notice.headline). \(notice.detail)")
+    }
+}
+
+/// How old the quote behind a delayed ladder is, refreshed on its OWN slow
+/// clock. The number has to tick independently: the equity quote itself only
+/// refreshes every couple of minutes, so an age computed once per frame would
+/// sit at "15m" while the real staleness grew — understating exactly the thing
+/// this line exists to state. Its own tiny subview, so the 5 s tick invalidates
+/// one Text and never the ladder Canvas.
+private struct QuoteAgeLine: View {
+    let tsMs: Int64
+
+    @State private var now = Date()
+    private let tick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        Text(
+            DepthHonesty.quoteAgeLine(
+                tsMs: tsMs, nowMs: Int64(now.timeIntervalSince1970 * 1000)
+            )
+        )
+        .font(.system(size: 10).monospacedDigit())
+        .foregroundStyle(Theme.dim)
+        .lineLimit(1)
+        .onReceive(tick) { now = $0 }
     }
 }
 

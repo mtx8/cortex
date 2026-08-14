@@ -330,9 +330,250 @@ struct DepthBanner: Equatable {
         if depth.is_live {
             return DepthBanner(kind: .live, source: source, note: "real-time depth")
         }
+        // Terse on purpose: this is the dock's one-line posture. The pane itself
+        // carries the full statement (source, level count, quote age) via
+        // `DepthHonesty` — the two must complement, never compete.
         return DepthBanner(
             kind: .delayed, source: source,
-            note: "delayed L1 — real-time depth requires IBKR market-data (Settings)"
+            note: "delayed L1 — a top-of-book stand-in, not an order book; "
+                + "real Level 2 comes with IB Gateway"
         )
+    }
+}
+
+// MARK: - Depth & tape honesty (what the panes may truthfully say)
+
+/// The posture of one symbol's Level 2 feed, decided ONLY from facts the engine
+/// reports — the subscription state and the frame's own `is_live` — never
+/// inferred from how much data happened to show up. A thin book is not the same
+/// thing as a missing one, and neither may ever read as a live order book.
+enum DepthFeedState: Equatable {
+    /// No depth subscription targets this symbol. Nothing was ever asked for,
+    /// so nothing is on its way — this is NOT a loading state.
+    case unsubscribed
+    /// Subscribed and genuinely waiting: the first frame has not landed yet.
+    case waiting
+    /// Real-time depth the engine vouched for (Coinbase crypto, IBKR L2).
+    case live
+    /// A frame arrived but the engine did NOT vouch for it as real-time. On the
+    /// keyless equity feed this is one synthetic level per side, derived from a
+    /// delayed top-of-book quote — a stand-in, not an order book.
+    case delayed
+}
+
+/// Everything the depth / tape notices depend on, as plain values: no model, no
+/// view state, no clock. Built once per render by the panes so the selection
+/// below stays a pure function of facts and every combination is testable.
+struct DepthFeedFacts: Equatable {
+    /// `AppModel.isEquity(symbol)`. Equities run the keyless delayed feed (no
+    /// book, no tape); crypto streams a real book and a real tape.
+    var isEquity: Bool
+    /// A depth subscription is targeting this symbol (`depthSymbol != nil`).
+    var isSubscribed: Bool
+    /// A depth frame has landed (the model's `bookDepth` is non-nil).
+    var hasDepth: Bool
+    /// The frame's own `is_live` flag. Meaningless when `hasDepth` is false.
+    var isLive: Bool
+    /// The frame's own `source` label ("cboe delayed L1 (no depth)", …).
+    var source: String
+    /// Drawable levels the frame carried on each side.
+    var bidLevels: Int
+    var askLevels: Int
+    /// The frame's quote stamp, carried into the notice so the view can report
+    /// how old the quote is on its own slow clock.
+    var quoteTsMs: Int64?
+
+    init(
+        isEquity: Bool,
+        isSubscribed: Bool,
+        hasDepth: Bool,
+        isLive: Bool = false,
+        source: String = "",
+        bidLevels: Int = 0,
+        askLevels: Int = 0,
+        quoteTsMs: Int64? = nil
+    ) {
+        self.isEquity = isEquity
+        self.isSubscribed = isSubscribed
+        self.hasDepth = hasDepth
+        self.isLive = isLive
+        self.source = source
+        self.bidLevels = bidLevels
+        self.askLevels = askLevels
+        self.quoteTsMs = quoteTsMs
+    }
+}
+
+/// One honest statement for a pane: an uppercase stamp headline, a
+/// plain-language detail, and — when the truth depends on how stale the data is
+/// — the quote stamp the view ages on its own clock. `isTerminal` marks the
+/// notices where NOTHING further is coming, so the view renders them as a
+/// statement of fact and never as a spinner.
+struct FeedNotice: Equatable {
+    var headline: String
+    var detail: String
+    var quoteTsMs: Int64?
+    var isTerminal: Bool
+
+    init(headline: String, detail: String, quoteTsMs: Int64? = nil, isTerminal: Bool) {
+        self.headline = headline
+        self.detail = detail
+        self.quoteTsMs = quoteTsMs
+        self.isTerminal = isTerminal
+    }
+}
+
+/// What the depth pane renders.
+enum DepthPaneState: Equatable {
+    /// A real book: draw the montage and say nothing extra.
+    case book
+    /// Draw the levels that exist AND state what they actually are underneath —
+    /// the delayed single-level case, which is otherwise indistinguishable from
+    /// a nearly-empty order book.
+    case bookWithNotice(FeedNotice)
+    /// Nothing drawable: the notice IS the pane.
+    case noticeOnly(FeedNotice)
+}
+
+/// What the time & sales pane renders.
+enum TapePaneState: Equatable {
+    /// Prints exist — render the tape.
+    case prints
+    /// A permanent statement: this feed will never produce a tape.
+    case notice(FeedNotice)
+    /// The real-time (crypto) tape's existing quiet state — prints are genuinely
+    /// possible, none have arrived yet.
+    case empty(String)
+}
+
+/// The honesty rules for the Level 2 panes. Pure: given the feed's facts it
+/// returns exactly what may be said, so the cardinal rule (never imply data is
+/// coming when it is not) is unit-tested rather than trusted to a view body.
+///
+/// The equity truth this encodes, from probing the running engine: the keyless
+/// CBOE feed publishes NO order book — one synthetic level per side, refreshed
+/// every couple of minutes, carrying a quote stamped ~15 minutes behind the
+/// clock — and NO time & sales at all. Both arrive only with IB Gateway.
+enum DepthHonesty {
+    /// The feed posture. A landed frame decides it (its own `is_live` flag);
+    /// with no frame, the subscription decides whether waiting is honest.
+    static func state(_ f: DepthFeedFacts) -> DepthFeedState {
+        guard f.hasDepth else { return f.isSubscribed ? .waiting : .unsubscribed }
+        return f.isLive ? .live : .delayed
+    }
+
+    /// What the depth pane may render.
+    static func depthPane(_ f: DepthFeedFacts) -> DepthPaneState {
+        let hasLevels = f.bidLevels > 0 || f.askLevels > 0
+        switch state(f) {
+        case .live:
+            // The working path (crypto / IBKR L2): a real book needs no notice.
+            return hasLevels ? .book : .noticeOnly(Self.emptyLiveBook)
+        case .delayed:
+            let notice = delayedNotice(f)
+            return hasLevels ? .bookWithNotice(notice) : .noticeOnly(notice)
+        case .waiting:
+            return .noticeOnly(Self.waiting)
+        case .unsubscribed:
+            return .noticeOnly(Self.unsubscribed)
+        }
+    }
+
+    /// What the time & sales pane may render. Prints win over every notice, so
+    /// the moment a real tape exists (IB Gateway, or crypto) the pane just shows
+    /// it — the notice can never hide real data.
+    static func tapePane(_ f: DepthFeedFacts, hasPrints: Bool) -> TapePaneState {
+        if hasPrints { return .prints }
+        if f.isEquity { return .notice(Self.noEquityTape) }
+        return .empty(cryptoTapeEmptyText(hasDepth: f.hasDepth))
+    }
+
+    /// The real-time tape's existing quiet text, unchanged: crypto prints DO
+    /// arrive, so "waiting" is the truth there, not a broken promise.
+    static func cryptoTapeEmptyText(hasDepth: Bool) -> String {
+        hasDepth ? "no prints yet" : "waiting for prints…"
+    }
+
+    // MARK: The notices
+
+    /// The delayed stand-in. For an equity this is the whole truth of the free
+    /// feed; the level count and the source come from the frame itself so the
+    /// copy can never overstate what arrived.
+    static func delayedNotice(_ f: DepthFeedFacts) -> FeedNotice {
+        let perSide = max(f.bidLevels, f.askLevels)
+        let source = f.source.isEmpty ? "the delayed feed" : f.source
+        guard f.isEquity else {
+            // A non-live crypto/other book: still not real-time, but the equity
+            // "there is no book" story does not apply.
+            return FeedNotice(
+                headline: "DELAYED BOOK — NOT REAL-TIME",
+                detail: "\(source) is not publishing real-time depth, so these "
+                    + "levels lag the market.",
+                quoteTsMs: f.quoteTsMs,
+                isTerminal: true
+            )
+        }
+        let levels = perSide <= 1
+            ? "a single top-of-book level per side"
+            : "\(perSide) delayed levels per side"
+        return FeedNotice(
+            headline: "DELAYED L1 — NOT AN ORDER BOOK",
+            detail: "\(source) publishes \(levels), refreshed every couple of "
+                + "minutes. There is no equity order book on the free feed — "
+                + "connect IB Gateway for real Level 2 depth.",
+            quoteTsMs: f.quoteTsMs,
+            isTerminal: true
+        )
+    }
+
+    /// Equity time & sales: not "empty yet" — never coming on this feed.
+    static let noEquityTape = FeedNotice(
+        headline: "NO TAPE ON THE DELAYED FEED",
+        detail: "the keyless equity feed carries delayed quotes only — it "
+            + "publishes no time & sales, so no prints will arrive for this "
+            + "symbol. A real tape comes with IB Gateway.",
+        isTerminal: true
+    )
+
+    /// Subscribed, nothing yet — the one state where waiting IS honest.
+    static let waiting = FeedNotice(
+        headline: "WAITING FOR DEPTH",
+        detail: "the subscription is open; no book frame has landed yet.",
+        isTerminal: false
+    )
+
+    /// Nothing was ever asked for. Distinct from waiting: no frame is in flight.
+    static let unsubscribed = FeedNotice(
+        headline: "NO DEPTH SUBSCRIPTION",
+        detail: "nothing is streaming for this symbol, so no book will arrive.",
+        isTerminal: true
+    )
+
+    /// A live feed that answered with an empty book — real, and genuinely empty
+    /// right now, so it may refill.
+    static let emptyLiveBook = FeedNotice(
+        headline: "EMPTY BOOK",
+        detail: "the venue is live but has no resting levels right now.",
+        isTerminal: false
+    )
+
+    // MARK: Quote age
+
+    /// Seconds between a frame's quote stamp and now. nil when the stamp is
+    /// absent / non-positive, or sits in the FUTURE — an age that cannot be
+    /// vouched for is never guessed at.
+    static func quoteAgeSec(tsMs: Int64?, nowMs: Int64) -> Double? {
+        guard let tsMs, tsMs > 0, nowMs >= tsMs else { return nil }
+        return Double(nowMs - tsMs) / 1000
+    }
+
+    /// The age line under a delayed notice. Rounds DOWN through
+    /// `ChartMath.compactAge`, so the figure shown is never younger than the
+    /// quote really is; an unusable stamp says so instead of printing a number.
+    static func quoteAgeLine(tsMs: Int64?, nowMs: Int64) -> String {
+        guard let age = quoteAgeSec(tsMs: tsMs, nowMs: nowMs) else {
+            return "quote time unknown"
+        }
+        return "quote stamped \(ChartMath.compactAge(age)) behind the clock"
     }
 }

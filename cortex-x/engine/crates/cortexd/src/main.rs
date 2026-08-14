@@ -41,6 +41,14 @@ async fn main() -> anyhow::Result<()> {
     // loop points it at the single actively-viewed symbol to bound bandwidth.
     let md = cx_md::MarketData::start(Arc::clone(&bus), Arc::clone(&store), cfg.clone());
 
+    // LIVE equity depth + tape from IB Gateway. Compiled only under `ibkr-live`
+    // (which pulls cx-broker's `ibkr` socket layer); the default paper build
+    // does not contain this path at all. Dropping the handle detaches the feed,
+    // which is correct — it is meant to outlive every reconnect and run for the
+    // life of the process.
+    #[cfg(feature = "ibkr-live")]
+    let _ibkr_md = spawn_ibkr_market_data(&cfg, &bus, &md);
+
     // OMS: paper execution, positions, account. The paper OMS runs in EVERY
     // mode — it is the paper broker's engine and the snapshot/risk view's
     // book. In live mode the IBKR adapter is the order SINK on top of it.
@@ -181,8 +189,12 @@ async fn main() -> anyhow::Result<()> {
             // LEVEL 2 depth subscribe/unsubscribe. The engine streams depth for
             // at most ONE symbol at a time: subscribing a new symbol implicitly
             // unsubscribes the previous, and a stale unsubscribe (for an already-
-            // replaced symbol) is ignored. The class-appropriate connector
-            // (Coinbase live L2 / CBOE delayed L1) responds to the watch update.
+            // replaced symbol) is ignored. Every depth streamer responds to the
+            // same watch update and serves what it legitimately can for that
+            // symbol class: Coinbase live L2 (crypto), IBKR live L2 + tape
+            // (equities, `ibkr-live`), CBOE delayed L1 (equities, and only
+            // while no live ladder owns the symbol — see
+            // `spawn_ibkr_market_data`).
             Command::SubscribeDepth { .. } | Command::UnsubscribeDepth { .. } => {
                 active_depth = next_active_depth(active_depth.take(), &cmd);
                 md.set_active_depth(active_depth.clone());
@@ -832,6 +844,54 @@ fn next_active_depth(current: Option<String>, cmd: &Command) -> Option<String> {
         }
         _ => current,
     }
+}
+
+/// Wire the LIVE IBKR equity market-data feed (cx-broker) to the market-data
+/// squadron's publishers (cx-md). This function is the whole reason the wiring
+/// lives in cortexd: cx-broker must not depend on cx-md's connectors, so it
+/// emits through caller-supplied sinks, and cortexd — the one crate that
+/// depends on both — closes the seam. `cx_md::publish_ibkr_depth` /
+/// `publish_ibkr_tape` are the ONLY sanctioned emitters of `is_live=true`
+/// equity depth/tape; this is their only caller.
+///
+/// The feed follows the SAME actively-viewed depth symbol the operator's
+/// Subscribe/UnsubscribeDepth commands resolve to via [`next_active_depth`] —
+/// a second receiver on the one `watch`, never a second signal. It opens its
+/// OWN Gateway session (order client id + 1) so a depth stall can never
+/// perturb order routing.
+///
+/// PRECEDENCE: while this feed is publishing live depth, cx-md's delayed CBOE
+/// stand-in yields the ladder for that symbol (enforced inside
+/// `publish_ibkr_depth`, documented at cx-md/src/equity.rs). Live wins whenever
+/// it is available; when it stops — no L2 entitlement, Gateway closed, session
+/// lost — the honest delayed book comes back on its own.
+///
+/// Returns `None` in paper mode: nothing here should reach for a Gateway the
+/// operator never asked us to connect to. NOTE the posture is read at startup,
+/// so a `mode="ibkr"` hot-swap through Settings does not retro-start the feed
+/// (a restart does) — the order path is unaffected either way.
+#[cfg(feature = "ibkr-live")]
+fn spawn_ibkr_market_data(
+    cfg: &Config,
+    bus: &Arc<Bus>,
+    md: &cx_md::MarketData,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if cfg.broker.mode != "ibkr" {
+        return None;
+    }
+    let bus_d = Arc::clone(bus);
+    let bus_t = Arc::clone(bus);
+    let sink = cx_broker::MarketDataSink::new(
+        move |d| cx_md::publish_ibkr_depth(&bus_d, d),
+        move |t| cx_md::publish_ibkr_tape(&bus_t, t),
+    );
+    tracing::info!("ibkr live market data enabled (depth + tape)");
+    Some(cx_broker::spawn_market_data(
+        Arc::clone(bus),
+        cx_broker::MarketDataConfig::from_broker(&cfg.broker),
+        md.subscribe_active_depth(),
+        sink,
+    ))
 }
 
 /// The configured EQUITY (bare-ticker) symbols — the only underlyings the

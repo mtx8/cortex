@@ -52,7 +52,18 @@ use cx_core::types::Severity;
 use cx_oms::Oms;
 
 pub use guard::{eval_live_order, LiveGuard, LiveLimits, LiveVerdict};
+pub use ibkr::book::{
+    ApplyOutcome, DepthBook, DepthUpdate, OP_DELETE, OP_INSERT, OP_UPDATE, SIDE_ASK, SIDE_BID,
+};
 pub use ibkr::IbkrBroker;
+// The LIVE equity depth/tape feed. Feature-gated exactly like the socket layer:
+// the default paper build has no market-data reach at all. It publishes through
+// caller-supplied sinks (cortexd wires them to cx-md's `publish_ibkr_*`), which
+// is how cx-broker emits market data WITHOUT depending on the connectors.
+#[cfg(feature = "ibkr")]
+pub use ibkr::marketdata::{
+    run_market_data, spawn_market_data, MarketDataConfig, MarketDataSink, DEPTH_ROWS,
+};
 pub use paper::PaperBroker;
 pub use translate::{translate, IbkrContract, IbkrOrder};
 

@@ -29,12 +29,13 @@ mod synthetic;
 /// can forward `updateMktDepthL2` callbacks into it.
 pub use l2book::L2Book;
 
-/// The IBKR market-data integration point: once the IBKR adapter (cx-broker,
-/// `ibkr` feature) is connected with the operator's market-data subscriptions,
-/// it publishes REAL equity LEVEL 1/2 depth (`reqMktDepth`) and trade prints
-/// (`reqMktData`) through these — the only sanctioned source of `is_live=true`
-/// equity depth/tape. The CBOE poller never emits live equity depth. See
-/// [`equity`] for the full note.
+/// The IBKR market-data integration point: with the `ibkr-live` daemon feature
+/// and the operator's own market-data subscriptions, cx-broker's live equity
+/// feed publishes REAL LEVEL 2 depth (`reqMktDepth`) and trade prints
+/// (`reqTickByTick`) through these — the only sanctioned source of
+/// `is_live=true` equity depth/tape. The CBOE poller never emits live equity
+/// depth, and yields the actively-viewed ladder while a live one is flowing.
+/// See [`equity`] for the full note and the precedence rule.
 pub use equity::{publish_ibkr_depth, publish_ibkr_tape};
 
 use std::sync::Arc;
@@ -134,6 +135,18 @@ impl MarketData {
         // `send` fails only if every receiver is gone (squadron torn down);
         // then there is nothing to stream and dropping the request is correct.
         let _ = self.depth_tx.send(symbol);
+    }
+
+    /// Another receiver on the SAME actively-viewed-depth signal the internal
+    /// connectors listen on. This exists so an OUT-OF-CRATE depth streamer —
+    /// today the IBKR live equity feed in cx-broker, wired by cortexd — follows
+    /// the one active symbol without a second subscription concept to keep in
+    /// sync. `set_active_depth` stays the only sender.
+    ///
+    /// Values sent before this call count as already seen, so a fresh receiver
+    /// starts from the current symbol and waits for the next change.
+    pub fn subscribe_active_depth(&self) -> watch::Receiver<Option<String>> {
+        self.depth_tx.subscribe()
     }
 
     /// Tear the squadron down (aborts the supervisor task).

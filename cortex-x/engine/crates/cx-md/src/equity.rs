@@ -18,12 +18,19 @@
 //! viewed equity symbol this feed therefore publishes a MINIMAL, honest
 //! [`BookDepth`] with `is_live = false` and `source = "cboe delayed L1 (no
 //! depth)"` — a single delayed level per side so the UI shows something true
-//! rather than pretending crypto-style live L2. Real equity L1/L2 (and a real
-//! tape) arrives via the IBKR adapter (`reqMktData` / `reqMktDepth`) once the
-//! operator connects IB Gateway with their market-data subscriptions; see the
-//! clearly-marked integration point [`publish_ibkr_depth`] / [`publish_ibkr_tape`]
-//! at the bottom of this file. This poller NEVER fabricates real-time equity
-//! depth or aggressor-tagged prints.
+//! rather than pretending crypto-style live L2. Real equity L2 (and a real
+//! tape) arrives via IBKR (`reqMktDepth` / `reqTickByTick`) once the operator
+//! connects IB Gateway with their market-data subscriptions, through the
+//! integration point [`publish_ibkr_depth`] / [`publish_ibkr_tape`] at the
+//! bottom of this file. This poller NEVER fabricates real-time equity depth or
+//! aggressor-tagged prints.
+//!
+//! PRECEDENCE, because both publishers target the same actively-viewed symbol:
+//! LIVE WINS. A live book claims the ladder for `LIVE_DEPTH_TTL_MS` and the
+//! delayed stand-in below stays quiet for that symbol; when the live feed stops
+//! (no entitlement, Gateway closed, session lost) the claim lapses and the
+//! delayed book resumes. Unguarded, the operator would watch a real 20-row
+//! ladder blink to one delayed level every poll.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -373,7 +380,13 @@ pub(crate) async fn run(
                     // Honest DELAYED L1 "depth" for the actively-viewed symbol
                     // only (bandwidth bound): a single delayed level per side,
                     // is_live=false. Never fabricated as live L2.
-                    if depth_rx.borrow().as_deref() == Some(symbol.as_str()) {
+                    //
+                    // ...and only while no LIVE IBKR ladder owns this symbol.
+                    // Live depth wins: publishing here underneath a real 20-row
+                    // book would replace it with one delayed level every poll.
+                    if depth_rx.borrow().as_deref() == Some(symbol.as_str())
+                        && !live_depth_owns(symbol, ts)
+                    {
                         bus.publish(EngineEvent::Depth(equity_depth(symbol, &q)));
                     }
                 }
@@ -403,8 +416,17 @@ pub(crate) async fn run(
                 }
                 let active = depth_rx.borrow_and_update().clone();
                 if let Some(sym) = active {
+                    // Same precedence rule as the poll path. On a symbol SWITCH
+                    // nothing owns the new symbol yet, so the delayed book still
+                    // seeds the ladder instantly (labelled is_live=false) and
+                    // the live IBKR ladder — which is opening off this same
+                    // watch update — takes it over a beat later. A truthful
+                    // stand-in beats an empty ladder; a re-assert of a symbol
+                    // already served live stays quiet.
                     if let Some(q) = last_seen.get(&sym) {
-                        bus.publish(EngineEvent::Depth(equity_depth(&sym, q)));
+                        if !live_depth_owns(&sym, now_ms()) {
+                            bus.publish(EngineEvent::Depth(equity_depth(&sym, q)));
+                        }
                     }
                 }
             }
@@ -443,7 +465,7 @@ pub(crate) fn equity_depth(symbol: &str, q: &EquityQuote) -> BookDepth {
 }
 
 // ---------------------------------------------------------------------------
-// IBKR INTEGRATION POINT (not yet wired).
+// IBKR INTEGRATION POINT.
 //
 // Real equity LEVEL 1 / LEVEL 2 depth and a real trade tape become available
 // once the operator connects IB Gateway / TWS and the IBKR adapter (cx-broker,
@@ -452,20 +474,86 @@ pub(crate) fn equity_depth(symbol: &str, q: &EquityQuote) -> BookDepth {
 //   - `reqMktDepth` -> the aggregated LEVEL 2 order book (per-venue depth),
 // both subject to the user's own IBKR market-data subscriptions.
 //
-// When that path is built, the adapter constructs honest `BookDepth` /
-// `TapePrint` values (labelling `is_live`/`source` per the ACTUAL subscription
-// — live vs delayed vs frozen) and publishes them through these two functions.
-// They are the ONLY sanctioned way to emit real equity depth/tape; the CBOE
-// poller above never emits `is_live = true`. Keeping them here (not in
-// cx-broker) preserves the bus-only rule: cx-broker publishes market data via
-// cx-md's vocabulary without depending on the connectors.
+// The adapter constructs honest `BookDepth` / `TapePrint` values (labelling
+// `is_live`/`source` per the ACTUAL subscription — live vs delayed vs frozen)
+// and publishes them through these two functions; cortexd (which depends on
+// both crates) closes the seam. They are the ONLY sanctioned way to emit real
+// equity depth/tape; the CBOE poller above never emits `is_live = true`.
+// Keeping them here (not in cx-broker) preserves the bus-only rule: cx-broker
+// publishes market data via cx-md's vocabulary without depending on the
+// connectors.
 // ---------------------------------------------------------------------------
+
+/// How long a LIVE depth publish keeps the actively-viewed ladder, in ms.
+///
+/// Deliberately longer than the CBOE `POLL_SECS` cycle: while IBKR depth is
+/// flowing, the delayed poller must never get a turn between two live edits,
+/// or the operator would watch a real 20-row ladder blink to a one-level
+/// delayed stand-in every 20 seconds. Bounded (rather than a latch) so a
+/// session that dies — entitlement pulled, Gateway closed, socket lost — hands
+/// the ladder BACK to the honest delayed book within one TTL instead of
+/// leaving the equity book permanently dark.
+const LIVE_DEPTH_TTL_MS: i64 = 30_000;
+
+/// Which symbol currently has a live L2 ladder, and when it was last proven.
+///
+/// PRECEDENCE between the two equity depth publishers lives here because both
+/// of them live in this file. There is exactly one actively-viewed depth symbol
+/// per process (cortexd's `next_active_depth`), so one slot is the whole state.
+/// A `Mutex` over a tuple, never held across an await — the critical section is
+/// a compare and two field writes.
+static LIVE_EQUITY_DEPTH: std::sync::Mutex<Option<(String, i64)>> = std::sync::Mutex::new(None);
+
+/// Take the mutex without ever panicking. Release builds are `panic = "abort"`,
+/// so a poisoned lock (a panic in another thread while holding it) must not be
+/// allowed to take the trading process down over a depth-precedence hint — the
+/// data behind it is a symbol and a timestamp, and stale is recoverable.
+fn live_depth_slot() -> std::sync::MutexGuard<'static, Option<(String, i64)>> {
+    LIVE_EQUITY_DEPTH
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record that genuine live depth for `symbol` was just published.
+fn claim_live_depth(symbol: &str, ts_ms: i64) {
+    let mut slot = live_depth_slot();
+    match slot.as_mut() {
+        // Same ladder: refresh the proof in place, no allocation on the hot
+        // path (this runs on every published live book, ~10/s).
+        Some((s, ts)) if s.eq_ignore_ascii_case(symbol) => *ts = ts_ms,
+        _ => *slot = Some((symbol.to_string(), ts_ms)),
+    }
+}
+
+/// Whether a live L2 ladder currently owns `symbol` — i.e. whether the delayed
+/// stand-in must stay quiet. False for every other symbol and once the claim
+/// has aged past `LIVE_DEPTH_TTL_MS`.
+fn live_depth_owns(symbol: &str, now: i64) -> bool {
+    match live_depth_slot().as_ref() {
+        Some((s, ts)) => {
+            s.eq_ignore_ascii_case(symbol.trim()) && now.saturating_sub(*ts) <= LIVE_DEPTH_TTL_MS
+        }
+        None => false,
+    }
+}
 
 /// Publish a LEVEL 2 (or L1) equity depth book obtained from the IBKR adapter.
 /// The caller MUST label `is_live` / `source` truthfully for the subscription
 /// that produced it (live `reqMktDepth`, delayed L1, or frozen). No-op-safe:
 /// with no subscribers the event is simply dropped by the bus.
+///
+/// PRECEDENCE: a book labelled `is_live` also CLAIMS the actively-viewed ladder
+/// for `LIVE_DEPTH_TTL_MS`, which silences this file's delayed CBOE stand-in
+/// for that symbol (see the poller above). Live depth wins whenever available —
+/// two publishers on one symbol would otherwise fight and the operator would
+/// see a real ladder flicker to a one-level delayed book. The claim is made
+/// HERE, at the single sanctioned live emitter, so no future caller can wire
+/// the feed up and forget the guard. A book NOT labelled live claims nothing:
+/// only real live depth may displace the honest delayed one.
 pub fn publish_ibkr_depth(bus: &Bus, depth: BookDepth) {
+    if depth.is_live {
+        claim_live_depth(&depth.symbol, now_ms());
+    }
     bus.publish(EngineEvent::Depth(depth));
 }
 
@@ -489,6 +577,71 @@ mod tests {
         assert_eq!(q.bid_size, 200.0);
         assert!(parse_quote("{}").is_none());
         assert!(parse_quote(r#"{"data":{"current_price":"NaN"}}"#).is_none());
+    }
+
+    /// The depth PRECEDENCE contract, end to end. One test rather than five
+    /// because the claim slot is process-wide (one active ladder per engine)
+    /// and cargo runs `#[test]`s in parallel — splitting it would let the cases
+    /// race each other.
+    #[test]
+    fn live_ibkr_depth_owns_the_ladder_and_the_claim_expires() {
+        let bus = Bus::new(64);
+        let now = now_ms();
+        let book = |symbol: &str, is_live: bool| BookDepth {
+            symbol: symbol.into(),
+            bids: vec![BookLevel {
+                px: 10.0,
+                sz: 1.0,
+                count: 0,
+                mm: None,
+            }],
+            asks: vec![BookLevel {
+                px: 10.1,
+                sz: 1.0,
+                count: 0,
+                mm: None,
+            }],
+            depth: 20,
+            source: "test".into(),
+            is_live,
+            ts_ms: now,
+        };
+
+        // A DELAYED book claims nothing: the CBOE stand-in must never lock
+        // itself in and shut out the real ladder.
+        publish_ibkr_depth(&bus, book("DLYD", false));
+        assert!(!live_depth_owns("DLYD", now_ms()));
+
+        // A LIVE book takes the ladder for its own symbol only.
+        publish_ibkr_depth(&bus, book("AAPL", true));
+        let claimed = now_ms();
+        assert!(
+            live_depth_owns("AAPL", claimed),
+            "live depth must own its symbol"
+        );
+        assert!(
+            live_depth_owns(" aapl ", claimed),
+            "match is trimmed + case-insensitive"
+        );
+        assert!(
+            !live_depth_owns("MSFT", claimed),
+            "a claim is per-symbol, not global"
+        );
+
+        // The claim is a bounded lease, not a latch: a dead live feed hands the
+        // ladder back to the honest delayed book instead of leaving it dark.
+        assert!(live_depth_owns("AAPL", claimed + LIVE_DEPTH_TTL_MS));
+        assert!(!live_depth_owns("AAPL", claimed + LIVE_DEPTH_TTL_MS + 1));
+
+        // Switching symbols moves the lease; the old one is released at once,
+        // so the delayed stand-in resumes for a symbol nobody streams live.
+        publish_ibkr_depth(&bus, book("MSFT", true));
+        let moved = now_ms();
+        assert!(live_depth_owns("MSFT", moved));
+        assert!(!live_depth_owns("AAPL", moved));
+
+        // Leave the slot clean for anything else in this binary.
+        *live_depth_slot() = None;
     }
 
     #[test]

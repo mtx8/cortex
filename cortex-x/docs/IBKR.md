@@ -226,7 +226,53 @@ Behaviour is **fail-safe** and matches startup:
 
 ---
 
-## 7. Known v1 scope / gaps (be honest)
+## 7. LIVE market data — equity L2 depth + tape
+
+With `--features ibkr-live` **and** `mode = "ibkr"`, cortexd starts a market-data
+feed **beside** the order adapter that streams the real book and the real tape
+for the equity ladder you are looking at:
+
+- `reqMktDepth` → the LEVEL 2 ladder (20 rows/side), published as
+  `BookDepth { is_live: true, source: "ibkr reqMktDepth L2 (<venue>)" }`.
+- `reqTickByTick(AllLast)` → Time & Sales prints, published as `TapePrint`.
+
+Both are subject to **your own IBKR market-data subscriptions**. Without an L2
+or tick-by-tick entitlement the corresponding half simply reports **Down** on the
+feed status (`ibkr-depth` / `ibkr-tape`) with the TWS message attached, and
+retries — nothing crashes and nothing is faked.
+
+**Isolation.** The feed opens its **own** Gateway session on
+`ibkr_client_id + 1`. Market data is high-volume and allowed to fail all day;
+order routing is not. A depth stall, a resubscribe storm or a market-data
+reconnect can never perturb the order socket, and the feed can neither place,
+cancel nor observe an order.
+
+**One symbol at a time.** Depth follows the single actively-viewed symbol the
+app subscribes to (`SubscribeDepth`), the same signal the Coinbase and CBOE
+connectors already follow. Idle bandwidth is zero; switching symbols cancels the
+old subscriptions before opening the new ones.
+
+**Precedence — live wins.** Equities have two possible depth publishers: this
+live IBKR ladder and the ~15-minute-**delayed** CBOE single-level stand-in
+(`is_live: false`, `source: "cboe delayed L1 (no depth)"`). While live depth is
+flowing for a symbol, the delayed stand-in **stays quiet** for that symbol —
+otherwise the real ladder would blink to one delayed level on every 20-second
+poll. The claim is a 30-second lease taken by the live publisher itself, so when
+the live feed stops (entitlement pulled, Gateway closed, session lost) the honest
+delayed book **comes back on its own** rather than leaving the ladder dark. The
+provenance label and the LIVE badge always tell you which one you are reading.
+
+> The feed's posture is decided at **startup** from `[broker].mode`. Switching to
+> `mode = "ibkr"` at runtime through Settings hot-swaps the **order** broker but
+> does not retro-start the market-data feed — restart the daemon for that.
+
+Crypto is unaffected: `BTC-USD` depth still comes live from Coinbase, and the
+IBKR feed ignores non-equity symbols rather than duplicating a book under a
+second provenance label.
+
+---
+
+## 8. Known v1 scope / gaps (be honest)
 
 - **US equities only.** The live adapter routes `STK` orders (SMART or a direct
   venue). Crypto symbols (e.g. `BTC-USD`) are **not** routed live in v1 — they

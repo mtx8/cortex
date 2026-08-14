@@ -630,10 +630,8 @@ struct ScannerView: View {
             }
             searchField
             detailsToggle
-            // Column add/remove/reorder — details view only, and here in the
-            // fixed pane header so it is always visible (never scrolled off the
-            // right edge of the grid like the old in-header affordance).
-            if showDetails { columnsMenu }
+            // Column configuration is NOT here — it lives in the grid's header
+            // row, next to the last column header (see `columnsMenu`).
             aiToggle
             alertsToggle
         }
@@ -1308,10 +1306,13 @@ struct ScannerView: View {
             ForEach(columnLayout.shown, id: \.self) { col in
                 headerCell(col)
             }
+            // Sits directly after the LAST column header, on the table it acts
+            // on. `ScanCol.shownWidth` already reserves this slot (its trailing
+            // `+ 24`), so the header rule still spans the full row width and the
+            // button is never clipped.
+            columnsMenu
             // Reserve the trailing slot the row's actions menu occupies so the
-            // header rule spans the full row width. The add/remove/reorder menu
-            // now lives in the always-visible pane header (see columnsMenu),
-            // never off-screen at the right edge of the horizontal scroll.
+            // header rule lines up with the rows beneath it.
             Spacer(minLength: ScanCol.trailing)
         }
         .padding(.horizontal, 12)
@@ -1350,10 +1351,11 @@ struct ScannerView: View {
         .animation(DeckMotion.ease(), value: active)
     }
 
-    /// Add / remove / reorder columns. Lives in the always-visible pane header
-    /// (only in details view) so it is never scrolled off the right edge. Each
-    /// shown column reorders via move left/right (reliable — no drag gesture to
-    /// fight the sort tap) and can be hidden; hidden columns add from a submenu.
+    /// Add / remove / reorder columns. Sits in the grid's header row, directly
+    /// after the last column header, so the control is on the table it acts on.
+    /// Each shown column reorders via move left/right (reliable — no drag
+    /// gesture to fight the sort tap) and can be hidden; hidden columns add
+    /// from a submenu.
     private var columnsMenu: some View {
         Menu {
             ForEach(columnLayout.shown, id: \.self) { col in

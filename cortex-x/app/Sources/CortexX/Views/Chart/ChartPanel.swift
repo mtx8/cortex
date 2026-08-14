@@ -163,6 +163,10 @@ struct ChartPanel: View {
             // stay laid out across the 12-40 Hz tick storm.
             LivePriceText(symbol: symbol)
 
+            // How old the newest print actually is. Same isolation rationale as
+            // LivePriceText: it reads market data, the pickers beside it do not.
+            PrintAgeChip(symbol: symbol)
+
             if let changePct {
                 Text(String(format: "%+.2f%%", changePct))
                     .font(.system(size: 12, weight: .medium))
@@ -408,6 +412,84 @@ private struct LivePriceText: View {
             guard token == flashToken else { return }
             flashDirection = 0
         }
+    }
+}
+
+// MARK: - Print age (the honest answer to "why isn't this moving?")
+
+/// Age of the newest print for this symbol.
+///
+/// Equities run on the keyless CBOE **delayed** snapshot: the upstream quote
+/// itself only refreshes every few minutes and carries a trade time ~15 minutes
+/// behind the wall clock. Bars are stamped with that true trade time (stamping
+/// them `now` would shift every live bar 15 minutes off the backfill grid), so a
+/// correct equity chart legitimately shows its newest candle a quarter of an hour
+/// in the past and repaints only a few times an hour.
+///
+/// Without this chip that is indistinguishable from a frozen app — which is
+/// exactly how it was reported. Crypto streams in real time from Coinbase, so it
+/// stays under the threshold and shows nothing.
+private struct PrintAgeChip: View {
+    @Environment(AppModel.self) private var model
+    let symbol: String
+
+    /// Below this, "age" is just normal jitter and not worth the ink.
+    private static let noticeableSec: Double = 90
+
+    /// Re-evaluated on a slow timer: the age grows on its own between prints, so
+    /// a purely event-driven chip would sit at "2m" while the feed went quiet.
+    @State private var now = Date()
+    private let tick = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        Group {
+            if let age = ageSec, age >= Self.noticeableSec {
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(Theme.ember)
+                        .frame(width: 4, height: 4)
+                    Text("DELAYED")
+                        .font(.system(size: 8, weight: .semibold))
+                        .tracking(0.9)
+                        .foregroundStyle(Theme.bone)
+                    Text(ChartMath.compactAge(age))
+                        .font(.system(size: 10))
+                        .monospacedDigit()
+                        .foregroundStyle(Theme.dim)
+                }
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(Theme.ink)
+                .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.chipRadius)
+                        .strokeBorder(Theme.line, lineWidth: Theme.hairline)
+                )
+                .help(helpText(age))
+            }
+        }
+        .onReceive(tick) { now = $0 }
+    }
+
+    /// Seconds since the newest print. nil when nothing has ever arrived — the
+    /// chart's own empty state owns that case.
+    private var ageSec: Double? {
+        guard let ts = model.lastTick[symbol]?.ts_ms else { return nil }
+        return max(0, now.timeIntervalSince1970 - Double(ts) / 1000)
+    }
+
+    private func helpText(_ age: Double) -> String {
+        let source = model.feeds.values
+            .first { $0.health != .live }
+            .map { "\($0.feed): \($0.detail)" }
+            ?? "delayed feed"
+        return """
+        last print \(ChartMath.compactAge(age)) ago — \(source)
+
+        This is the data's real age, not a stalled chart. Equity quotes here are \
+        ~15 minutes delayed and refresh only every few minutes; connect IB Gateway \
+        for real-time equity data.
+        """
     }
 }
 
