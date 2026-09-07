@@ -506,8 +506,12 @@ enum ChartMath {
     /// Vertical centre for the countdown chip: `offset` below the last-price
     /// tag, flipped to the same distance ABOVE it when the tag sits too close to
     /// the bottom of the price pane for the chip to fit under it.
+    ///
+    /// Both boxes are 14pt tall, so the default 17 leaves a 3pt gap between them
+    /// (14 would make their edges touch, reading as one smeared block rather than
+    /// a stacked pair).
     static func countdownCenterY(
-        priceTagY: Double, paneMaxY: Double, offset: Double = 14, halfHeight: Double = 7
+        priceTagY: Double, paneMaxY: Double, offset: Double = 17, halfHeight: Double = 7
     ) -> Double {
         let below = priceTagY + offset
         return below + halfHeight <= paneMaxY ? below : priceTagY - offset

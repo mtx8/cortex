@@ -9,6 +9,8 @@
 // current one: equity quotes arrive ~15 minutes delayed, so that bar has usually
 // already closed, and a countdown there would be meaningless or negative.
 
+import AppKit
+import SwiftUI
 import XCTest
 @testable import CortexX
 
@@ -260,15 +262,15 @@ final class BarCountdownTests: XCTestCase {
     // MARK: - Placement under the price tag
 
     func testCountdownSitsBelowThePriceTag() {
-        XCTAssertEqual(ChartMath.countdownCenterY(priceTagY: 100, paneMaxY: 400), 114)
+        XCTAssertEqual(ChartMath.countdownCenterY(priceTagY: 100, paneMaxY: 400), 117)
         // Exactly enough room below: stays below.
-        XCTAssertEqual(ChartMath.countdownCenterY(priceTagY: 379, paneMaxY: 400), 393)
+        XCTAssertEqual(ChartMath.countdownCenterY(priceTagY: 376, paneMaxY: 400), 393)
     }
 
     func testCountdownFlipsAboveTheTagAtThePaneFloor() {
         // No room under the tag — the chip flips above it rather than spilling
         // into the volume pane.
-        XCTAssertEqual(ChartMath.countdownCenterY(priceTagY: 390, paneMaxY: 400), 376)
+        XCTAssertEqual(ChartMath.countdownCenterY(priceTagY: 390, paneMaxY: 400), 373)
     }
 }
 
@@ -409,5 +411,85 @@ extension BarCountdownTests {
                 barOpenMs: now + 40 * minute, barSpanMs: minute, nowMs: now
             )
         )
+    }
+}
+
+// MARK: - The countdown box matches the price box
+//
+// The two are a stacked PAIR in the price axis. They shared no geometry
+// originally — different corner radius, padding and font weight — so they read
+// as two unrelated chips. These pin the shared constants so a restyle of one
+// cannot silently drift from the other.
+
+extension BarCountdownTests {
+    func testTagGeometryIsShared() {
+        // drawTag's own constants, now named on ChartFrame so both boxes use them.
+        XCTAssertEqual(PriceTagGeometry.height, 14)
+        XCTAssertEqual(PriceTagGeometry.cornerRadius, 3)
+    }
+
+    func testTagWidthTracksTheTextAndKeepsDrawTagsPadding() {
+        // drawTag lays out `textWidth + 8` (4pt each side).
+        let short = PriceTagGeometry.width(for: "00:00")
+        let long = PriceTagGeometry.width(for: "305.68 EXT")
+        XCTAssertGreaterThan(long, short, "a wider price makes a wider box")
+        // Monospaced: 10 characters must be exactly twice the advance of 5, once
+        // the constant padding is removed from both.
+        let five = PriceTagGeometry.width(for: "00000") - 8
+        let ten = PriceTagGeometry.width(for: "0000000000") - 8
+        XCTAssertEqual(ten, five * 2, accuracy: 1.0, "monospaced advance must be linear")
+        XCTAssertGreaterThan(short, 8, "padding alone is not a box")
+    }
+
+    func testCountdownClearsThePriceTagWithoutTouchingIt() {
+        // Both boxes are tagHeight tall. Stacked, their edges must not meet:
+        // touching reads as one smeared block rather than a pair.
+        let tagY = 100.0
+        let centre = ChartMath.countdownCenterY(priceTagY: tagY, paneMaxY: 400)
+        let half = PriceTagGeometry.height / 2
+        let gap = (centre - Double(half)) - (tagY + Double(half))
+        XCTAssertGreaterThan(gap, 0, "the boxes must not touch")
+        XCTAssertLessThanOrEqual(gap, 6, "…but they must still read as a pair")
+    }
+}
+
+// MARK: - The neon is ORANGE, not amber
+//
+// The countdown first shipped in `emberHi`, which reads YELLOW on screen: the
+// whole ember family sits at hue 31-34 deg (amber-gold), and `emberHi` is 34 deg
+// at 59% lightness — one step from `warn` at 42 deg. Bloom pushes a lit amber
+// further toward yellow still. `emberNeon` exists to be unmistakably orange, and
+// this pins that rather than trusting the token's name.
+
+extension BarCountdownTests {
+    /// Hue in degrees, 0 = red, 30 = orange, 60 = yellow.
+    private func hue(_ color: Color) -> Double {
+        let ns = NSColor(color).usingColorSpace(.sRGB)!
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        ns.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        return Double(h) * 360
+    }
+
+    private func saturation(_ color: Color) -> Double {
+        let ns = NSColor(color).usingColorSpace(.sRGB)!
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        ns.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        return Double(s)
+    }
+
+    func testNeonIsOrangeNotAmberOrYellow() {
+        let h = hue(Theme.emberNeon)
+        XCTAssertGreaterThanOrEqual(h, 18, "below this it turns red")
+        XCTAssertLessThanOrEqual(h, 28, "above this it drifts to amber and reads yellow when lit")
+        XCTAssertGreaterThan(saturation(Theme.emberNeon), 0.9, "a washed-out orange reads brown")
+    }
+
+    func testNeonIsClearlySeparatedFromTheAmberAccentAndTheWarnColour() {
+        // If these converge, a glowing countdown becomes indistinguishable from a
+        // warning — the reason `warn` is a different colour in the first place.
+        XCTAssertGreaterThan(hue(Theme.emberHi) - hue(Theme.emberNeon), 6,
+                             "neon must be visibly more orange than the amber accent")
+        XCTAssertGreaterThan(hue(Theme.warn) - hue(Theme.emberNeon), 12,
+                             "neon must never be confusable with the warning colour")
     }
 }

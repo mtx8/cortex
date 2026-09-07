@@ -252,7 +252,8 @@ struct CandleChart: View {
         if let tag = frame.lastPriceTagCenter, let last = bars.last {
             BarCountdownChip(
                 symbol: symbol, interval: interval, weekly: weekly,
-                barOpenMs: last.ts_open_ms, barSpanMs: barSpanMs
+                barOpenMs: last.ts_open_ms, barSpanMs: barSpanMs,
+                tagWidth: frame.lastPriceTagWidth ?? PriceTagGeometry.width(for: "00:00")
             )
                 .position(
                     x: tag.x,
@@ -420,6 +421,10 @@ private struct BarCountdownChip: View {
     let weekly: Bool
     let barOpenMs: Int64
     let barSpanMs: Int64
+    /// The live-price tag's exact width. The countdown is the SAME box as the
+    /// tag above it — matched width, height and corner radius — so the two read
+    /// as one stacked pair instead of two unrelated chips.
+    let tagWidth: CGFloat
 
     @State private var now = Date()
 
@@ -441,16 +446,36 @@ private struct BarCountdownChip: View {
                 nowMs: Int64((now.timeIntervalSince1970 * 1000).rounded())
             ) {
                 Text(text)
-                    // Deliberately quiet: the price tag above is the headline,
-                    // this is TradingView's secondary line.
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(Theme.dim)
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1)
-                    // Canvas ink, so the price-axis label it covers cannot bleed
-                    // through. No border: the tag above owns the emphasis.
+                    // Same font as the price tag (`drawTag`): 9pt MEDIUM
+                    // monospaced. Semibold read as part of the glow — heavier
+                    // strokes bloom more — so matching the tag's weight is itself
+                    // part of calming the digits down.
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    // The GLOW LIVES ON THE BOX, NOT THE DIGITS. Shadowing the
+                    // text smeared 9pt glyphs into each other and made the
+                    // numbers hard to read at a glance — which is the one thing a
+                    // countdown has to be. The digits are flat; the neon is the
+                    // ring and halo around them.
+                    //
+                    // `emberNeon`, not `ember`: the ember family is amber
+                    // (hue 31-34 deg) and blooms YELLOW when it is lit.
+                    .foregroundStyle(Theme.emberNeon)
+                    .frame(
+                        width: tagWidth,
+                        height: PriceTagGeometry.height
+                    )
+                    // Ink ground so the price-axis label beneath cannot bleed
+                    // through, and so the halo reads against something flat.
                     .background(Theme.ink)
-                    .clipShape(RoundedRectangle(cornerRadius: Theme.chipRadius))
+                    .clipShape(RoundedRectangle(cornerRadius: PriceTagGeometry.cornerRadius))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: PriceTagGeometry.cornerRadius)
+                            .strokeBorder(Theme.emberNeon, lineWidth: 1)
+                    )
+                    // One soft halo on the BOX — the neon, kept off the text.
+                    // A DELIBERATE single-element exception to docs/DESIGN.md:5
+                    // ("no neon"); delete this line to revert it exactly.
+                    .shadow(color: Theme.emberNeon.opacity(0.6), radius: 4)
             }
         }
         .onReceive(Self.tick) { now = $0 }
@@ -753,6 +778,35 @@ private struct ThoughtChip: View {
 }
 
 // MARK: - Frame (per-draw precomputed geometry + renderer)
+
+/// Geometry of the right-axis price tag — a CONTRACT between the two renderers
+/// that draw boxes there: the Canvas `drawTag` and the SwiftUI bar-close
+/// countdown stacked beneath it. They are meant to be the same box, and they
+/// originally were not (different corner radius, padding and font weight), which
+/// read as two unrelated chips.
+///
+/// Internal rather than file-private so the sizing can actually be tested; the
+/// numbers are small but they are the whole reason the pair looks like a pair.
+enum PriceTagGeometry {
+    static let height: CGFloat = 14
+    static let cornerRadius: CGFloat = 3
+    /// Horizontal padding, per side.
+    static let hPadding: CGFloat = 4
+    /// The tag font, shared by both renderers.
+    static let fontSize: CGFloat = 9
+
+    /// Width `drawTag` produces for `text`.
+    ///
+    /// drawTag sizes itself by resolving the text in a `GraphicsContext`, which
+    /// exists only mid-draw — so the SwiftUI side cannot ask it. The font is
+    /// MONOSPACED, so the same width is reproducible from the glyph advance
+    /// measured with the identical font, plus the same padding.
+    static func width(for text: String) -> CGFloat {
+        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .medium)
+        let measured = (text as NSString).size(withAttributes: [.font: font]).width
+        return measured.rounded(.up) + hPadding * 2
+    }
+}
 
 private struct ChartFrame {
     // Inputs
@@ -1568,6 +1622,16 @@ private struct ChartFrame {
         bars.last(where: { !ChartMath.isExtendedHours($0.ts_open_ms) })?.close
     }
 
+    /// The last-price tag's width, for the countdown to match. nil exactly when
+    /// no tag is drawn.
+    var lastPriceTagWidth: CGFloat? {
+        guard let last = bars.last, lastPriceTagCenter != nil else { return nil }
+        let text = inExtendedHours
+            ? ChartMath.formatPrice(last.close) + " EXT"
+            : ChartMath.formatPrice(last.close)
+        return PriceTagGeometry.width(for: text)
+    }
+
     /// Centre of the last-price tag in the right axis column, or nil when the
     /// last close sits outside the price pane (where no tag is drawn either).
     /// The SwiftUI bar-close countdown hangs off this, so the countdown can
@@ -1581,22 +1645,30 @@ private struct ChartFrame {
 
     private func drawLastPrice(_ ctx: GraphicsContext) {
         guard let last = bars.last, let tag = lastPriceTagCenter else { return }
-        // During an equity pre/post session the live price reads EMBER + "EXT" so
-        // the operator sees at a glance it's an extended-hours print (TradingView).
+        // Extended-hours prints keep their "EXT" suffix (TradingView's cue) — the
+        // information survives, it just no longer needs colour to carry it.
         let ext = inExtendedHours
+        // DIRECTION drives the tag, using the SAME rule as the candle body it
+        // points at (`close >= open`, see drawCandles). Deriving it any other way
+        // — against the previous close, say — would let a green tag sit on a red
+        // candle, which is its own small lie on a trading screen.
+        let up = last.close >= last.open
+        let direction = up ? Theme.up : Theme.down
         var p = Path()
         let yy = tag.y
         p.move(to: CGPoint(x: 0, y: yy))
         p.addLine(to: CGPoint(x: plotWidth, y: yy))
         ctx.stroke(
-            p, with: .color(ext ? Theme.ember.opacity(0.5) : Theme.dim.opacity(0.3)),
+            p, with: .color(direction.opacity(0.45)),
             style: StrokeStyle(lineWidth: 1, dash: [2, 3])
         )
         drawTag(
             ctx, text: ext ? ChartMath.formatPrice(last.close) + " EXT" : ChartMath.formatPrice(last.close),
             center: tag,
-            background: ext ? Theme.ember.opacity(0.18) : Theme.panelHi,
-            textColor: ext ? Theme.ember : Theme.bone
+            // Solid fill, ink text: the price reads from across the desk, and the
+            // direction is legible before the number is.
+            background: direction,
+            textColor: Theme.ink
         )
     }
 
@@ -1860,11 +1932,13 @@ private struct ChartFrame {
         )
         let ts = resolved.measure(in: CGSize(width: 220, height: 20))
         var rect = CGRect(
-            x: center.x - ts.width / 2 - 4, y: center.y - 7,
-            width: ts.width + 8, height: 14
+            x: center.x - ts.width / 2 - PriceTagGeometry.hPadding,
+            y: center.y - PriceTagGeometry.height / 2,
+            width: ts.width + PriceTagGeometry.hPadding * 2,
+            height: PriceTagGeometry.height
         )
         rect.origin.x = min(max(0, rect.origin.x), size.width - rect.width)
-        let path = Path(roundedRect: rect, cornerRadius: 3)
+        let path = Path(roundedRect: rect, cornerRadius: PriceTagGeometry.cornerRadius)
         ctx.fill(path, with: .color(background))
         ctx.stroke(path, with: .color(Theme.line), lineWidth: 1)
         ctx.draw(resolved, at: CGPoint(x: rect.midX, y: rect.midY), anchor: .center)

@@ -21,6 +21,17 @@ enum Theme {
     static let emberDown = Color(hex: 0xB56F1E)
     static let emberTint = Color(hex: 0xE08A2A).opacity(0.10)
     static let onEmber = Color(hex: 0x141005)
+    /// TRUE orange, for the one deliberately neon element (the chart's bar-close
+    /// countdown). The whole ember family sits at hue 31-34 deg — amber-gold, not
+    /// orange — and `emberHi` in particular is 34 deg at 59% lightness, one step
+    /// from `warn` (42 deg). Lit up and bloomed, amber reads YELLOW, which is
+    /// exactly how it looked on screen. This is hue 24 deg at full saturation:
+    /// unmistakably orange, and far enough from `warn` that a glowing countdown
+    /// can never be mistaken for a warning.
+    ///
+    /// Reserved for that element. It is NOT a second accent — ember remains the
+    /// one accent for every other surface.
+    static let emberNeon = Color(hex: 0xFF7518)
 
     // MARK: Semantics
     static let up = Color(hex: 0x3FB68B)
